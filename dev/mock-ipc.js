@@ -145,6 +145,60 @@ uci commit openclash && /etc/init.d/openclash restart
     ai_provider_models: () => ["claude-haiku-5-5", "claude-opus-5-5", "claude-sonnet-5-5"],
     ai_provider_test: () => "连接正常，模型回复：pong",
     ai_provider_save: ({ input }) => ({ ...input, hasKey: true }),
+    ai_conversations_list: ({ hostId }) => {
+      const now = Math.floor(Date.now() / 1000);
+      const all = [
+        { id: "c1", title: "nginx 证书续期", hostLabel: "prod-api-tokyo", hostId: "h1", updatedAt: now - 600, turnCount: 6 },
+        { id: "c2", title: "查一下磁盘占用", hostLabel: "prod-api-tokyo", hostId: "h1", updatedAt: now - 34_000, turnCount: 4 },
+        { id: "c3", title: "上次重启为什么失败", hostLabel: "staging-web", hostId: "h2", updatedAt: now - 200_000, turnCount: 9 },
+      ];
+      return hostId ? all.filter((c) => c.hostId === hostId) : all;
+    },
+    ai_conversation_get: ({ id }) => ({
+      id,
+      title: id === "c2" ? "查一下磁盘占用" : "nginx 证书续期",
+      hostId: "h1",
+      hostLabel: "prod-api-tokyo",
+      providerId: "p1",
+      model: "claude-sonnet-5-5",
+      createdAt: Math.floor(Date.now() / 1000) - 3600,
+      updatedAt: Math.floor(Date.now() / 1000) - 600,
+      turns: [
+        { role: "user", parts: [{ kind: "text", text: "看看磁盘还够不够" }] },
+        {
+          role: "assistant",
+          parts: [
+            { kind: "text", text: "我看一下根分区的使用情况。" },
+            { kind: "tool", call: { id: "t1", name: "run_command", args: { command: "df -h /" }, auto: true, result: { ok: true, content: "Filesystem      Size  Used Avail Use% Mounted on\n/dev/vda1        77G   32G   42G  44% /" } } },
+            { kind: "text", text: "根分区用了 44%，还有 42G 空闲。" },
+          ],
+        },
+      ],
+    }),
+    ai_conversation_save: ({ conversation }) => {
+      state.conversations = state.conversations || [];
+      const i = state.conversations.findIndex((c) => c.id === conversation.id);
+      const summary = {
+        id: conversation.id,
+        title: conversation.title,
+        hostLabel: conversation.hostLabel,
+        hostId: conversation.hostId,
+        updatedAt: Math.floor(Date.now() / 1000),
+        turnCount: (conversation.turns || []).length,
+      };
+      if (i >= 0) state.conversations[i] = summary;
+      else state.conversations.push(summary);
+      return null;
+    },
+    ai_conversation_rename: ({ id, title }) => {
+      const c = (state.conversations || []).find((x) => x.id === id);
+      if (c) c.title = title;
+      return null;
+    },
+    ai_conversation_delete: ({ id }) => {
+      state.conversations = (state.conversations || []).filter((c) => c.id !== id);
+      return null;
+    },
     update_check: () => null,
     forward_list: () => state.forwards,
     sync_status: () => null,

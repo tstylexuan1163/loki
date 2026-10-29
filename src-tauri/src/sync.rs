@@ -208,6 +208,19 @@ fn stored_client(state: &crate::AppState) -> Result<Client, SyncError> {
     Ok(Client::new(&url)?.with_token(token))
 }
 
+/// Kinds that stay on this machine.
+///
+/// A conversation holds server output and grows large; it is private to the
+/// device that produced it, so it is neither pushed nor accepted from a peer.
+pub fn is_local_only(kind: &str) -> bool {
+    kind == "ai_conversation"
+}
+
+/// Rows that may be pushed to the sync server.
+fn pushable(rows: &[crate::store::ItemRow]) -> impl Iterator<Item = &crate::store::ItemRow> {
+    rows.iter().filter(|r| !is_local_only(&r.kind))
+}
+
 /// Runs one full sync: pull what is new, then push what is local and newer.
 ///
 /// The vault lock is taken and released around each database step rather than
@@ -241,6 +254,10 @@ pub async fn run_once(state: &crate::AppState) -> Result<SyncReport, SyncError> 
                 .map_err(|e| SyncError::Store(e.to_string()))?;
             let store = vault.store();
             for item in &page.items {
+                // Never let a peer inject a conversation into this device.
+                if is_local_only(&item.kind) {
+                    continue;
+                }
                 let envelope: crate::crypto::Envelope = match serde_json::from_str(&item.envelope) {
                     Ok(e) => e,
                     // A blob that does not parse is skipped, not fatal: one
@@ -281,7 +298,7 @@ pub async fn run_once(state: &crate::AppState) -> Result<SyncReport, SyncError> 
 
     // ---- push (no lock held) ----------------------------------------------
     let mut wire = Vec::with_capacity(local_items.len());
-    for row in &local_items {
+    for row in pushable(&local_items) {
         wire.push(WireItem {
             id: row.id.clone(),
             kind: row.kind.clone(),
@@ -334,6 +351,32 @@ fn read_cursor(store: &crate::store::Store) -> Result<u64, SyncError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row(id: &str, kind: &str) -> crate::store::ItemRow {
+        crate::store::ItemRow {
+            id: id.to_string(),
+            kind: kind.to_string(),
+            envelope: crate::crypto::Envelope {
+                v: 1,
+                n: "n".into(),
+                c: "c".into(),
+            },
+            updated_at: 1,
+        }
+    }
+
+    #[test]
+    fn conversations_are_never_pushed() {
+        let rows = vec![
+            row("h1", "host"),
+            row("c1", "ai_conversation"),
+            row("k1", "key"),
+        ];
+        let ids: Vec<&str> = pushable(&rows).map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["h1", "k1"]);
+        assert!(is_local_only("ai_conversation"));
+        assert!(!is_local_only("host"));
+    }
 
     #[test]
     fn rejects_addresses_that_are_not_urls() {

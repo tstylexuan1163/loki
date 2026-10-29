@@ -10,6 +10,7 @@
 //! the conversation, and so a tool call never round-trips through JavaScript to
 //! be approved.
 
+pub mod conversation;
 pub mod provider;
 pub mod tools;
 

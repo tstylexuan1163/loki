@@ -2,20 +2,23 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
   aiApi,
+  conversationApi,
   errorMessage,
   type AiEvent,
   type ChatMessage,
   type PermissionMode,
   type ProviderView,
 } from "@/lib/api";
+import { useApp } from "@/app/store";
+import { ConversationHistory } from "@/features/ai/ConversationHistory";
 import {
   IconAlert,
   IconCheck,
   IconChevronRight,
   IconClock,
   IconSend,
+  IconPlus,
   IconSparkle,
-  IconTrash,
   IconX,
 } from "@/components/icons";
 import { Markdown } from "@/features/ai/Markdown";
@@ -106,6 +109,13 @@ function turnToMessages(parts: Part[]): ChatMessage[] {
   return out;
 }
 
+/** A conversation id; the panel owns it, the store just keeps it. */
+function newConversationId(): string {
+  const c = globalThis.crypto as Crypto | undefined;
+  if (c && "randomUUID" in c) return c.randomUUID();
+  return `c-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 const textOf = (t: Turn) =>
   t.parts.map((p) => (p.kind === "text" ? p.text : "")).join("");
 
@@ -118,9 +128,14 @@ const textOf = (t: Turn) =>
  */
 export function AiPanel({
   sessionId,
+  hostId,
+  hostLabel,
   onClose,
 }: {
   sessionId: string | null;
+  /** Host this tab is bound to, so a conversation can be listed per host. */
+  hostId?: string | null;
+  hostLabel?: string;
   onClose: () => void;
 }) {
   const [turns, setTurns] = useState<Turn[]>([]);
@@ -131,7 +146,18 @@ export function AiPanel({
   const [model, setModel] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [conversationId, setConversationId] = useState(newConversationId);
+  const [title, setTitle] = useState("");
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const createdAt = useRef(Math.floor(Date.now() / 1000));
   const logRef = useRef<HTMLDivElement>(null);
+  // The host a conversation belongs to, captured when it is created: switching
+  // tabs mid-conversation must not silently rebind the transcript.
+  const boundHost = useRef({ id: hostId ?? null, label: hostLabel ?? "" });
+  const turnsRef = useRef<Turn[]>([]);
+  useEffect(() => {
+    turnsRef.current = turns;
+  }, [turns]);
 
   useEffect(() => {
     void (async () => {
@@ -184,6 +210,83 @@ export function AiPanel({
     };
   }, []);
 
+  /** Saves the conversation as it stands. Failures stay quiet on purpose: a
+   *  full disk must not interrupt a chat, and the next save retries. */
+  const persist = useCallback(
+    async (snapshot?: Turn[]) => {
+      const list = snapshot ?? turnsRef.current;
+      if (list.length === 0) return;
+      const firstUser = list.find((t) => t.role === "user");
+      const fallback = firstUser ? textOf(firstUser).trim().slice(0, 30) : "";
+      try {
+        await conversationApi.save({
+          id: conversationId,
+          title: title || fallback || "未命名对话",
+          hostId: boundHost.current.id,
+          hostLabel: boundHost.current.label,
+          providerId,
+          model,
+          createdAt: createdAt.current,
+          updatedAt: Math.floor(Date.now() / 1000),
+          turns: list,
+        });
+      } catch {
+        /* ignored: see above */
+      }
+    },
+    [conversationId, title, providerId, model],
+  );
+  const persistRef = useRef(persist);
+  useEffect(() => {
+    persistRef.current = persist;
+  }, [persist]);
+
+  // A finished turn is saved once more, when the parts have all arrived.
+  const wasRunning = useRef(false);
+  useEffect(() => {
+    if (wasRunning.current && !running) void persistRef.current();
+    wasRunning.current = running;
+  }, [running]);
+
+  // Locking the vault clears the panel, like the terminals around it.
+  const phase = useApp((s) => s.phase);
+  useEffect(() => {
+    if (phase === "unlocked") return;
+    setTurns([]);
+    setConversationId(newConversationId());
+    setTitle("");
+    createdAt.current = Math.floor(Date.now() / 1000);
+    setHistoryOpen(false);
+  }, [phase]);
+
+  /** Replaces the panel contents with a stored conversation. */
+  function openConversation(conv: Record<string, unknown>) {
+    const next = Array.isArray(conv.turns) ? (conv.turns as Turn[]) : [];
+    setTurns(next);
+    setConversationId(String(conv.id));
+    setTitle(typeof conv.title === "string" ? conv.title : "");
+    boundHost.current = {
+      id: typeof conv.hostId === "string" ? conv.hostId : null,
+      label: typeof conv.hostLabel === "string" ? conv.hostLabel : "",
+    };
+    createdAt.current =
+      typeof conv.createdAt === "number" ? conv.createdAt : Math.floor(Date.now() / 1000);
+    if (typeof conv.providerId === "string") setProviderId(conv.providerId);
+    if (typeof conv.model === "string") setModel(conv.model);
+    setHistoryOpen(false);
+    pinned.current = true;
+  }
+
+  function newConversation() {
+    if (running) return;
+    setTurns([]);
+    setConversationId(newConversationId());
+    setTitle("");
+    createdAt.current = Math.floor(Date.now() / 1000);
+    boundHost.current = { id: hostId ?? null, label: hostLabel ?? "" };
+    setError(null);
+  }
+
   const history = useCallback((): ChatMessage[] => {
     const out: ChatMessage[] = [];
     for (const t of turns) {
@@ -205,11 +308,15 @@ export function AiPanel({
     const assistantTurn: Turn = { role: "assistant", parts: [] };
     // History must go to Rust *without* the placeholder assistant turn.
     const prior = history();
-    setTurns((prev) => [...prev, userTurn, assistantTurn]);
+    const nextTurns = [...turns, userTurn, assistantTurn];
+    setTurns(nextTurns);
     setDraft("");
     pinned.current = true;
     setRunning(true);
     setError(null);
+    // Save as soon as the question is asked, so closing the panel right after
+    // sending still leaves the conversation in the history.
+    void persist(nextTurns);
 
     try {
       await aiApi.send(providerId, model, sessionId, mode, [
@@ -229,13 +336,15 @@ export function AiPanel({
           <IconSparkle size={14} /> 助手
         </span>
         <div className="spacer" />
+        <button className="iconbtn" title="新对话" disabled={running} onClick={newConversation}>
+          <IconPlus size={14} />
+        </button>
         <button
-          className="iconbtn"
-          title="清空对话"
-          disabled={running || turns.length === 0}
-          onClick={() => setTurns([])}
+          className={`iconbtn ${historyOpen ? "iconbtn--on" : ""}`}
+          title="历史对话"
+          onClick={() => setHistoryOpen((v) => !v)}
         >
-          <IconTrash size={14} />
+          <IconClock size={14} />
         </button>
         <button className="iconbtn" onClick={onClose} title="关闭">
           <IconX size={15} />
@@ -381,6 +490,20 @@ export function AiPanel({
           <IconSend size={15} />
         </button>
       </div>
+
+      {historyOpen && (
+        <ConversationHistory
+          hostId={hostId ?? null}
+          hostLabel={hostLabel ?? ""}
+          currentId={conversationId}
+          disabled={running}
+          onClose={() => setHistoryOpen(false)}
+          onOpen={openConversation}
+          onRenamed={(id, next) => {
+            if (id === conversationId) setTitle(next);
+          }}
+        />
+      )}
     </div>
   );
 }

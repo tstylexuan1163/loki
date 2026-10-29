@@ -4209,3 +4209,132 @@ textarea.field__input {
   background: var(--bg-raised);
   border: 1px solid var(--border);
 }
+
+/* ---- AI conversation history --------------------------------------------- */
+
+.ai {
+  position: relative;
+}
+
+.conv {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-elevated);
+  border-left: 1px solid var(--border);
+}
+
+.conv__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.conv__title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.conv__filters {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.conv__search {
+  flex: 1;
+  min-width: 0;
+}
+
+.conv__list {
+  flex: 1;
+  overflow: auto;
+  padding: 6px 8px 12px;
+}
+
+.conv__group {
+  margin-top: 8px;
+}
+
+.conv__groupTitle {
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  color: var(--text-faint);
+  padding: 4px 6px;
+}
+
+.conv__row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 8px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.conv__row:hover {
+  background: var(--bg-raised);
+}
+
+.conv__row--on {
+  background: var(--bg-raised);
+  outline: 1px solid var(--border-strong);
+}
+
+.conv__main {
+  flex: 1;
+  min-width: 0;
+}
+
+.conv__rowTitle {
+  font-size: 12.5px;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.conv__meta {
+  font-size: 10.5px;
+  color: var(--text-faint);
+  margin-top: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.conv__actions {
+  display: flex;
+  gap: 2px;
+  opacity: 0;
+}
+
+.conv__row:hover .conv__actions {
+  opacity: 1;
+}
+
+.conv__rename {
+  flex: 1;
+}
+
+.conv__state {
+  padding: 24px 10px;
+  text-align: center;
+  font-size: 11.5px;
+  color: var(--text-faint);
+  line-height: 1.7;
+}
+
+.conv__state--err {
+  color: var(--danger);
+}

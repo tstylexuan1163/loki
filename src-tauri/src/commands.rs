@@ -1617,6 +1617,197 @@ fn finish_all_recordings(state: &AppState) {
     }
 }
 
+// ---- AI conversations ----------------------------------------------------
+
+/// A saved chat, without its turns: what the history list shows.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationSummary {
+    pub id: String,
+    pub title: String,
+    pub host_label: String,
+    pub updated_at: i64,
+    pub turn_count: usize,
+}
+
+/// Conversations need the vault open: the payload holds server output.
+fn require_unlocked(vault: &crate::vault::Vault) -> Result<(), String> {
+    if vault.status().unlocked {
+        Ok(())
+    } else {
+        Err("保险库已锁定".into())
+    }
+}
+
+/// Every stored conversation, decrypted, newest first.
+fn all_conversations(
+    vault: &crate::vault::Vault,
+) -> Result<Vec<(crate::store::ItemRow, serde_json::Value)>, String> {
+    let rows = vault.store().list_items().map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for row in rows.into_iter().filter(|r| r.kind == "ai_conversation") {
+        // A row that will not decrypt (older key, corruption) is skipped rather
+        // than breaking the whole list.
+        if let Ok(item) = vault.decrypt_item(&row) {
+            out.push((row, item.payload));
+        }
+    }
+    Ok(out)
+}
+
+/// Lists conversation summaries, optionally only those of one host.
+#[tauri::command]
+pub fn ai_conversations_list(
+    state: State<'_, AppState>,
+    host_id: Option<String>,
+) -> Result<Vec<ConversationSummary>, String> {
+    let vault = state.vault.lock().map_err(|e| e.to_string())?;
+    require_unlocked(&vault)?;
+
+    let mut out: Vec<ConversationSummary> = all_conversations(&vault)?
+        .into_iter()
+        .filter(|(_, payload)| match &host_id {
+            Some(want) => payload.get("hostId").and_then(|v| v.as_str()) == Some(want.as_str()),
+            None => true,
+        })
+        .map(|(row, payload)| ConversationSummary {
+            id: row.id,
+            title: payload
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("未命名对话")
+                .to_string(),
+            host_label: payload
+                .get("hostLabel")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            updated_at: row.updated_at,
+            turn_count: payload
+                .get("turns")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0),
+        })
+        .collect();
+
+    out.sort_by_key(|c| std::cmp::Reverse(c.updated_at));
+    Ok(out)
+}
+
+/// The full conversation, or None when it does not exist.
+#[tauri::command]
+pub fn ai_conversation_get(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<Option<serde_json::Value>, String> {
+    let vault = state.vault.lock().map_err(|e| e.to_string())?;
+    require_unlocked(&vault)?;
+
+    let Some(row) = vault.store().get_item(&id).map_err(|e| e.to_string())? else {
+        return Ok(None);
+    };
+    if row.kind != "ai_conversation" {
+        return Ok(None);
+    }
+    let item = vault.decrypt_item(&row).map_err(|e| e.to_string())?;
+    Ok(Some(item.payload))
+}
+
+/// Drops the oldest conversations once there are too many.
+fn prune_conversations(vault: &crate::vault::Vault) -> Result<(), String> {
+    let mut rows: Vec<(crate::store::ItemRow, serde_json::Value)> = all_conversations(vault)?;
+    let limit = crate::ai::conversation::MAX_CONVERSATIONS;
+    if rows.len() <= limit {
+        return Ok(());
+    }
+    // Oldest first, and remove the surplus from that end.
+    rows.sort_by_key(|r| r.0.updated_at);
+    let surplus = rows.len() - limit;
+    for (row, _) in rows.into_iter().take(surplus) {
+        vault
+            .store()
+            .delete_item(&row.id)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Inserts or replaces a conversation. Limits are applied here so a caller
+/// cannot store an oversized payload.
+#[tauri::command]
+pub fn ai_conversation_save(
+    state: State<'_, AppState>,
+    conversation: serde_json::Value,
+) -> Result<(), String> {
+    let vault = state.vault.lock().map_err(|e| e.to_string())?;
+    require_unlocked(&vault)?;
+
+    let id = conversation
+        .get("id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or("缺少对话 id")?
+        .to_string();
+
+    let mut payload = crate::ai::conversation::truncate(conversation);
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("id".into(), serde_json::Value::String(id.clone()));
+        obj.insert("updatedAt".into(), serde_json::Value::from(now_secs()));
+    }
+
+    let row = vault
+        .encrypt_item(&id, "ai_conversation", &payload)
+        .map_err(|e| e.to_string())?;
+    vault.store().put_item(&row).map_err(|e| e.to_string())?;
+    prune_conversations(&vault)
+}
+
+/// Renames a conversation, which also moves it to the top of the list.
+#[tauri::command]
+pub fn ai_conversation_rename(
+    state: State<'_, AppState>,
+    id: String,
+    title: String,
+) -> Result<(), String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err("标题不能为空".into());
+    }
+    let vault = state.vault.lock().map_err(|e| e.to_string())?;
+    require_unlocked(&vault)?;
+
+    let Some(row) = vault.store().get_item(&id).map_err(|e| e.to_string())? else {
+        return Err("对话不存在".into());
+    };
+    if row.kind != "ai_conversation" {
+        return Err("对话不存在".into());
+    }
+    let mut payload = vault.decrypt_item(&row).map_err(|e| e.to_string())?.payload;
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("title".into(), serde_json::Value::String(title.to_string()));
+        obj.insert("updatedAt".into(), serde_json::Value::from(now_secs()));
+    }
+    let updated = vault
+        .encrypt_item(&id, "ai_conversation", &payload)
+        .map_err(|e| e.to_string())?;
+    vault.store().put_item(&updated).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn ai_conversation_delete(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let vault = state.vault.lock().map_err(|e| e.to_string())?;
+    require_unlocked(&vault)?;
+    // Only ever delete a conversation: an id from the list must not be able to
+    // remove a host or a key by mistake.
+    if let Some(row) = vault.store().get_item(&id).map_err(|e| e.to_string())? {
+        if row.kind != "ai_conversation" {
+            return Err("不是对话记录".into());
+        }
+    }
+    vault.store().delete_item(&id).map_err(|e| e.to_string())
+}
+
 // ---- Sync ----------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2771,6 +2962,59 @@ mod tests {
         let row = vault.encrypt_item(id, "provider", &payload).unwrap();
         vault.store().put_item(&row).unwrap();
         vault
+    }
+
+    #[test]
+    fn conversations_are_refused_while_the_vault_is_locked() {
+        // A vault that was never created or unlocked has no key.
+        let vault = Vault::new(Store::open_in_memory().unwrap()).unwrap();
+        assert!(require_unlocked(&vault).is_err());
+        // The real gate for saving/reading: no key, no ciphertext.
+        assert!(vault
+            .encrypt_item("c1", "ai_conversation", &serde_json::json!({}))
+            .is_err());
+    }
+
+    #[test]
+    fn pruning_keeps_only_the_most_recent_conversations() {
+        let mut vault = Vault::new(Store::open_in_memory().unwrap()).unwrap();
+        vault.create("test-password", KdfParams::default()).unwrap();
+
+        let limit = crate::ai::conversation::MAX_CONVERSATIONS;
+        let total = limit + 3;
+        for i in 0..total {
+            let payload = serde_json::json!({
+                "id": format!("c{i}"),
+                "title": format!("对话 {i}"),
+                "hostId": "h1",
+                "hostLabel": "prod",
+                "turns": [],
+            });
+            let row = vault
+                .encrypt_item(&format!("c{i}"), "ai_conversation", &payload)
+                .unwrap();
+            // `encrypt_item` stamps now(); make the order explicit so "oldest"
+            // is not a race between rows written in the same second.
+            let mut row = row;
+            row.updated_at = 1_000 + i as i64;
+            vault.store().put_item(&row).unwrap();
+        }
+
+        prune_conversations(&vault).unwrap();
+
+        let rows = vault.store().list_items().unwrap();
+        let conversations: Vec<_> = rows
+            .iter()
+            .filter(|r| r.kind == "ai_conversation")
+            .collect();
+        assert_eq!(conversations.len(), limit);
+        // The three oldest are gone; the newest survive.
+        assert!(conversations
+            .iter()
+            .all(|r| r.id != "c0" && r.id != "c1" && r.id != "c2"));
+        assert!(conversations
+            .iter()
+            .any(|r| r.id == format!("c{}", total - 1)));
     }
 
     #[test]

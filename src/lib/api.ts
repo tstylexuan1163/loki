@@ -483,3 +483,25 @@ export const recordApi = {
     invoke<RecordStopped | null>("session_record_stop", { sessionId }),
   status: (sessionId: string) => invoke<RecordInfo | null>("session_record_status", { sessionId }),
 };
+
+// ---- AI conversation history ---------------------------------------------
+
+export interface ConversationSummary {
+  id: string;
+  title: string;
+  hostLabel: string;
+  /** Unix seconds. */
+  updatedAt: number;
+  turnCount: number;
+}
+
+export const conversationApi = {
+  /** Summaries only; `hostId` narrows to one host. */
+  list: (hostId?: string | null) =>
+    invoke<ConversationSummary[]>("ai_conversations_list", { hostId: hostId ?? null }),
+  get: (id: string) => invoke<unknown | null>("ai_conversation_get", { id }),
+  save: (conversation: unknown) => invoke<void>("ai_conversation_save", { conversation }),
+  rename: (id: string, title: string) =>
+    invoke<void>("ai_conversation_rename", { id, title }),
+  remove: (id: string) => invoke<void>("ai_conversation_delete", { id }),
+};

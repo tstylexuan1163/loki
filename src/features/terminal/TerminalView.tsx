@@ -356,6 +356,8 @@ export function TerminalView({ visible }: { visible: boolean }) {
                 ) : panel === "ai" ? (
                   <AiPanel
                     sessionId={current.kind === "ssh" ? current.sessionId : null}
+                    hostId={current.hostId}
+                    hostLabel={current.title}
                     onClose={() => setPanel(null)}
                   />
                 ) : null}

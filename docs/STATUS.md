@@ -545,3 +545,57 @@ macOS 未改配置，行为不变。**Windows 实机效果未验证**（开发�
   内容会拼接而不是覆盖）；不处理六线制图形等其他转义。文件末尾、头信息都对得上，正文对「配置
   输出」这类顺序文本是准确的。
 - **单一录制**：一个会话同时只能有一个录制，重复开始会报错。
+
+## 十九、AI 历史会话 ✅（界面未逐点点验）
+
+计划见 [plans/2026-10-29-next-features.md](plans/2026-10-29-next-features.md) 第 2 项。
+
+### 做了什么
+
+**存储（Rust）**
+- 新 kind `ai_conversation`，`vault.encrypt_item` 加密后存 `items` 表。payload：
+  `{ id, title, hostId, hostLabel, providerId, model, createdAt, updatedAt, turns: [{ role, parts, error }] }`，
+  `parts` 与前端渲染的结构一致（文本块 / 工具卡片，含 `call.result.content`）。
+- 保存时截断（`src/ai/conversation.rs`，纯函数 + 单元测试）：单个工具结果最多 8 KB（按 UTF-8 边界切，
+  末尾加「…已截断」）；单对话最多 200 轮，**超出时丢最早**的（继续对话靠的是近期上下文）；
+  全机最多 200 个对话，超出删最旧的。
+- **不参与同步**：`sync.rs` 的 `is_local_only()` 同时用于推送过滤和拉取跳过，两端都不会传播。
+- 命令（全部要求保险库已解锁，未解锁返回「保险库已锁定」）：
+  `ai_conversations_list(hostId?)` → 摘要（id/title/hostLabel/updatedAt/turnCount）；
+  `ai_conversation_get` / `ai_conversation_save`（upsert）/ `ai_conversation_rename` / `ai_conversation_delete`。
+  删除会先确认 kind，避免用对话 id 误删主机或密钥。
+
+**界面（AiPanel + ConversationHistory）**
+- 面板头部：「新对话」（+）、「历史」（时钟）。历史是一层覆盖在面板内的列表：今天 / 昨天 / 更早分组，
+  顶部「当前主机 / 全部」切换，按标题搜索，每行有重命名（就地输入）和删除（确认框）；
+  空列表、加载中、失败都有提示。
+- 点开历史对话即载入 turns，可直接继续提问（`history()` 从 parts 重建消息）。
+- 自动保存两次：发出用户消息时一次、回合结束（done / error）再次。标题默认取第一条用户消息前 30 字，
+  可重命名；重命名会同步回面板，避免下一次自动保存又写回旧标题。
+- 会话**在创建时绑定当前标签的主机**（`boundHost` ref）：中途切标签不会把旧对话改挂到新主机上。
+- 生成中禁用切换与新建（历史行与按钮都置灰）。
+- 锁定保险库时清空面板（面板本身在 Gate 之下也会卸载，这里额外显式清一次）。
+
+### 怎么验证的
+
+单元 / 集成测试（`cargo test`，105 通过）：
+- 截断：8 KB 上限 + 标记、短结果与文本不动、UTF-8 边界不切字、只保留最近 200 轮、无 turns 的 payload 不动（5 个）。
+- 数量上限：写 203 个对话后 `prune_conversations` 保留 200 个且删掉最旧的三个。
+- 未解锁拒绝：`require_unlocked` 对未解锁的 vault 报错，且 `encrypt_item` 无密钥失败。
+- 同步排除：`pushable()` 只留下 host/key，`ai_conversation` 被剔除。
+- **磁盘密文**（`tests/conversation_storage.rs`）：用真实 vault 写进真实 SQLite 文件后，直接读 `loki.db`
+  与 `loki.db-wal`，里面**搜不到**对话正文和标题；同时验证解锁后能正确解密回来。
+
+静态检查：`cargo fmt`、clippy（0 警告）、`cargo test`、`npx tsc --noEmit`、`npx vite build` 全通过。
+`dev/mock-ipc.js` 也补了列表 / 读取 / 保存 / 重命名 / 删除，内存里带三条示例对话。
+
+### 未验证 / 已知限制
+
+- **界面没有逐点点验**：历史抽屉、分组、搜索、重命名、删除、以及「提问 → 关面板 → 从历史继续」这条完整路径
+  都只做了类型检查与构建，**没有截图级证据**。这一轮自动化点击在浏览器里反复落到邻近控件上（窗口坐标漂移），
+  和前两项是同一个环境问题。建议在真实应用里点一遍。
+- **跨主机继续对话**：历史里能看到「全部」范围的对话，点开一个别的主机的对话并按继续提问时，助手仍然对
+  **当前标签**的服务器执行工具（工具绑定的是当前会话，不是对话记录里的主机）。这是刻意的（工具必须作用于
+  一个真实会话），但用户可能误以为在操作原主机。后续可在打开跨主机对话时提示或阻止继续。
+- 对话标题在保存时才生成（首条消息前 30 字）；空对话不会落盘。
+- 每设备各自保存，不同步，换机器看不到旧对话。
