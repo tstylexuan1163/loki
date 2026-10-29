@@ -1,6 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { aiApi, errorMessage, type AiEvent, type ChatMessage, type PermissionMode } from "@/lib/api";
+import {
+  aiApi,
+  errorMessage,
+  type AiEvent,
+  type ChatMessage,
+  type PermissionMode,
+  type ProviderView,
+} from "@/lib/api";
 import { IconCheck, IconSend, IconSparkle, IconTrash, IconX, IconChevronRight } from "@/components/icons";
 import { Fragment, type ReactNode } from "react";
 
@@ -78,8 +85,9 @@ export function AiPanel({
   const [turns, setTurns] = useState<Turn[]>([]);
   const [draft, setDraft] = useState("");
   const [mode, setMode] = useState<PermissionMode>("manual");
-  const [providers, setProviders] = useState<{ id: string; name: string }[]>([]);
+  const [providers, setProviders] = useState<ProviderView[]>([]);
   const [providerId, setProviderId] = useState<string | null>(null);
+  const [model, setModel] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -89,7 +97,9 @@ export function AiPanel({
       try {
         const list = await aiApi.providers();
         setProviders(list);
-        setProviderId((cur) => cur ?? list[0]?.id ?? null);
+        const first = list[0];
+        setProviderId((cur) => cur ?? first?.id ?? null);
+        setModel((cur) => cur ?? first?.models[0] ?? null);
       } catch (e) {
         setError(errorMessage(e));
       }
@@ -99,6 +109,8 @@ export function AiPanel({
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [turns]);
+
+  const activeModelOptions = providers.find((p) => p.id === providerId)?.models ?? [];
 
   // Stream the engine's events into the last assistant turn.
   useEffect(() => {
@@ -190,7 +202,10 @@ export function AiPanel({
     setError(null);
 
     try {
-      await aiApi.send(providerId, sessionId, mode, [...prior, { role: "user", content: text }]);
+      await aiApi.send(providerId, model, sessionId, mode, [
+        ...prior,
+        { role: "user", content: text },
+      ]);
     } catch (e) {
       setError(errorMessage(e));
       setRunning(false);
@@ -220,7 +235,13 @@ export function AiPanel({
         <select
           className="ai__select"
           value={providerId ?? ""}
-          onChange={(e) => setProviderId(e.target.value || null)}
+          onChange={(e) => {
+            const id = e.target.value || null;
+            setProviderId(id);
+            // A model id belongs to one provider; carrying it across would send
+            // a name the new endpoint has never heard of.
+            setModel(providers.find((p) => p.id === id)?.models[0] ?? null);
+          }}
         >
           {providers.length === 0 && <option value="">未配置服务商</option>}
           {providers.map((p) => (
@@ -229,6 +250,20 @@ export function AiPanel({
             </option>
           ))}
         </select>
+        {activeModelOptions.length > 1 && (
+          <select
+            className="ai__select"
+            value={model ?? ""}
+            onChange={(e) => setModel(e.target.value || null)}
+            title="模型"
+          >
+            {activeModelOptions.map((m) => (
+              <option key={m} value={m}>
+                {m}
+              </option>
+            ))}
+          </select>
+        )}
         <select
           className="ai__select"
           value={mode}

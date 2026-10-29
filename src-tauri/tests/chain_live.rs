@@ -9,7 +9,8 @@ use loki_lib::ssh::{self, ConnectOutcome, Credential, Hop, KnownKey, TermEvent};
 use std::sync::atomic::AtomicBool;
 
 fn key() -> String {
-    let path = std::env::var("LOKI_TEST_KEY").unwrap_or_else(|_| "/tmp/loki-sshd/client_key".into());
+    let path =
+        std::env::var("LOKI_TEST_KEY").unwrap_or_else(|_| "/tmp/loki-sshd/client_key".into());
     std::fs::read_to_string(path).expect("test key")
 }
 
@@ -100,9 +101,18 @@ async fn a_changed_key_reports_the_previous_fingerprint() {
         fingerprint: "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
     }];
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<TermEvent>();
-    let res = ssh::connect_chain(None, &hop(vec![key_cred()], stale), "t", "test", None, 80, 24, tx)
-        .await
-        .unwrap();
+    let res = ssh::connect_chain(
+        None,
+        &hop(vec![key_cred()], stale),
+        "t",
+        "test",
+        None,
+        80,
+        24,
+        tx,
+    )
+    .await
+    .unwrap();
     match res.outcome {
         ConnectOutcome::UnknownHostKey { previous, .. } => {
             assert_eq!(
@@ -132,7 +142,9 @@ async fn tunnels_through_a_jump_host() {
     let jump = hop(vec![key_cred()], trusted());
     let target = hop(vec![key_cred()], trusted());
     let session = live(Some(&jump), &target).await;
-    let out = ssh::exec_command(&session, "echo via-jump-$((20+22))").await.unwrap();
+    let out = ssh::exec_command(&session, "echo via-jump-$((20+22))")
+        .await
+        .unwrap();
     assert!(out.contains("via-jump-42"), "{out}");
 }
 
@@ -167,13 +179,25 @@ async fn uploads_and_downloads_a_directory() {
         .await
         .unwrap();
     assert_eq!(last, (600_005, 600_005));
-    assert_eq!(std::fs::read(format!("{remote_dir}/src/a.txt")).unwrap(), b"hello");
+    assert_eq!(
+        std::fs::read(format!("{remote_dir}/src/a.txt")).unwrap(),
+        b"hello"
+    );
 
     let back = base.join("back");
-    loki_lib::transfer::download(&sftp, &format!("{remote_dir}/src"), &back, &cancel, |_, _| {})
-        .await
-        .unwrap();
-    assert_eq!(std::fs::read(back.join("nested/b.bin")).unwrap().len(), 600_000);
+    loki_lib::transfer::download(
+        &sftp,
+        &format!("{remote_dir}/src"),
+        &back,
+        &cancel,
+        |_, _| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read(back.join("nested/b.bin")).unwrap().len(),
+        600_000
+    );
     assert!(!back.join("a.txt.part").exists(), "no .part left behind");
 
     loki_lib::transfer::remove_recursive(&sftp, &format!("{remote_dir}/src"))

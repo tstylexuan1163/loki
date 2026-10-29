@@ -34,6 +34,8 @@ pub struct AppState {
     pub direct: Mutex<direct::DirectManager>,
     /// Cancel flags for running SFTP transfers.
     pub transfers: Mutex<transfer::TransferMap>,
+    /// True while an update download/install is in flight.
+    pub update_busy: Mutex<bool>,
     /// Kept so background tasks can emit events without a command in flight.
     pub app: tauri::AppHandle,
 }
@@ -50,6 +52,10 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        // Update check + install. The plugin provides the verification and the
+        // platform-specific installer; the UI reaches it through our own
+        // commands, so the JS binding package is not needed.
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             // Everything private lives under the app's data dir. LOKI_DATA_DIR
             // points a development build at a throwaway vault instead.
@@ -69,6 +75,7 @@ pub fn run() {
                 sftp: Mutex::new(sftp::SftpMap::new()),
                 forwards: Mutex::new(forward::ForwardManager::new()),
                 ai_approvals: Mutex::new(None),
+                update_busy: Mutex::new(false),
                 direct: Mutex::new(direct::DirectManager::new()),
                 transfers: Mutex::new(transfer::TransferMap::new()),
                 app: app.handle().clone(),
@@ -99,6 +106,8 @@ pub fn run() {
             commands::sftp_download_to_downloads,
             commands::sftp_upload,
             commands::transfer_cancel,
+            commands::update_check,
+            commands::update_install,
             commands::serial_ports,
             commands::telnet_open,
             commands::serial_open,
@@ -111,6 +120,8 @@ pub fn run() {
             commands::sync_disconnect,
             commands::ai_providers_list,
             commands::ai_provider_save,
+            commands::ai_provider_models,
+            commands::ai_provider_test,
             commands::ai_provider_delete,
             commands::ai_send,
             commands::ai_approve,

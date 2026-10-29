@@ -188,7 +188,8 @@ pub async fn download(
 }
 
 fn plan_upload(local: &Path, remote_dir: &str) -> Result<Plan, String> {
-    let meta = std::fs::metadata(local).map_err(|e| format!("无法读取 {}：{e}", local.display()))?;
+    let meta =
+        std::fs::metadata(local).map_err(|e| format!("无法读取 {}：{e}", local.display()))?;
     let name = local
         .file_name()
         .map(|n| n.to_string_lossy().to_string())

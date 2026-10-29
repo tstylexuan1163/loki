@@ -24,7 +24,11 @@ use tokio::sync::mpsc;
 /// `rename_all_fields`, or the WebView receives `session_id` while it filters
 /// on `sessionId` and silently drops every frame.
 #[derive(Debug, Clone, serde::Serialize)]
-#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum TermEvent {
     /// Shell output. Base64 keeps arbitrary bytes intact across the IPC hop.
     Data {
@@ -73,7 +77,8 @@ impl OutputBuffer {
     pub fn push(&mut self, data: &[u8]) {
         if !self.attached {
             let room = BACKLOG_LIMIT.saturating_sub(self.pending.len());
-            self.pending.extend_from_slice(&data[..data.len().min(room)]);
+            self.pending
+                .extend_from_slice(&data[..data.len().min(room)]);
         }
         self.tail.extend(data.iter().copied());
         let excess = self.tail.len().saturating_sub(TAIL_LIMIT);
@@ -632,7 +637,8 @@ pub async fn connect_chain(
     events: mpsc::UnboundedSender<TermEvent>,
 ) -> Result<Connected, String> {
     let mut accepted = Vec::new();
-    let is_new = |hop: &Hop, key: &SeenKey| !hop.known.iter().any(|k| k.fingerprint == key.fingerprint);
+    let is_new =
+        |hop: &Hop, key: &SeenKey| !hop.known.iter().any(|k| k.fingerprint == key.fingerprint);
 
     let jump_handle = match jump {
         None => None,
@@ -677,7 +683,17 @@ pub async fn connect_chain(
         accepted.push(key.clone());
     }
 
-    let session = open_shell(handle, jump_handle, host_id, title, Some(key.fingerprint), cols, rows, events).await?;
+    let session = open_shell(
+        handle,
+        jump_handle,
+        host_id,
+        title,
+        Some(key.fingerprint),
+        cols,
+        rows,
+        events,
+    )
+    .await?;
     Ok(Connected {
         outcome: ConnectOutcome::Live(session),
         accepted,
@@ -846,7 +862,17 @@ pub async fn connect(
         known: Vec::new(),
     };
     let title = format!("{}@{}", host.username, host.address);
-    let res = connect_chain(None, &hop, &host.id, &title, pin.as_deref(), cols, rows, events).await?;
+    let res = connect_chain(
+        None,
+        &hop,
+        &host.id,
+        &title,
+        pin.as_deref(),
+        cols,
+        rows,
+        events,
+    )
+    .await?;
     Ok(res.outcome)
 }
 
@@ -893,7 +919,10 @@ pub async fn exec_with_timeout(
     };
     let _ = tokio::time::timeout(timeout, read).await;
 
-    Ok(cap_output(String::from_utf8_lossy(&out).to_string(), max_output))
+    Ok(cap_output(
+        String::from_utf8_lossy(&out).to_string(),
+        max_output,
+    ))
 }
 
 /// Caps what goes back to the model: `cat` on a huge file must not eat the
@@ -954,7 +983,10 @@ mod tests {
         let json = serde_json::to_value(&ev).unwrap();
         assert_eq!(json["type"], "data");
         assert_eq!(json["sessionId"], "s");
-        let closed = serde_json::to_value(TermEvent::Closed { session_id: "s".into() }).unwrap();
+        let closed = serde_json::to_value(TermEvent::Closed {
+            session_id: "s".into(),
+        })
+        .unwrap();
         assert_eq!(closed["sessionId"], "s");
     }
 

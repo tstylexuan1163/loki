@@ -1,7 +1,8 @@
 # loki — 构建进度
 
-> **当前版本 v0.7.0**。打包产物：`src-tauri/target/release/bundle/dmg/loki_0.7.0_aarch64.dmg`
-> 与 `.../macos/loki.app`（ad-hoc 签名，arm64）。v0.7.0 的新增内容见第八节。
+> **当前版本 v0.9.0**。打包产物：`src-tauri/target/release/bundle/dmg/loki_0.9.0_aarch64.dmg`
+> 与 `.../macos/loki.app`（ad-hoc 签名，arm64）。v0.8.0 的新增内容见第 13 节；
+> AI 服务商改造的详细说明单独写在 [AI_PROVIDER_SETTINGS.md](AI_PROVIDER_SETTINGS.md)。
 
 > 基于对 [Hatoba](https://github.com/scarletkc/Hatoba) 架构的分析蓝图重新实现（蓝图不在本仓库中）。
 > 本文记录**实际已验证**的能力，与"写了但没跑过"的部分严格区分。
@@ -343,3 +344,74 @@ SOCKS5 握手已实现（no-auth + CONNECT），**未做端到端验证**。
 - **pnpm 严格校验误报**：pnpm 12 的 `ERR_PNPM_IGNORED_BUILDS` 会因为 esbuild 的 postinstall 报错，但依赖实际已安装，构建与运行正常。
 - `russh 0.54` 会触发一条 future-incompat 警告（上游 crate 的问题）。
 - 前端 bundle 约 680 KB（xterm 占大头），Vite 会提示 chunk 过大，不影响桌面应用。
+
+## 十三、v0.8.0：AI 服务商设置改造 ✅
+
+界面按 Hatoba 的服务商对话框重做，并把「只能接几家官方预设」改成任意端点。
+
+### 改了什么
+
+| 项 | v0.7 | v0.8 |
+|---|---|---|
+| 协议 | 2 个硬编码值 | 3 个：Chat Completions / Responses / Anthropic |
+| 模型 | 单个字符串 | **有序列表**，可手动加、可一键拉取 |
+| 基础 URL | 后端偷偷拼 `/v1` | 显式包含版本，`/api/v1` 等也认 |
+| 拉取模型 | 无 | 「获取模型列表」→ 可点击 chip 添加 |
+| 连接测试 | 无 | 「测试连接」→ 真实发一条 ping |
+| 空密钥 | 无条件发空 Bearer | **不发送认证头**（本地服务器可用） |
+| URL 校验 | 无 | 拒绝非 http(s)、无主机、URL 内嵌账号密码 |
+
+### 真机验证
+
+对本地 mock 端点（`http://127.0.0.1:18090/v1`，返回 3 个模型）：
+
+1. 「获取模型列表」→ 列出 `mock-embed` / `mock-gpt-4o` / `mock-gpt-4o-mini`，提示「服务商列出 3 个模型」
+2. 点选加入模型列表
+3. 「测试连接」→ **`连接正常，模型回复：pong（模型 mock-gpt-4o-mini 可用）`**
+4. 保存 → 列表行显示 `OpenAI Chat Completions · http://127.0.0.1:18090/v1` 与 `1 个模型：mock-gpt-4o-mini`
+5. 对 `loki.db` 全量检索 `mock-gpt-4o-mini` / `127.0.0.1:18090` / `Mock 本地`：**均 0 命中**（仍是密文）
+
+### 未验证
+
+- `anthropic` 协议本轮没有重新真机测试（代码路径与 v0.7 相同）
+- `responses` 协议只有请求体/响应解析的单元测试，**没有可用端点做真机验证**
+- 老库（v0.7 结构）迁移有兼容分支与单测，但未用真实旧库回放
+
+`cargo test` 74 个通过，clippy `-D warnings` 无警告，`tsc` 通过。
+
+## 十四、v0.8.1：Windows 标题栏合并 ✅（待 Windows 验证）
+
+Windows 上原来有两条标题栏：系统原生一条 + 应用自绘一条。
+
+- 根因：`titleBarStyle` / `hiddenTitle` 是 macOS 专有字段，Windows 上被忽略，窗口保留完整原生装饰。
+- 改法：新增 `src-tauri/tauri.windows.conf.json`（`decorations: false`），并把窗口对象写全（平台配置里的 `app.windows` 数组是**整体替换**）；新增 `src/app/WindowControls.tsx` 自绘最小化/最大化/关闭，仅在非 macOS 渲染。
+- 细节与风险见 [WINDOWS_FRAMELESS.md](WINDOWS_FRAMELESS.md)。
+
+macOS 未改配置，行为不变。**Windows 实机效果未验证**（开发机为 macOS，无法构建 Windows 包）。
+
+## 十五、v0.9.0：检查更新 + 安装器语言 ✅（部分待真机验证）
+
+### 检查更新
+
+- 启动约 4 秒后静默检查一次；有新版才提示，失败不打扰。
+- 设置 → 关于 有「检查更新」按钮与状态文字；发现新版时右下角浮出提示条（非模态，不打断终端）。
+- 点「下载并安装」显示进度；失败可重试。
+- 走官方 `tauri-plugin-updater` 的 **Rust API**，自己包了两条命令，**不需要 npm 包**。
+- 更新包强制 minisign 签名校验；`createUpdaterArtifacts` 只放在 `tauri.release.conf.json` 供 CI 使用，本地构建不需要私钥。
+
+### 安装器语言
+
+`bundle.windows.nsis.languages = ["SimpChinese", "English"]`，`displayLanguageSelector: false`。NSIS 按系统语言自动选择，未匹配时回退到第一个（中文）。
+
+### 验证
+
+| 项 | 结果 |
+|---|---|
+| 自动检查 → 提示条（版本 + 说明） | ✅ 用本地假 `latest.json`(9.9.9) 实测 |
+| 关于页手动检查 → 显示新版本 + 安装按钮 | ✅ 实测 |
+| 下载失败/重试 UI | ✅ 实测 |
+| **签名校验拦下伪造包** | ✅ `Invalid encoding in minisign data`，未安装任何文件 |
+| 真实发布包完整升级流程 | ❌ 未验证（需真实 Release + 签名产物） |
+| Windows 安装器语言 | ❌ 未验证（需 Windows 构建） |
+
+细节见 [UPDATES.md](UPDATES.md)。

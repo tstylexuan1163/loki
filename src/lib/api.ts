@@ -309,12 +309,15 @@ export const forwardApi = {
 
 export type PermissionMode = "manual" | "auto" | "bypass";
 
+export type ProviderProtocol = "chat_completions" | "responses" | "anthropic";
+
 export interface ProviderView {
   id: string;
   name: string;
-  protocol: "open_ai" | "anthropic";
+  protocol: ProviderProtocol;
   baseUrl: string;
-  model: string;
+  /** Every model the user added, in their order. */
+  models: string[];
   hasKey: boolean;
 }
 
@@ -323,7 +326,7 @@ export interface ProviderInput {
   name: string;
   protocol: string;
   baseUrl: string;
-  model: string;
+  models: string[];
   apiKey?: string;
 }
 
@@ -345,8 +348,17 @@ export const aiApi = {
   providers: () => invoke<ProviderView[]>("ai_providers_list"),
   saveProvider: (input: ProviderInput) => invoke<ProviderView>("ai_provider_save", { input }),
   deleteProvider: (id: string) => invoke<void>("ai_provider_delete", { id }),
-  send: (providerId: string, sessionId: string | null, mode: PermissionMode, history: ChatMessage[]) =>
-    invoke<void>("ai_send", { providerId, sessionId, mode, history }),
+  /** Fetches the provider's model list without saving. */
+  models: (input: ProviderInput) => invoke<string[]>("ai_provider_models", { input }),
+  /** Sends a minimal request to prove URL + key work. */
+  test: (input: ProviderInput) => invoke<string>("ai_provider_test", { input }),
+  send: (
+    providerId: string,
+    model: string | null,
+    sessionId: string | null,
+    mode: PermissionMode,
+    history: ChatMessage[],
+  ) => invoke<void>("ai_send", { providerId, model, sessionId, mode, history }),
   approve: (callId: string, approved: boolean) =>
     invoke<void>("ai_approve", { callId, approved }),
 };
@@ -429,3 +441,18 @@ export function parseTarget(text: string, fallbackUser: string): QuickTarget | n
   if (!address || port < 1 || port > 65535) return null;
   return { address, port, username: m[1] ?? fallbackUser };
 }
+
+// ---- Updates -------------------------------------------------------------
+
+export interface UpdateInfo {
+  currentVersion: string;
+  version: string;
+  notes: string | null;
+  date: string | null;
+}
+
+export const updateApi = {
+  /** `null` means already current — an error means the check itself failed. */
+  check: () => invoke<UpdateInfo | null>("update_check"),
+  install: () => invoke<void>("update_install"),
+};

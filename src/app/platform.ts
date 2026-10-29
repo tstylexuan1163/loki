@@ -7,6 +7,14 @@
  */
 export const isMac = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.userAgent);
 
+/**
+ * Windows runs with a frameless window, so it needs in-app window controls.
+ * Linux still has its native frame (no `tauri.linux.conf.json` yet), so it must
+ * NOT render them or it would show two sets of buttons.
+ */
+export const isWindows =
+  typeof navigator !== "undefined" && /Windows/.test(navigator.userAgent);
+
 /** True when the event carries this platform's app-shortcut modifier. */
 export function isAppShortcut(e: KeyboardEvent | React.KeyboardEvent): boolean {
   return isMac ? e.metaKey && !e.ctrlKey : e.ctrlKey && e.shiftKey && !e.metaKey;
@@ -30,7 +38,7 @@ export function keyLabel(key: string): string {
   return isMac ? `⌘${key}` : `Ctrl+Shift+${key.toUpperCase()}`;
 }
 
-/** Marks the document so CSS can leave room for the macOS traffic lights. */
+/** Marks the document so CSS can size the title bar per platform. */
 export function applyPlatform() {
-  document.documentElement.dataset.platform = isMac ? "mac" : "other";
+  document.documentElement.dataset.platform = isMac ? "mac" : isWindows ? "windows" : "other";
 }

@@ -1,6 +1,6 @@
 [package]
 name = "loki"
-version = "0.7.0"
+version = "0.9.0"
 description = "loki — an SSH client with an AI assistant beside every terminal"
 authors = ["loki contributors"]
 edition = "2021"
@@ -26,6 +26,9 @@ russh = { version = "0.54", default-features = false, features = ["ring", "flate
 russh-sftp = "3"
 # Serial console: switches, routers, and embedded boards.
 serialport = "4"
+# In-app update check and install. Rust-only: the JS binding is not used, so the
+# npm package is not required.
+tauri-plugin-updater = "2"
 # Local shell tabs.
 portable-pty = "0.9"
 # Crypto for the vault: Argon2id KDF + AES-256-GCM envelope, same primitives as the blueprint.

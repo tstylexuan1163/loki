@@ -1,4 +1,5 @@
 import { useEffect, useState, type ReactNode } from "react";
+import { listen } from "@tauri-apps/api/event";
 import logoUrl from "@/assets/logo.png";
 import { useApp } from "@/app/store";
 import { Gate } from "@/features/gate/Gate";
@@ -11,7 +12,10 @@ import { TerminalView } from "@/features/terminal/TerminalView";
 import { QuickConnect } from "@/features/terminal/QuickConnect";
 import { useTerminals, type TermTab } from "@/features/terminal/terminals";
 import { useAutoLock } from "@/app/useAutoLock";
-import { isAppShortcut, isMac, keyLabel, shortcutKey } from "@/app/platform";
+import { WindowControls } from "@/app/WindowControls";
+import { UpdateBanner } from "@/components/UpdateBanner";
+import { useUpdates } from "@/app/updates";
+import { isAppShortcut, isMac, isWindows, keyLabel, shortcutKey } from "@/app/platform";
 import { ConfirmHost, Toasts, toast } from "@/components/ui";
 import {
   IconForward,
@@ -45,6 +49,30 @@ export function App() {
   useEffect(() => {
     void boot();
   }, [boot]);
+
+  // Update progress arrives as an event; the engine owns the download.
+  useEffect(() => {
+    let disposed = false;
+    let un: (() => void) | undefined;
+    void listen<{ downloaded: number; total: number | null }>("update-progress", (e) => {
+      useUpdates.getState().setProgress(e.payload);
+    }).then((f) => {
+      if (disposed) f();
+      else un = f;
+    });
+    return () => {
+      disposed = true;
+      un?.();
+    };
+  }, []);
+
+  // One background check per launch, a few seconds in so it never competes with
+  // startup work. A failure stays silent; the user can retry from 关于.
+  useEffect(() => {
+    if (phase !== "unlocked") return;
+    const timer = window.setTimeout(() => void useUpdates.getState().check(true), 4000);
+    return () => window.clearTimeout(timer);
+  }, [phase]);
 
   // Store-level errors surface as toasts instead of a banner that pushes the
   // whole page down.
@@ -131,6 +159,8 @@ export function App() {
           <TerminalView visible={page.kind === "terminal"} />
         </main>
       </div>
+
+      <UpdateBanner />
 
       {settingsOpen && <SettingsWindow onClose={() => setSettingsOpen(false)} />}
       {quickOpen && <QuickConnect onClose={() => setQuickOpen(false)} />}
@@ -279,6 +309,9 @@ function TitleBar({ phase, onSearch }: { phase: string; onSearch?: () => void })
       <span className={`titlebar__status titlebar__status--${phase}`} data-tauri-drag-region>
         {phase === "onboarding" ? "初始化" : phase === "locked" ? "已锁定" : "已解锁"}
       </span>
+      {/* Only Windows runs frameless today; macOS keeps its traffic lights and
+          Linux still has a native frame, so neither draws these. */}
+      {isWindows && <WindowControls />}
     </div>
   );
 }

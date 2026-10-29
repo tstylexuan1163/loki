@@ -312,7 +312,10 @@ pub fn host_delete(state: State<'_, AppState>, id: String) -> Result<(), String>
             let updated = vault
                 .encrypt_item(&item.id, "host", &item.payload)
                 .map_err(|e| e.to_string())?;
-            vault.store().put_item(&updated).map_err(|e| e.to_string())?;
+            vault
+                .store()
+                .put_item(&updated)
+                .map_err(|e| e.to_string())?;
         }
     }
     vault.store().delete_item(&id).map_err(|e| e.to_string())
@@ -437,7 +440,11 @@ pub fn host_duplicate(state: State<'_, AppState>, id: String) -> Result<String, 
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "主机不存在".to_string())?;
     let mut payload = vault.decrypt_item(&row).map_err(|e| e.to_string())?.payload;
-    let name = payload.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let name = payload
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     payload["name"] = serde_json::Value::String(format!("{name} 副本"));
     let new_id = uuid::Uuid::new_v4().to_string();
     let row = vault
@@ -511,7 +518,11 @@ fn credentials_for(
             });
         }
     }
-    if payload.get("use_agent").and_then(|v| v.as_bool()).unwrap_or(true) {
+    if payload
+        .get("use_agent")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
+    {
         out.push(ssh::Credential::Agent);
     }
     let password = field("password");
@@ -524,7 +535,11 @@ fn credentials_for(
 }
 
 /// The vault's trusted keys for `host:port`.
-fn known_keys(vault: &crate::vault::Vault, host: &str, port: u16) -> Result<Vec<ssh::KnownKey>, String> {
+fn known_keys(
+    vault: &crate::vault::Vault,
+    host: &str,
+    port: u16,
+) -> Result<Vec<ssh::KnownKey>, String> {
     let rows = vault.store().list_items().map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     for row in rows.iter().filter(|r| r.kind == "known_host") {
@@ -558,7 +573,10 @@ fn save_known_key(vault: &crate::vault::Vault, key: &ssh::SeenKey) -> Result<(),
             && p.get("port").and_then(|v| v.as_u64()) == Some(key.port as u64)
             && p.get("key_type").and_then(|v| v.as_str()) == Some(key.key_type.as_str());
         if same {
-            vault.store().delete_item(&row.id).map_err(|e| e.to_string())?;
+            vault
+                .store()
+                .delete_item(&row.id)
+                .map_err(|e| e.to_string())?;
         }
     }
     let id = uuid::Uuid::new_v4().to_string();
@@ -1049,6 +1067,101 @@ fn session_view(s: &ssh::Session) -> SessionView {
     }
 }
 
+// ---- Updates -------------------------------------------------------------
+
+/// What a check found, in the shape the UI needs.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateInfo {
+    pub current_version: String,
+    pub version: String,
+    pub notes: Option<String>,
+    pub date: Option<String>,
+}
+
+/// Checks the configured endpoint for a newer release.
+///
+/// `Ok(None)` means "already current" — distinct from an error, so the UI can
+/// say "已是最新版本" instead of showing a failure.
+#[tauri::command]
+pub async fn update_check(app: tauri::AppHandle) -> Result<Option<UpdateInfo>, String> {
+    use tauri_plugin_updater::UpdaterExt;
+
+    let updater = app.updater_builder().build().map_err(|e| e.to_string())?;
+    match updater.check().await.map_err(|e| e.to_string())? {
+        Some(update) => Ok(Some(UpdateInfo {
+            current_version: update.current_version.clone(),
+            version: update.version.clone(),
+            notes: update.body.clone(),
+            date: update.date.map(|d| d.to_string()),
+        })),
+        None => Ok(None),
+    }
+}
+
+/// Downloads, verifies and hands the update to the platform installer.
+///
+/// Progress is emitted as `update-progress` with `{ downloaded, total }`.
+/// On success the app usually restarts itself; the UI should also offer a
+/// manual restart in case the platform finishes asynchronously.
+#[tauri::command]
+pub async fn update_install(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    use tauri_plugin_updater::UpdaterExt;
+
+    // One install at a time: a second click would race the same temp file.
+    {
+        let mut busy = state.update_busy.lock().map_err(|e| e.to_string())?;
+        if *busy {
+            return Err("正在更新中".into());
+        }
+        *busy = true;
+    }
+
+    // Release the flag on every exit path.
+    let state_ref = state.inner();
+    let result = async {
+        let updater = app.updater_builder().build().map_err(|e| e.to_string())?;
+        let update = updater
+            .check()
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "没有可用更新".to_string())?;
+
+        let emitter = app.clone();
+        let mut downloaded: u64 = 0;
+        update
+            .download_and_install(
+                move |chunk: usize, total: Option<u64>| {
+                    downloaded += chunk as u64;
+                    let _ = emitter.emit(
+                        "update-progress",
+                        serde_json::json!({ "downloaded": downloaded, "total": total }),
+                    );
+                },
+                || {},
+            )
+            .await
+            .map_err(|e| e.to_string())
+    }
+    .await;
+
+    if let Ok(mut busy) = state_ref.update_busy.lock() {
+        *busy = false;
+    }
+
+    // macOS replaces the .app in place, so the running process must re-exec the
+    // new binary. On Windows the NSIS installer restarts the app itself.
+    #[cfg(target_os = "macos")]
+    if result.is_ok() {
+        app.restart();
+    }
+
+    result
+}
+
 // ---- Telnet & serial -----------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1266,7 +1379,8 @@ pub struct ProviderView {
     pub name: String,
     pub protocol: String,
     pub base_url: String,
-    pub model: String,
+    /// Every model the user added, in their order.
+    pub models: Vec<String>,
     pub has_key: bool,
 }
 
@@ -1277,7 +1391,8 @@ pub struct ProviderInput {
     pub name: String,
     pub protocol: String,
     pub base_url: String,
-    pub model: String,
+    #[serde(default)]
+    pub models: Vec<String>,
     /// Blank keeps the stored key.
     pub api_key: Option<String>,
 }
@@ -1304,11 +1419,28 @@ fn provider_from_payload(p: &serde_json::Value) -> ProviderView {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
-        model: p
-            .get("model")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
+        models: {
+            // `model` is the 0.7 shape: a single string. Fold it into the list
+            // so an upgraded install keeps its provider usable.
+            let list: Vec<String> = p
+                .get("models")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|m| m.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if list.is_empty() {
+                p.get("model")
+                    .and_then(|v| v.as_str())
+                    .filter(|m| !m.is_empty())
+                    .map(|m| vec![m.to_string()])
+                    .unwrap_or_default()
+            } else {
+                list
+            }
+        },
         has_key: p
             .get("api_key")
             .and_then(|v| v.as_str())
@@ -1369,12 +1501,26 @@ pub fn ai_provider_save(
         .or(existing_key)
         .unwrap_or_default();
 
+    // Reject a malformed address here rather than at request time, where the
+    // error would surface as a confusing network failure.
+    let base_url =
+        crate::ai::provider::validate_base_url(&input.base_url).map_err(|e| e.to_string())?;
+
+    // Trim, drop blanks, de-duplicate while keeping the user's order.
+    let mut models: Vec<String> = Vec::new();
+    for m in &input.models {
+        let m = m.trim();
+        if !m.is_empty() && !models.iter().any(|x| x == m) {
+            models.push(m.to_string());
+        }
+    }
+
     let payload = serde_json::json!({
         "id": id,
         "name": input.name,
         "protocol": input.protocol,
-        "base_url": input.base_url,
-        "model": input.model,
+        "base_url": base_url,
+        "models": models,
         "api_key": api_key,
     });
 
@@ -1410,18 +1556,107 @@ fn load_provider(
             .unwrap_or("")
             .to_string()
     };
-    let protocol = match f("protocol").as_str() {
-        "anthropic" => crate::ai::provider::Protocol::Anthropic,
-        _ => crate::ai::provider::Protocol::OpenAi,
+    let protocol = crate::ai::provider::Protocol::parse(&f("protocol"));
+    let models: Vec<String> = item
+        .payload
+        .get("models")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|m| m.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let models = if models.is_empty() {
+        item.payload
+            .get("model")
+            .and_then(|v| v.as_str())
+            .filter(|m| !m.is_empty())
+            .map(|m| vec![m.to_string()])
+            .unwrap_or_default()
+    } else {
+        models
     };
+
     Ok(crate::ai::provider::ProviderConfig {
         id: f("id"),
         name: f("name"),
         protocol,
         base_url: f("base_url"),
-        model: f("model"),
+        model: models.first().cloned().unwrap_or_default(),
+        models,
         api_key: f("api_key"),
     })
+}
+
+/// Builds a runtime config from a dialog's draft.
+///
+/// The dialog can ask for the model list or test the connection *before* saving,
+/// so a blank key means "use the one already stored for this id".
+fn config_from_input(
+    state: &AppState,
+    input: &ProviderInput,
+) -> Result<crate::ai::provider::ProviderConfig, String> {
+    let api_key = match input.api_key.as_ref().filter(|k| !k.is_empty()) {
+        Some(k) => k.clone(),
+        None => match &input.id {
+            Some(id) => {
+                let vault = state.vault.lock().map_err(|e| e.to_string())?;
+                vault
+                    .store()
+                    .get_item(id)
+                    .map_err(|e| e.to_string())?
+                    .map(|row| vault.decrypt_item(&row))
+                    .transpose()
+                    .map_err(|e| e.to_string())?
+                    .and_then(|item| {
+                        item.payload
+                            .get("api_key")
+                            .and_then(|v| v.as_str())
+                            .map(String::from)
+                    })
+                    .unwrap_or_default()
+            }
+            None => String::new(),
+        },
+    };
+
+    let base_url =
+        crate::ai::provider::validate_base_url(&input.base_url).map_err(|e| e.to_string())?;
+
+    Ok(crate::ai::provider::ProviderConfig {
+        id: input.id.clone().unwrap_or_default(),
+        name: input.name.clone(),
+        protocol: crate::ai::provider::Protocol::parse(&input.protocol),
+        base_url,
+        model: input.models.first().cloned().unwrap_or_default(),
+        models: input.models.clone(),
+        api_key,
+    })
+}
+
+/// Fetches the provider's model list, without saving anything.
+#[tauri::command]
+pub async fn ai_provider_models(
+    state: State<'_, AppState>,
+    input: ProviderInput,
+) -> Result<Vec<String>, String> {
+    let config = config_from_input(&state, &input)?;
+    crate::ai::provider::list_models(&config)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Proves the URL and key work, returning a human-readable verdict.
+#[tauri::command]
+pub async fn ai_provider_test(
+    state: State<'_, AppState>,
+    input: ProviderInput,
+) -> Result<String, String> {
+    let config = config_from_input(&state, &input)?;
+    crate::ai::provider::test_connection(&config)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Starts a turn. Events stream on `ai-event`; gated calls wait for
@@ -1431,11 +1666,22 @@ pub async fn ai_send(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     provider_id: String,
+    model: Option<String>,
     session_id: Option<String>,
     mode: String,
     history: Vec<serde_json::Value>,
 ) -> Result<(), String> {
-    let config = load_provider(&state, &provider_id)?;
+    let mut config = load_provider(&state, &provider_id)?;
+
+    // The panel picks one of the provider's models; fall back to the first.
+    if let Some(chosen) = model.filter(|m| !m.trim().is_empty()) {
+        if config.models.iter().any(|m| m == &chosen) {
+            config.model = chosen;
+        }
+    }
+    if config.model.trim().is_empty() {
+        return Err("这个服务商还没有添加模型".into());
+    }
 
     let permission = match mode.as_str() {
         "auto" => crate::ai::tools::PermissionMode::Auto,
@@ -2004,12 +2250,16 @@ pub fn ssh_config_import(
         let jump_host_id = e.proxy_jump.as_ref().and_then(|j| {
             let alias = j.split('@').next_back().unwrap_or(j);
             let alias = alias.split(':').next().unwrap_or(alias);
-            ids.get(alias).cloned().or_else(|| existing_by_name.get(alias).cloned())
+            ids.get(alias)
+                .cloned()
+                .or_else(|| existing_by_name.get(alias).cloned())
         });
         if e.proxy_jump.is_some() && jump_host_id.is_none() {
-            report
-                .notes
-                .push(format!("{}：跳板机 {} 不在已选列表里，已忽略", e.alias, e.proxy_jump.as_deref().unwrap_or("")));
+            report.notes.push(format!(
+                "{}：跳板机 {} 不在已选列表里，已忽略",
+                e.alias,
+                e.proxy_jump.as_deref().unwrap_or("")
+            ));
         }
         let payload = serde_json::json!({
             "name": e.alias,
@@ -2056,7 +2306,16 @@ pub async fn sftp_upload(
 ) -> Result<Vec<String>, String> {
     let mut ids = Vec::new();
     for local in locals {
-        ids.push(start_transfer(&state, session_id.clone(), "upload", local, remote_dir.clone()).await?);
+        ids.push(
+            start_transfer(
+                &state,
+                session_id.clone(),
+                "upload",
+                local,
+                remote_dir.clone(),
+            )
+            .await?,
+        );
     }
     Ok(ids)
 }
@@ -2142,9 +2401,11 @@ async fn start_transfer(
         let result = async {
             let sftp = crate::sftp::open_sftp(session.handle()).await?;
             if direction == "upload" {
-                crate::transfer::upload(&sftp, std::path::Path::new(&from), &to, &cancel, report).await
+                crate::transfer::upload(&sftp, std::path::Path::new(&from), &to, &cancel, report)
+                    .await
             } else {
-                crate::transfer::download(&sftp, &from, std::path::Path::new(&to), &cancel, report).await
+                crate::transfer::download(&sftp, &from, std::path::Path::new(&to), &cancel, report)
+                    .await
             }
         }
         .await;

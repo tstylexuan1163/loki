@@ -80,7 +80,10 @@ pub fn parse(text: &str, home: &str, default_user: &str) -> Vec<SshConfigEntry> 
         }
         // `Key value`, `Key=value` and `Key = value` are all accepted.
         let (key, value) = match line.split_once(|c: char| c.is_whitespace() || c == '=') {
-            Some((k, v)) => (k.to_lowercase(), v.trim_start_matches(['=', ' ', '\t']).trim()),
+            Some((k, v)) => (
+                k.to_lowercase(),
+                v.trim_start_matches(['=', ' ', '\t']).trim(),
+            ),
             None => continue,
         };
         let value = value.trim_matches('"');
@@ -139,7 +142,10 @@ pub fn parse(text: &str, home: &str, default_user: &str) -> Vec<SshConfigEntry> 
                     .clone()
                     .or_else(|| defaults.identity_file.clone())
                     .map(|p| expand_home(&p, home)),
-                proxy_jump: block.proxy_jump.clone().or_else(|| defaults.proxy_jump.clone()),
+                proxy_jump: block
+                    .proxy_jump
+                    .clone()
+                    .or_else(|| defaults.proxy_jump.clone()),
             });
         }
     }
@@ -150,8 +156,8 @@ pub fn parse(text: &str, home: &str, default_user: &str) -> Vec<SshConfigEntry> 
 pub fn read_user_config() -> Result<Vec<SshConfigEntry>, String> {
     let home = crate::local::home_dir().ok_or_else(|| "无法确定主目录".to_string())?;
     let path = std::path::Path::new(&home).join(".ssh/config");
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| format!("无法读取 {}：{e}", path.display()))?;
+    let text =
+        std::fs::read_to_string(&path).map_err(|e| format!("无法读取 {}：{e}", path.display()))?;
     // USERNAME is the Windows spelling.
     let user = std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
@@ -195,7 +201,10 @@ Match host foo
         assert_eq!(prod.hostname, "10.0.0.5");
         assert_eq!(prod.port, 2200);
         assert_eq!(prod.user, "fallback");
-        assert_eq!(prod.identity_file.as_deref(), Some("/home/me/.ssh/id_ed25519"));
+        assert_eq!(
+            prod.identity_file.as_deref(),
+            Some("/home/me/.ssh/id_ed25519")
+        );
         assert_eq!(prod.proxy_jump.as_deref(), Some("bastion"));
 
         let bastion = &entries[2];

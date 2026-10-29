@@ -9,6 +9,7 @@ import { ChangePasswordSection } from "@/features/settings/ChangePasswordSection
 import { usePrefs } from "@/app/prefs";
 import { api } from "@/lib/api";
 import { isMac, keyLabel } from "@/app/platform";
+import { useUpdates } from "@/app/updates";
 import {
   IconCloud,
   IconInfo,
@@ -159,26 +160,73 @@ const SHORTCUTS: [string, string][] = [
 
 function AboutSection() {
   const [version, setVersion] = useState("");
+  const phase = useUpdates((s) => s.phase);
+  const info = useUpdates((s) => s.info);
+  const message = useUpdates((s) => s.message);
+  const progress = useUpdates((s) => s.progress);
+  const check = useUpdates((s) => s.check);
+  const install = useUpdates((s) => s.install);
+
   useEffect(() => {
     void api.appInfo().then((i) => setVersion(i.version)).catch(() => {});
   }, []);
+
+  const status = (() => {
+    switch (phase) {
+      case "checking":
+        return "正在检查…";
+      case "current":
+        return "已是最新版本";
+      case "available":
+        return `发现新版本 ${info?.version ?? ""}`;
+      case "downloading":
+        return progress?.total
+          ? `正在下载 ${Math.round((progress.downloaded / progress.total) * 100)}%`
+          : "正在下载…";
+      case "ready":
+        return "更新已安装，重启后生效";
+      case "error":
+        return message ?? "检查失败";
+      default:
+        return "";
+    }
+  })();
+
+  const busy = phase === "checking" || phase === "downloading";
+
   return (
     <section className="settings__group">
       <div className="settings__group-title">关于 loki</div>
+
       <div className="settings__row">
         <div className="settings__row-main">
           <div className="settings__label">版本</div>
-          <div className="settings__hint">{version || "…"} · 基于 Hatoba 架构蓝图重实现</div>
+          <div className="settings__hint">
+            {version || "…"} · 基于 Hatoba 架构蓝图重实现
+            {status && <span className="settings__hint"> · {status}</span>}
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 6 }}>
+          <button className="btn btn--sm" disabled={busy} onClick={() => void check(false)}>
+            {phase === "checking" ? "检查中…" : "检查更新"}
+          </button>
+          {phase === "available" && (
+            <button className="btn btn--primary btn--sm" onClick={() => void install()}>
+              下载并安装
+            </button>
+          )}
         </div>
       </div>
+
       <div className="settings__row">
         <div className="settings__row-main">
           <div className="settings__label">数据位置</div>
           <div className="settings__hint" style={{ fontFamily: "ui-monospace, Menlo, monospace" }}>
-            ~/Library/Application Support/app.loki.desktop/loki.db
+            {dataDir()}
           </div>
         </div>
       </div>
+
       <div className="settings__row">
         <div className="settings__row-main">
           <div className="settings__hint" style={{ lineHeight: 1.7 }}>
@@ -190,4 +238,11 @@ function AboutSection() {
       </div>
     </section>
   );
+}
+
+/** Where the vault lives, per platform (Tauri's `app_data_dir`). */
+function dataDir(): string {
+  return isMac
+    ? "~/Library/Application Support/app.loki.desktop"
+    : "%APPDATA%\\app.loki.desktop";
 }
