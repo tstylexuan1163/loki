@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>loki (mock)</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <!-- A fake Tauri backend so the UI can be developed and reviewed in a plain
+         browser: `pnpm dev`, then open /dev/mock.html. No secrets, no network. -->
+    <script src="./mock-ipc.js"></script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

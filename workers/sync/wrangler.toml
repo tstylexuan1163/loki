@@ -1,0 +1,9 @@
+name = "loki-sync"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+
+# Fill in after `wrangler d1 create loki-sync`.
+[[d1_databases]]
+binding = "DB"
+database_name = "loki-sync"
+database_id = "REPLACE_WITH_YOUR_D1_ID"

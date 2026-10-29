@@ -1,0 +1,2195 @@
+//! IPC surface. Every command returns `Result<T, String>` so the WebView gets a
+//! readable message; secrets travel one way only (into Rust).
+
+use crate::crypto::RecoveryCode;
+use crate::ssh::{self, ConnectOutcome, TermEvent};
+use crate::vault::{PlainItem, VaultStatus};
+use crate::AppState;
+use base64::Engine;
+use serde::{Deserialize, Serialize};
+use tauri::{Emitter, Manager, State};
+
+/// A host as the UI sees it. Note what is absent: no password, no key material.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostView {
+    pub id: String,
+    pub name: String,
+    /// `ssh`, `telnet`, or `serial`. Defaults to `ssh` for older rows.
+    pub protocol: String,
+    pub address: String,
+    pub port: u16,
+    pub username: String,
+    pub tags: Vec<String>,
+    /// Serial framing; only meaningful when `protocol == "serial"`.
+    pub baud: Option<u32>,
+    pub data_bits: Option<u8>,
+    pub parity: Option<String>,
+    pub stop_bits: Option<u8>,
+    /// Whether a password is stored, never the password itself.
+    pub has_password: bool,
+    /// Whether a private key is stored, never the key itself.
+    pub has_key: bool,
+    /// A key from the key vault to log in with, by id.
+    pub key_id: Option<String>,
+    /// Another saved host to tunnel through (`ProxyJump`).
+    pub jump_host_id: Option<String>,
+    /// Whether to offer the local ssh-agent's keys.
+    pub use_agent: bool,
+    /// Typed into the shell right after it opens.
+    pub startup_command: Option<String>,
+}
+
+impl HostView {
+    /// A plain SSH host; tests and non-serial call paths use this instead of
+    /// spelling out every optional field.
+    pub fn ssh(id: &str, name: &str, address: &str, port: u16, username: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            name: name.to_string(),
+            protocol: "ssh".to_string(),
+            address: address.to_string(),
+            port,
+            username: username.to_string(),
+            tags: vec![],
+            baud: None,
+            data_bits: None,
+            parity: None,
+            stop_bits: None,
+            has_password: false,
+            has_key: false,
+            key_id: None,
+            jump_host_id: None,
+            use_agent: true,
+            startup_command: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionView {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+    pub fingerprint: Option<String>,
+}
+
+#[tauri::command]
+pub fn vault_status(state: State<'_, AppState>) -> Result<VaultStatus, String> {
+    let vault = state.vault.lock().map_err(|e| e.to_string())?;
+    Ok(vault.status())
+}
+
+/// What `vault_create` hands back: the status plus the one-time recovery code.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateVaultResult {
+    pub status: VaultStatus,
+    /// Shown once; never stored in plaintext anywhere.
+    pub recovery_code: Option<String>,
+}
+
+#[tauri::command]
+pub fn vault_create(
+    state: State<'_, AppState>,
+    password: String,
+) -> Result<CreateVaultResult, String> {
+    let mut vault = state.vault.lock().map_err(|e| e.to_string())?;
+    let code = vault
+        .create(&password, crate::crypto::KdfParams::default())
+        .map_err(|e| e.to_string())?;
+    Ok(CreateVaultResult {
+        status: vault.status(),
+        recovery_code: Some(code.display),
+    })
+}
+
+/// Unlocks with a recovery code, for a user who forgot the password.
+#[tauri::command]
+pub fn vault_recover(state: State<'_, AppState>, code: String) -> Result<VaultStatus, String> {
+    let parsed = RecoveryCode::parse(&code).map_err(|_| "恢复码格式不正确".to_string())?;
+    let mut vault = state.vault.lock().map_err(|e| e.to_string())?;
+    vault
+        .unlock_with_recovery(&parsed)
+        .map_err(|e| e.to_string())?;
+    Ok(vault.status())
+}
+
+/// Sets a new master password. The vault must be unlocked first.
+#[tauri::command]
+pub fn vault_change_password(
+    state: State<'_, AppState>,
+    new_password: String,
+) -> Result<VaultStatus, String> {
+    if new_password.len() < 8 {
+        return Err("新密码至少 8 位".to_string());
+    }
+    let mut vault = state.vault.lock().map_err(|e| e.to_string())?;
+    vault
+        .change_password(&new_password, crate::crypto::KdfParams::default())
+        .map_err(|e| e.to_string())?;
+    Ok(vault.status())
+}
+
+#[tauri::command]
+pub fn vault_unlock(state: State<'_, AppState>, password: String) -> Result<VaultStatus, String> {
+    let mut vault = state.vault.lock().map_err(|e| e.to_string())?;
+    vault.unlock(&password).map_err(|e| e.to_string())?;
+    Ok(vault.status())
+}
+
+#[tauri::command]
+/// Locks the vault and drops the key material.
+///
+/// With `close_sessions` the live SSH connections are torn down too; a locked
+/// app should not keep a shell open that the UI can no longer show.
+pub async fn lock_vault(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    close_sessions: bool,
+) -> Result<VaultStatus, String> {
+    let status = {
+        let mut vault = state.vault.lock().map_err(|e| e.to_string())?;
+        vault.lock();
+        vault.status()
+    };
+
+    if close_sessions {
+        close_everything(state).await;
+    }
+
+    // The UI listens for this to drop the lock screen in place.
+    let _ = app.emit("vault-locked", &status);
+    Ok(status)
+}
+
+/// Tears down every live connection: SSH, telnet, serial, local shells,
+/// forwards and transfers. A locked app must not keep anything open that the
+/// UI can no longer show or stop.
+pub async fn close_everything(state: &AppState) {
+    if let Ok(mut f) = state.forwards.lock() {
+        for view in f.list() {
+            f.remove(&view.id);
+        }
+    }
+    if let Ok(mut t) = state.transfers.lock() {
+        for flag in t.values() {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        t.clear();
+    }
+    if let Ok(mut m) = state.sftp.lock() {
+        m.clear();
+    }
+    if let Ok(mut d) = state.direct.lock() {
+        d.stop_all();
+    }
+    let sessions = state.ssh.lock().map(|mut m| m.drain()).unwrap_or_default();
+    for session in sessions {
+        ssh::close(session).await;
+    }
+}
+
+#[tauri::command]
+pub async fn vault_lock(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<VaultStatus, String> {
+    lock_vault(&app, &state, true).await
+}
+
+/// Lists hosts. Decryption happens here, in Rust, and the plaintext is never
+/// persisted; only the fields below cross the IPC boundary.
+#[tauri::command]
+pub fn hosts_list(state: State<'_, AppState>) -> Result<Vec<HostView>, String> {
+    let vault = state.vault.lock().map_err(|e| e.to_string())?;
+    let rows = vault.store().list_items().map_err(|e| e.to_string())?;
+
+    let mut out = Vec::new();
+    for row in rows.iter().filter(|r| r.kind == "host") {
+        let item = vault.decrypt_item(row).map_err(|e| e.to_string())?;
+        out.push(to_host_view(&item));
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+pub fn host_save(state: State<'_, AppState>, host: HostInput) -> Result<String, String> {
+    let vault = state.vault.lock().map_err(|e| e.to_string())?;
+
+    let id = host
+        .id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    // Blank means "leave what is stored alone": editing a host must not wipe a
+    // password the user never retyped.
+    let existing = if host.id.is_some() {
+        vault
+            .store()
+            .get_item(&id)
+            .map_err(|e| e.to_string())?
+            .map(|row| vault.decrypt_item(&row))
+            .transpose()
+            .map_err(|e| e.to_string())?
+            .map(|item| item.payload)
+    } else {
+        None
+    };
+    let keep = |field: &str| -> Option<String> {
+        existing
+            .as_ref()
+            .and_then(|p| p.get(field))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    };
+
+    let password = host
+        .password
+        .as_ref()
+        .filter(|p| !p.is_empty())
+        .cloned()
+        .or_else(|| (!host.clear_password).then(|| keep("password")).flatten());
+    let pasted = host
+        .private_key
+        .as_ref()
+        .filter(|k| !k.trim().is_empty())
+        .map(|k| ssh::normalize_private_key(k));
+    let private_key = pasted
+        .clone()
+        .or_else(|| (!host.clear_key).then(|| keep("private_key")).flatten());
+    // Catch a broken paste now rather than at the next connect attempt.
+    if let Some(pem) = &pasted {
+        if let Err(e) = russh::keys::decode_secret_key(pem, None) {
+            let msg = e.to_string();
+            if !msg.to_lowercase().contains("encrypted") && !msg.contains("passphrase") {
+                return Err(format!("私钥无法解析：{msg}"));
+            }
+        }
+    }
+    if host.jump_host_id.as_deref() == Some(id.as_str()) {
+        return Err("主机不能把自己当作跳板机".into());
+    }
+
+    let payload = serde_json::json!({
+        "name": host.name,
+        "protocol": host.protocol,
+        "address": host.address,
+        "port": host.port,
+        "username": host.username,
+        "tags": host.tags,
+        "baud": host.baud,
+        "data_bits": host.data_bits,
+        "parity": host.parity,
+        "stop_bits": host.stop_bits,
+        // Credentials sit inside the same envelope as everything else, so an
+        // operator reading the database cannot even tell one is present.
+        "password": password,
+        "private_key": private_key,
+        "key_id": host.key_id.filter(|k| !k.is_empty()),
+        "jump_host_id": host.jump_host_id.filter(|k| !k.is_empty()),
+        "use_agent": host.use_agent,
+        "startup_command": host.startup_command.filter(|c| !c.trim().is_empty()),
+    });
+
+    let row = vault
+        .encrypt_item(&id, "host", &payload)
+        .map_err(|e| e.to_string())?;
+    vault.store().put_item(&row).map_err(|e| e.to_string())?;
+    Ok(id)
+}
+
+#[tauri::command]
+pub fn host_delete(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let vault = state.vault.lock().map_err(|e| e.to_string())?;
+    // A host that tunnelled through this one would otherwise fail with a
+    // confusing "jump host not found" on its next connect.
+    let rows = vault.store().list_items().map_err(|e| e.to_string())?;
+    for row in rows.iter().filter(|r| r.kind == "host" && r.id != id) {
+        let mut item = vault.decrypt_item(row).map_err(|e| e.to_string())?;
+        if item.payload.get("jump_host_id").and_then(|v| v.as_str()) == Some(id.as_str()) {
+            item.payload["jump_host_id"] = serde_json::Value::Null;
+            let updated = vault
+                .encrypt_item(&item.id, "host", &item.payload)
+                .map_err(|e| e.to_string())?;
+            vault.store().put_item(&updated).map_err(|e| e.to_string())?;
+        }
+    }
+    vault.store().delete_item(&id).map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostInput {
+    pub id: Option<String>,
+    pub name: String,
+    #[serde(default = "default_protocol")]
+    pub protocol: String,
+    pub address: String,
+    pub port: u16,
+    pub username: String,
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub baud: Option<u32>,
+    #[serde(default)]
+    pub data_bits: Option<u8>,
+    #[serde(default)]
+    pub parity: Option<String>,
+    #[serde(default)]
+    pub stop_bits: Option<u8>,
+    pub password: Option<String>,
+    /// An `OpenSSH` private key, stored encrypted alongside the host.
+    pub private_key: Option<String>,
+    /// Drop the stored password instead of keeping it.
+    #[serde(default)]
+    pub clear_password: bool,
+    /// Drop the stored private key instead of keeping it.
+    #[serde(default)]
+    pub clear_key: bool,
+    #[serde(default)]
+    pub key_id: Option<String>,
+    #[serde(default)]
+    pub jump_host_id: Option<String>,
+    #[serde(default = "default_true")]
+    pub use_agent: bool,
+    #[serde(default)]
+    pub startup_command: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_protocol() -> String {
+    "ssh".to_string()
+}
+
+fn to_host_view(item: &PlainItem) -> HostView {
+    let p = &item.payload;
+    HostView {
+        id: item.id.clone(),
+        name: p
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        address: p
+            .get("address")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        protocol: p
+            .get("protocol")
+            .and_then(|v| v.as_str())
+            .unwrap_or("ssh")
+            .to_string(),
+        port: p.get("port").and_then(|v| v.as_u64()).unwrap_or(22) as u16,
+        baud: p.get("baud").and_then(|v| v.as_u64()).map(|v| v as u32),
+        data_bits: p.get("data_bits").and_then(|v| v.as_u64()).map(|v| v as u8),
+        parity: p.get("parity").and_then(|v| v.as_str()).map(String::from),
+        stop_bits: p.get("stop_bits").and_then(|v| v.as_u64()).map(|v| v as u8),
+        username: p
+            .get("username")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        tags: p
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|t| t.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        has_password: p
+            .get("password")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false),
+        has_key: p
+            .get("private_key")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false),
+        key_id: str_field(p, "key_id"),
+        jump_host_id: str_field(p, "jump_host_id"),
+        use_agent: p.get("use_agent").and_then(|v| v.as_bool()).unwrap_or(true),
+        startup_command: str_field(p, "startup_command"),
+    }
+}
+
+fn str_field(p: &serde_json::Value, name: &str) -> Option<String> {
+    p.get(name)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+/// Copies a host, secrets included, under a new id. The copy is made here
+/// because the WebView never holds the secrets it would need to do it.
+#[tauri::command]
+pub fn host_duplicate(state: State<'_, AppState>, id: String) -> Result<String, String> {
+    let vault = state.vault.lock().map_err(|e| e.to_string())?;
+    let row = vault
+        .store()
+        .get_item(&id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "主机不存在".to_string())?;
+    let mut payload = vault.decrypt_item(&row).map_err(|e| e.to_string())?.payload;
+    let name = payload.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    payload["name"] = serde_json::Value::String(format!("{name} 副本"));
+    let new_id = uuid::Uuid::new_v4().to_string();
+    let row = vault
+        .encrypt_item(&new_id, "host", &payload)
+        .map_err(|e| e.to_string())?;
+    vault.store().put_item(&row).map_err(|e| e.to_string())?;
+    Ok(new_id)
+}
+
+#[tauri::command]
+pub fn sessions_list(state: State<'_, AppState>) -> Result<Vec<SessionView>, String> {
+    let mgr = state.ssh.lock().map_err(|e| e.to_string())?;
+    Ok(mgr.list().iter().map(session_view).collect())
+}
+
+/// Pulls the host and its credential out of the vault.
+///
+/// The secret lives only in the returned value and is dropped once the
+/// handshake finishes. A key takes precedence over a password when both exist.
+fn load_host(state: &AppState, host_id: &str) -> Result<(HostView, serde_json::Value), String> {
+    let vault = state.vault.lock().map_err(|e| e.to_string())?;
+    let row = vault
+        .store()
+        .get_item(host_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "主机不存在".to_string())?;
+    let item = vault.decrypt_item(&row).map_err(|e| e.to_string())?;
+    let view = to_host_view(&item);
+    Ok((view, item.payload))
+}
+
+/// Builds the credential list for a host payload, in the order `ssh` tries
+/// them: the host's own key, a key from the key vault, the agent, then a
+/// password (saved, or typed just now).
+///
+/// Separate from loading the host: telnet and serial have no credential, and
+/// demanding one before the protocol is known rejected valid connections.
+fn credentials_for(
+    vault: &crate::vault::Vault,
+    payload: &serde_json::Value,
+    one_time_password: Option<&str>,
+) -> Result<Vec<ssh::Credential>, String> {
+    let field = |name: &str| -> String {
+        payload
+            .get(name)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let mut out = Vec::new();
+
+    let key = field("private_key");
+    if !key.is_empty() {
+        out.push(ssh::Credential::Key {
+            pem: key,
+            passphrase: None,
+        });
+    }
+    let key_id = field("key_id");
+    if !key_id.is_empty() {
+        let row = vault
+            .store()
+            .get_item(&key_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "这台主机引用的密钥已被删除".to_string())?;
+        let item = vault.decrypt_item(&row).map_err(|e| e.to_string())?;
+        if let Some(pem) = item.payload.get("private_key").and_then(|v| v.as_str()) {
+            out.push(ssh::Credential::Key {
+                pem: pem.to_string(),
+                passphrase: None,
+            });
+        }
+    }
+    if payload.get("use_agent").and_then(|v| v.as_bool()).unwrap_or(true) {
+        out.push(ssh::Credential::Agent);
+    }
+    let password = field("password");
+    if !password.is_empty() {
+        out.push(ssh::Credential::Password(password));
+    } else if let Some(pw) = one_time_password.filter(|p| !p.is_empty()) {
+        out.push(ssh::Credential::Password(pw.to_string()));
+    }
+    Ok(out)
+}
+
+/// The vault's trusted keys for `host:port`.
+fn known_keys(vault: &crate::vault::Vault, host: &str, port: u16) -> Result<Vec<ssh::KnownKey>, String> {
+    let rows = vault.store().list_items().map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for row in rows.iter().filter(|r| r.kind == "known_host") {
+        let item = vault.decrypt_item(row).map_err(|e| e.to_string())?;
+        let p = &item.payload;
+        let same_host = p
+            .get("host")
+            .and_then(|v| v.as_str())
+            .is_some_and(|h| h.eq_ignore_ascii_case(host));
+        let same_port = p.get("port").and_then(|v| v.as_u64()) == Some(port as u64);
+        if same_host && same_port {
+            out.push(ssh::KnownKey {
+                key_type: str_field(p, "key_type").unwrap_or_default(),
+                fingerprint: str_field(p, "fingerprint").unwrap_or_default(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Trusts a key for its `host:port`, replacing any older key of the same type.
+fn save_known_key(vault: &crate::vault::Vault, key: &ssh::SeenKey) -> Result<(), String> {
+    let rows = vault.store().list_items().map_err(|e| e.to_string())?;
+    for row in rows.iter().filter(|r| r.kind == "known_host") {
+        let item = vault.decrypt_item(row).map_err(|e| e.to_string())?;
+        let p = &item.payload;
+        let same = p
+            .get("host")
+            .and_then(|v| v.as_str())
+            .is_some_and(|h| h.eq_ignore_ascii_case(&key.host))
+            && p.get("port").and_then(|v| v.as_u64()) == Some(key.port as u64)
+            && p.get("key_type").and_then(|v| v.as_str()) == Some(key.key_type.as_str());
+        if same {
+            vault.store().delete_item(&row.id).map_err(|e| e.to_string())?;
+        }
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    let payload = serde_json::json!({
+        "host": key.host.to_lowercase(),
+        "port": key.port,
+        "key_type": key.key_type,
+        "fingerprint": key.fingerprint,
+        "added_at": now_secs(),
+    });
+    let row = vault
+        .encrypt_item(&id, "known_host", &payload)
+        .map_err(|e| e.to_string())?;
+    vault.store().put_item(&row).map_err(|e| e.to_string())
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KnownHostView {
+    pub id: String,
+    pub host: String,
+    pub port: u16,
+    pub key_type: String,
+    pub fingerprint: String,
+    pub added_at: i64,
+}
+
+#[tauri::command]
+pub fn known_hosts_list(state: State<'_, AppState>) -> Result<Vec<KnownHostView>, String> {
+    let vault = state.vault.lock().map_err(|e| e.to_string())?;
+    let rows = vault.store().list_items().map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for row in rows.iter().filter(|r| r.kind == "known_host") {
+        let item = vault.decrypt_item(row).map_err(|e| e.to_string())?;
+        let p = &item.payload;
+        out.push(KnownHostView {
+            id: item.id.clone(),
+            host: str_field(p, "host").unwrap_or_default(),
+            port: p.get("port").and_then(|v| v.as_u64()).unwrap_or(22) as u16,
+            key_type: str_field(p, "key_type").unwrap_or_default(),
+            fingerprint: str_field(p, "fingerprint").unwrap_or_default(),
+            added_at: p.get("added_at").and_then(|v| v.as_i64()).unwrap_or(0),
+        });
+    }
+    out.sort_by(|a, b| a.host.cmp(&b.host).then(a.port.cmp(&b.port)));
+    Ok(out)
+}
+
+#[tauri::command]
+pub fn known_host_delete(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let vault = state.vault.lock().map_err(|e| e.to_string())?;
+    vault.store().delete_item(&id).map_err(|e| e.to_string())
+}
+
+/// An unsaved SSH target typed into quick connect.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuickTarget {
+    pub address: String,
+    pub port: u16,
+    pub username: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenInput {
+    /// A saved host, or…
+    pub host_id: Option<String>,
+    /// …an ad-hoc target.
+    pub target: Option<QuickTarget>,
+    /// The fingerprint the user just confirmed.
+    pub accept: Option<String>,
+    /// A password typed in for this attempt only, and the host it is for.
+    pub password: Option<String>,
+    pub password_host: Option<String>,
+    /// Store the typed password on the saved host after a successful login.
+    #[serde(default)]
+    pub remember_password: bool,
+    pub cols: Option<u32>,
+    pub rows: Option<u32>,
+}
+
+/// Everything the terminal wants to know before it may connect.
+#[derive(Debug, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectResult {
+    /// `connected`, `hostKey` or `needPassword`.
+    pub kind: String,
+    pub session: Option<SessionView>,
+    /// For `hostKey`: what the server presented, and for which hop.
+    pub fingerprint: Option<String>,
+    pub key_type: Option<String>,
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    /// For `hostKey`: the fingerprint the vault had for this host before.
+    /// Present means the key *changed*.
+    pub previous: Option<String>,
+    /// For `needPassword`.
+    pub username: Option<String>,
+}
+
+/// Connects to a saved host or a quick-connect target.
+#[tauri::command]
+pub async fn session_open(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    input: OpenInput,
+) -> Result<ConnectResult, String> {
+    let cols = input.cols.unwrap_or(120);
+    let rows = input.rows.unwrap_or(32);
+
+    // Gather everything from the vault first, then drop the lock before
+    // touching the network.
+    let (host, payload) = match (&input.host_id, &input.target) {
+        (Some(id), _) => load_host(&state, id)?,
+        (None, Some(t)) => {
+            let mut view = HostView::ssh("", "", &t.address, t.port, &t.username);
+            view.name = format!("{}@{}", t.username, t.address);
+            let payload = serde_json::json!({ "use_agent": true });
+            (view, payload)
+        }
+        (None, None) => return Err("没有指定要连接的主机".into()),
+    };
+
+    // Telnet and serial do not use SSH at all; they feed the same event channel
+    // so the terminal needs no special case. Dispatch before asking for a
+    // credential, which those protocols do not have.
+    if host.protocol == "telnet" {
+        return open_telnet_host(&app, host, Some(cols), Some(rows)).await;
+    }
+    if host.protocol == "serial" {
+        return open_serial_host(&app, host);
+    }
+
+    let pw_for = |address: &str| -> Option<&str> {
+        match (&input.password, &input.password_host) {
+            (Some(p), Some(h)) if h.eq_ignore_ascii_case(address) => Some(p.as_str()),
+            // Without a host tag the password is for the target only.
+            (Some(p), None) if address == host.address => Some(p.as_str()),
+            _ => None,
+        }
+    };
+
+    let (target, jump) = {
+        let vault = state.vault.lock().map_err(|e| e.to_string())?;
+        let target = ssh::Hop {
+            address: host.address.clone(),
+            port: host.port,
+            username: host.username.clone(),
+            credentials: credentials_for(&vault, &payload, pw_for(&host.address))?,
+            known: known_keys(&vault, &host.address, host.port)?,
+        };
+        let jump = match host.jump_host_id.as_deref() {
+            None => None,
+            Some(jid) => {
+                let row = vault
+                    .store()
+                    .get_item(jid)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "跳板机已被删除，请在主机设置里重新选择".to_string())?;
+                let item = vault.decrypt_item(&row).map_err(|e| e.to_string())?;
+                let jv = to_host_view(&item);
+                Some(ssh::Hop {
+                    credentials: credentials_for(&vault, &item.payload, pw_for(&jv.address))?,
+                    known: known_keys(&vault, &jv.address, jv.port)?,
+                    address: jv.address,
+                    port: jv.port,
+                    username: jv.username,
+                })
+            }
+        };
+        (target, jump)
+    };
+
+    // Forward terminal output to the WebView on one event channel.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TermEvent>();
+    let emitter = app.clone();
+    tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            if let Err(e) = emitter.emit("term-event", &ev) {
+                tracing::warn!("emit term-event failed: {e}");
+            }
+        }
+    });
+
+    let title = if host.name.is_empty() {
+        format!("{}@{}", host.username, host.address)
+    } else {
+        host.name.clone()
+    };
+    let res = ssh::connect_chain(
+        jump.as_ref(),
+        &target,
+        &host.id,
+        &title,
+        input.accept.as_deref(),
+        cols,
+        rows,
+        tx,
+    )
+    .await?;
+
+    // Keys the user confirmed on this attempt become trusted, whether or not
+    // the rest of the chain made it: the confirmation already happened.
+    if !res.accepted.is_empty() {
+        let vault = state.vault.lock().map_err(|e| e.to_string())?;
+        for key in &res.accepted {
+            save_known_key(&vault, key)?;
+        }
+    }
+
+    match res.outcome {
+        ConnectOutcome::UnknownHostKey {
+            fingerprint,
+            key_type,
+            host,
+            port,
+            previous,
+        } => Ok(ConnectResult {
+            kind: "hostKey".into(),
+            fingerprint: Some(fingerprint),
+            key_type: Some(key_type),
+            host: Some(host),
+            port: Some(port),
+            previous,
+            ..Default::default()
+        }),
+        ConnectOutcome::NeedPassword { host, username } => Ok(ConnectResult {
+            kind: "needPassword".into(),
+            host: Some(host),
+            username: Some(username),
+            ..Default::default()
+        }),
+        ConnectOutcome::Live(session) => {
+            if input.remember_password {
+                if let (Some(id), Some(pw)) = (&input.host_id, &input.password) {
+                    remember_password(&state, id, pw)?;
+                }
+            }
+            if let Some(cmd) = &host.startup_command {
+                let _ = session.write(format!("{cmd}\r").as_bytes()).await;
+            }
+            let view = session_view(&session.info);
+            let mut mgr = state.ssh.lock().map_err(|e| e.to_string())?;
+            mgr.insert(session);
+            Ok(ConnectResult {
+                kind: "connected".into(),
+                session: Some(view),
+                ..Default::default()
+            })
+        }
+    }
+}
+
+/// Saves a password typed at the prompt onto the host it was for.
+fn remember_password(state: &AppState, host_id: &str, password: &str) -> Result<(), String> {
+    let vault = state.vault.lock().map_err(|e| e.to_string())?;
+    let Some(row) = vault.store().get_item(host_id).map_err(|e| e.to_string())? else {
+        return Ok(());
+    };
+    let mut item = vault.decrypt_item(&row).map_err(|e| e.to_string())?;
+    item.payload["password"] = serde_json::Value::String(password.to_string());
+    let row = vault
+        .encrypt_item(host_id, "host", &item.payload)
+        .map_err(|e| e.to_string())?;
+    vault.store().put_item(&row).map_err(|e| e.to_string())
+}
+
+/// Opens a shell on this machine.
+#[tauri::command]
+pub fn local_open(
+    state: State<'_, AppState>,
+    cols: Option<u16>,
+    rows: Option<u16>,
+) -> Result<crate::direct::DirectInfo, String> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ssh::TermEvent>();
+    let info = {
+        let mut mgr = state.direct.lock().map_err(|e| e.to_string())?;
+        mgr.open_local(id, cols.unwrap_or(120), rows.unwrap_or(32), tx)?
+    };
+    let app = state.app.clone();
+    tauri::async_runtime::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            if let Err(e) = app.emit("term-event", &ev) {
+                tracing::warn!("emit term-event failed: {e}");
+            }
+        }
+    });
+    Ok(info)
+}
+
+/// One resource reading for a session's status bar.
+#[tauri::command]
+pub async fn session_stats(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<crate::stats::ServerStats, String> {
+    let session = {
+        let mgr = state.ssh.lock().map_err(|e| e.to_string())?;
+        mgr.get(&session_id)
+            .ok_or_else(|| "会话不存在".to_string())?
+    };
+    crate::stats::sample(&session).await
+}
+
+/// Opens a saved telnet host.
+async fn open_telnet_host(
+    app: &tauri::AppHandle,
+    host: HostView,
+    cols: Option<u32>,
+    rows: Option<u32>,
+) -> Result<ConnectResult, String> {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TermEvent>();
+    let emitter = app.clone();
+    tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            if let Err(e) = emitter.emit("term-event", &ev) {
+                tracing::warn!("emit term-event failed: {e}");
+            }
+        }
+    });
+
+    let conn = crate::direct::DirectManager::connect_telnet(
+        &host.address,
+        host.port,
+        cols.unwrap_or(120) as u16,
+        rows.unwrap_or(32) as u16,
+    )
+    .await?;
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let info = {
+        let app_state = app.state::<AppState>();
+        let mut mgr = app_state.direct.lock().map_err(|e| e.to_string())?;
+        mgr.register_telnet(id, host.address.clone(), host.port, conn, tx)
+    };
+
+    Ok(ConnectResult {
+        kind: "connected".into(),
+        session: Some(SessionView {
+            id: info.id,
+            title: if host.name.is_empty() {
+                info.target.clone()
+            } else {
+                host.name.clone()
+            },
+            status: "connected".into(),
+            fingerprint: None,
+        }),
+        ..Default::default()
+    })
+}
+
+/// Opens a saved serial host.
+fn open_serial_host(app: &tauri::AppHandle, host: HostView) -> Result<ConnectResult, String> {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TermEvent>();
+    let emitter = app.clone();
+    tauri::async_runtime::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            if let Err(e) = emitter.emit("term-event", &ev) {
+                tracing::warn!("emit term-event failed: {e}");
+            }
+        }
+    });
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let app_state = app.state::<AppState>();
+    let info = {
+        let mut mgr = app_state.direct.lock().map_err(|e| e.to_string())?;
+        mgr.open_serial(
+            id,
+            crate::direct::SerialOptions {
+                path: host.address.clone(),
+                baud: host.baud.unwrap_or(115200),
+                data_bits: host.data_bits.unwrap_or(8),
+                parity: host.parity.clone().unwrap_or_else(|| "none".to_string()),
+                stop_bits: host.stop_bits.unwrap_or(1),
+            },
+            tx,
+        )?
+    };
+
+    Ok(ConnectResult {
+        kind: "connected".into(),
+        session: Some(SessionView {
+            id: info.id,
+            title: if host.name.is_empty() {
+                info.target.clone()
+            } else {
+                host.name.clone()
+            },
+            status: "connected".into(),
+            fingerprint: None,
+        }),
+        ..Default::default()
+    })
+}
+
+/// Sends keyboard input to a session.
+#[tauri::command]
+pub async fn term_write(
+    state: State<'_, AppState>,
+    session_id: String,
+    data: String,
+) -> Result<(), String> {
+    let session = {
+        let mgr = state.ssh.lock().map_err(|e| e.to_string())?;
+        mgr.get(&session_id)
+            .ok_or_else(|| "会话不存在".to_string())?
+    };
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&data)
+        .unwrap_or_else(|_| data.as_bytes().to_vec());
+    session.write(&bytes).await
+}
+
+/// Returns output the shell produced before the pane attached.
+///
+/// The UI calls this on mount, then keeps consuming `term-event`; the two
+/// overlap is harmless because the backend never re-sends what it hands out
+/// The buffer is drained, so calling twice does not duplicate output.
+#[tauri::command]
+pub fn term_backlog(state: State<'_, AppState>, session_id: String) -> Result<String, String> {
+    // SSH keeps its buffer on the session; telnet and serial keep theirs in the
+    // direct manager. Try both so the UI does not need to know which it is.
+    let from_ssh = {
+        let mgr = state.ssh.lock().map_err(|e| e.to_string())?;
+        mgr.get(&session_id).map(|s| s.take_backlog())
+    };
+    if let Some(bytes) = from_ssh {
+        return Ok(base64::engine::general_purpose::STANDARD.encode(bytes));
+    }
+
+    let mgr = state.direct.lock().map_err(|e| e.to_string())?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(mgr.take_backlog(&session_id)))
+}
+
+/// Keeps the remote PTY in step with the window.
+#[tauri::command]
+pub async fn term_resize(
+    state: State<'_, AppState>,
+    session_id: String,
+    cols: u32,
+    rows: u32,
+) -> Result<(), String> {
+    let session = {
+        let mgr = state.ssh.lock().map_err(|e| e.to_string())?;
+        mgr.get(&session_id)
+            .ok_or_else(|| "会话不存在".to_string())?
+    };
+    session.resize(cols, rows).await
+}
+
+#[tauri::command]
+pub async fn session_close(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let session = {
+        let mut mgr = state.ssh.lock().map_err(|e| e.to_string())?;
+        mgr.remove(&id)
+    };
+    // Forwards and the cached SFTP channel ride on this connection; leaving
+    // them registered would show dead entries and keep the handle alive.
+    if let Ok(mut f) = state.forwards.lock() {
+        f.stop_for_session(&id);
+    }
+    if let Ok(mut m) = state.sftp.lock() {
+        m.remove(&id);
+    }
+    if let Some(s) = session {
+        ssh::close(s).await;
+    }
+    Ok(())
+}
+
+fn session_view(s: &ssh::Session) -> SessionView {
+    SessionView {
+        id: s.id.clone(),
+        title: s.title.clone(),
+        status: s.status.clone(),
+        fingerprint: s.fingerprint.clone(),
+    }
+}
+
+// ---- Telnet & serial -----------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TelnetInput {
+    pub host: String,
+    pub port: u16,
+    #[serde(default)]
+    pub cols: Option<u16>,
+    #[serde(default)]
+    pub rows: Option<u16>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SerialInput {
+    pub path: String,
+    pub baud: u32,
+    #[serde(default)]
+    pub data_bits: Option<u8>,
+    #[serde(default)]
+    pub parity: Option<String>,
+    #[serde(default)]
+    pub stop_bits: Option<u8>,
+}
+
+/// Lists serial ports present on this machine.
+#[tauri::command]
+pub fn serial_ports() -> Result<Vec<crate::serial::SerialPortInfo>, String> {
+    crate::serial::list_ports()
+}
+
+/// Opens a telnet connection. Output arrives on the same `term-event` channel SSH
+/// uses, so the terminal component needs no special case.
+#[tauri::command]
+pub async fn telnet_open(
+    state: State<'_, AppState>,
+    input: TelnetInput,
+) -> Result<crate::direct::DirectInfo, String> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ssh::TermEvent>();
+
+    // Connect first, then take the lock: see DirectManager::connect_telnet.
+    let conn = crate::direct::DirectManager::connect_telnet(
+        &input.host,
+        input.port,
+        input.cols.unwrap_or(120),
+        input.rows.unwrap_or(32),
+    )
+    .await?;
+
+    let info = {
+        let mut mgr = state.direct.lock().map_err(|e| e.to_string())?;
+        mgr.register_telnet(id, input.host, input.port, conn, tx)
+    };
+
+    let app = state.app.clone();
+    tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            if let Err(e) = app.emit("term-event", &ev) {
+                tracing::warn!("emit term-event failed: {e}");
+            }
+        }
+    });
+
+    Ok(info)
+}
+
+#[tauri::command]
+pub fn serial_open(
+    state: State<'_, AppState>,
+    input: SerialInput,
+) -> Result<crate::direct::DirectInfo, String> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ssh::TermEvent>();
+
+    let info = {
+        let mut mgr = state.direct.lock().map_err(|e| e.to_string())?;
+        mgr.open_serial(
+            id,
+            crate::direct::SerialOptions {
+                path: input.path,
+                baud: input.baud,
+                data_bits: input.data_bits.unwrap_or(8),
+                parity: input.parity.unwrap_or_else(|| "none".to_string()),
+                stop_bits: input.stop_bits.unwrap_or(1),
+            },
+            tx,
+        )?
+    };
+
+    let app = state.app.clone();
+    tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            if let Err(e) = app.emit("term-event", &ev) {
+                tracing::warn!("emit term-event failed: {e}");
+            }
+        }
+    });
+
+    Ok(info)
+}
+
+/// Writes to a telnet or serial session.
+#[tauri::command]
+pub async fn direct_write(
+    state: State<'_, AppState>,
+    session_id: String,
+    data: String,
+) -> Result<(), String> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&data)
+        .map_err(|e| format!("数据编码错误：{e}"))?;
+
+    let session = {
+        let mgr = state.direct.lock().map_err(|e| e.to_string())?;
+        mgr.get(&session_id)
+            .ok_or_else(|| "会话不存在".to_string())?
+    };
+    session.write(&bytes).await
+}
+
+#[tauri::command]
+pub async fn direct_resize(
+    state: State<'_, AppState>,
+    session_id: String,
+    cols: u16,
+    rows: u16,
+) -> Result<(), String> {
+    let session = {
+        let mgr = state.direct.lock().map_err(|e| e.to_string())?;
+        mgr.get(&session_id)
+            .ok_or_else(|| "会话不存在".to_string())?
+    };
+    session.resize(cols, rows).await
+}
+
+#[tauri::command]
+pub fn direct_close(state: State<'_, AppState>, session_id: String) -> Result<(), String> {
+    let mut mgr = state.direct.lock().map_err(|e| e.to_string())?;
+    if !mgr.remove(&session_id) {
+        return Err("会话不存在".into());
+    }
+    Ok(())
+}
+
+// ---- Sync ----------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncConnectInput {
+    pub url: String,
+    pub token: String,
+}
+
+/// Checks the Worker and remembers the address and token.
+#[tauri::command]
+pub async fn sync_connect(
+    state: State<'_, AppState>,
+    input: SyncConnectInput,
+) -> Result<String, String> {
+    let health = crate::sync::connect(&state, &input.url, &input.token)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(if health.initialized {
+        "已连接，远端已有保险库".to_string()
+    } else {
+        "已连接，远端还没有保险库".to_string()
+    })
+}
+
+#[tauri::command]
+pub fn sync_status(state: State<'_, AppState>) -> Result<Option<serde_json::Value>, String> {
+    let vault = state.vault.lock().map_err(|e| e.to_string())?;
+    let url = vault
+        .store()
+        .get_meta("sync_url")
+        .map_err(|e| e.to_string())?;
+    let cursor = vault
+        .store()
+        .get_meta("sync_cursor")
+        .map_err(|e| e.to_string())?;
+    Ok(url.map(|u| serde_json::json!({ "url": u, "cursor": cursor.and_then(|c| c.parse::<u64>().ok()).unwrap_or(0) })))
+}
+
+#[tauri::command]
+pub async fn sync_run(state: State<'_, AppState>) -> Result<crate::sync::SyncReport, String> {
+    crate::sync::run_once(&state)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn sync_disconnect(state: State<'_, AppState>) -> Result<(), String> {
+    let vault = state.vault.lock().map_err(|e| e.to_string())?;
+    vault
+        .store()
+        .set_meta("sync_url", "")
+        .map_err(|e| e.to_string())?;
+    vault
+        .store()
+        .set_meta("sync_token", "")
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// ---- AI assistant --------------------------------------------------------
+
+/// A provider as the UI sees it: the API key is never included.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderView {
+    pub id: String,
+    pub name: String,
+    pub protocol: String,
+    pub base_url: String,
+    pub model: String,
+    pub has_key: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderInput {
+    pub id: Option<String>,
+    pub name: String,
+    pub protocol: String,
+    pub base_url: String,
+    pub model: String,
+    /// Blank keeps the stored key.
+    pub api_key: Option<String>,
+}
+
+fn provider_from_payload(p: &serde_json::Value) -> ProviderView {
+    ProviderView {
+        id: p
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        name: p
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        protocol: p
+            .get("protocol")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        base_url: p
+            .get("base_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        model: p
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        has_key: p
+            .get("api_key")
+            .and_then(|v| v.as_str())
+            .map(|k| !k.is_empty())
+            .unwrap_or(false),
+    }
+}
+
+#[tauri::command]
+pub fn ai_providers_list(state: State<'_, AppState>) -> Result<Vec<ProviderView>, String> {
+    let vault = state.vault.lock().map_err(|e| e.to_string())?;
+    let rows = vault.store().list_items().map_err(|e| e.to_string())?;
+
+    let mut out = Vec::new();
+    for row in rows.iter().filter(|r| r.kind == "provider") {
+        let item = vault.decrypt_item(row).map_err(|e| e.to_string())?;
+        out.push(provider_from_payload(&item.payload));
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+pub fn ai_provider_save(
+    state: State<'_, AppState>,
+    input: ProviderInput,
+) -> Result<ProviderView, String> {
+    let vault = state.vault.lock().map_err(|e| e.to_string())?;
+    let id = input
+        .id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    // A blank key on an edit keeps the stored one, so the UI never has to hold
+    // the secret just to rename a provider.
+    let existing_key = if input.id.is_some() {
+        vault
+            .store()
+            .get_item(&id)
+            .map_err(|e| e.to_string())?
+            .map(|row| vault.decrypt_item(&row))
+            .transpose()
+            .map_err(|e| e.to_string())?
+            .and_then(|item| {
+                item.payload
+                    .get("api_key")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            })
+    } else {
+        None
+    };
+
+    let api_key = input
+        .api_key
+        .as_ref()
+        .filter(|k| !k.is_empty())
+        .cloned()
+        .or(existing_key)
+        .unwrap_or_default();
+
+    let payload = serde_json::json!({
+        "id": id,
+        "name": input.name,
+        "protocol": input.protocol,
+        "base_url": input.base_url,
+        "model": input.model,
+        "api_key": api_key,
+    });
+
+    let row = vault
+        .encrypt_item(&id, "provider", &payload)
+        .map_err(|e| e.to_string())?;
+    vault.store().put_item(&row).map_err(|e| e.to_string())?;
+    Ok(provider_from_payload(&payload))
+}
+
+#[tauri::command]
+pub fn ai_provider_delete(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let vault = state.vault.lock().map_err(|e| e.to_string())?;
+    vault.store().delete_item(&id).map_err(|e| e.to_string())
+}
+
+/// Reads one provider, key included, for the turn engine. Not exposed to the UI.
+fn load_provider(
+    state: &AppState,
+    provider_id: &str,
+) -> Result<crate::ai::provider::ProviderConfig, String> {
+    let vault = state.vault.lock().map_err(|e| e.to_string())?;
+    let row = vault
+        .store()
+        .get_item(provider_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "模型服务商不存在".to_string())?;
+    let item = vault.decrypt_item(&row).map_err(|e| e.to_string())?;
+    let f = |name: &str| {
+        item.payload
+            .get(name)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let protocol = match f("protocol").as_str() {
+        "anthropic" => crate::ai::provider::Protocol::Anthropic,
+        _ => crate::ai::provider::Protocol::OpenAi,
+    };
+    Ok(crate::ai::provider::ProviderConfig {
+        id: f("id"),
+        name: f("name"),
+        protocol,
+        base_url: f("base_url"),
+        model: f("model"),
+        api_key: f("api_key"),
+    })
+}
+
+/// Starts a turn. Events stream on `ai-event`; gated calls wait for
+/// [`ai_approve`].
+#[tauri::command]
+pub async fn ai_send(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    provider_id: String,
+    session_id: Option<String>,
+    mode: String,
+    history: Vec<serde_json::Value>,
+) -> Result<(), String> {
+    let config = load_provider(&state, &provider_id)?;
+
+    let permission = match mode.as_str() {
+        "auto" => crate::ai::tools::PermissionMode::Auto,
+        "bypass" => crate::ai::tools::PermissionMode::Bypass,
+        _ => crate::ai::tools::PermissionMode::Manual,
+    };
+
+    let session = match session_id {
+        Some(id) => {
+            let mgr = state.ssh.lock().map_err(|e| e.to_string())?;
+            mgr.get(&id)
+        }
+        None => None,
+    };
+
+    // The most recent terminal output, so `read_terminal` has something to read.
+    let terminal_tail = session
+        .as_ref()
+        .map(|s| String::from_utf8_lossy(&s.peek_backlog()).to_string())
+        .unwrap_or_default();
+
+    let history: Vec<crate::ai::provider::ChatMessage> = history
+        .iter()
+        .filter_map(|v| serde_json::from_value(v.clone()).ok())
+        .collect();
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::ai::AiEvent>();
+    let (approval_tx, approval_rx) = tokio::sync::mpsc::unbounded_channel::<crate::ai::Approval>();
+
+    {
+        let mut slot = state.ai_approvals.lock().map_err(|e| e.to_string())?;
+        *slot = Some(approval_tx);
+    }
+
+    let emitter = app.clone();
+    tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            if let Err(e) = emitter.emit("ai-event", &ev) {
+                tracing::warn!("emit ai-event failed: {e}");
+            }
+        }
+    });
+
+    crate::ai::run_turn(
+        crate::ai::TurnRequest {
+            config,
+            history,
+            mode: permission,
+            session,
+            terminal_tail,
+        },
+        tx,
+        approval_rx,
+    )
+    .await;
+
+    Ok(())
+}
+
+/// Answers a gated tool call.
+#[tauri::command]
+pub fn ai_approve(
+    state: State<'_, AppState>,
+    call_id: String,
+    approved: bool,
+) -> Result<(), String> {
+    let slot = state.ai_approvals.lock().map_err(|e| e.to_string())?;
+    match slot.as_ref() {
+        Some(tx) => tx
+            .send(crate::ai::Approval { call_id, approved })
+            .map_err(|_| "对话已结束".to_string()),
+        None => Err("当前没有进行中的对话".into()),
+    }
+}
+
+// ---- Port forwarding -----------------------------------------------------
+
+#[tauri::command]
+pub async fn forward_start(
+    state: State<'_, AppState>,
+    session_id: String,
+    spec: crate::forward::ForwardSpec,
+) -> Result<crate::forward::ForwardView, String> {
+    let session = {
+        let mgr = state.ssh.lock().map_err(|e| e.to_string())?;
+        mgr.get(&session_id)
+            .ok_or_else(|| "会话不存在".to_string())?
+    };
+
+    let (view, stop) = crate::forward::start(session, spec).await?;
+    let mut mgr = state.forwards.lock().map_err(|e| e.to_string())?;
+    mgr.insert(crate::forward::Running {
+        view: view.clone(),
+        stop,
+    });
+    Ok(view)
+}
+
+#[tauri::command]
+pub fn forward_list(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::forward::ForwardView>, String> {
+    let mgr = state.forwards.lock().map_err(|e| e.to_string())?;
+    Ok(mgr.list())
+}
+
+#[tauri::command]
+pub fn forward_stop(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let mut mgr = state.forwards.lock().map_err(|e| e.to_string())?;
+    if !mgr.remove(&id) {
+        return Err("转发不存在".into());
+    }
+    Ok(())
+}
+
+// ---- SFTP ----------------------------------------------------------------
+
+/// Opens (or reuses) the SFTP channel for a session and hands back its home dir.
+async fn sftp_for(
+    state: &AppState,
+    session_id: &str,
+) -> Result<
+    (
+        std::sync::Arc<tokio::sync::Mutex<russh_sftp::client::SftpSession>>,
+        String,
+    ),
+    String,
+> {
+    let cached = {
+        let map = state.sftp.lock().map_err(|e| e.to_string())?;
+        map.get(session_id).cloned()
+    };
+    if let Some(sftp) = cached {
+        let guard = sftp.lock().await;
+        let home = crate::sftp::home_dir(&guard).await?;
+        return Ok((sftp.clone(), home));
+    }
+
+    let session = {
+        let mgr = state.ssh.lock().map_err(|e| e.to_string())?;
+        mgr.get(session_id)
+            .ok_or_else(|| "会话不存在".to_string())?
+    };
+
+    let sftp = crate::sftp::open_sftp(&session.handle).await?;
+    let home = crate::sftp::home_dir(&sftp).await?;
+    let shared = std::sync::Arc::new(tokio::sync::Mutex::new(sftp));
+
+    let mut map = state.sftp.lock().map_err(|e| e.to_string())?;
+    map.insert(session_id.to_string(), shared.clone());
+    Ok((shared, home))
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DirListing {
+    pub path: String,
+    pub home: String,
+    pub entries: Vec<crate::sftp::FileEntry>,
+}
+
+/// Lists a directory. `path` may be empty to start at the home directory.
+#[tauri::command]
+pub async fn sftp_list(
+    state: State<'_, AppState>,
+    session_id: String,
+    path: String,
+) -> Result<DirListing, String> {
+    let (sftp, home) = sftp_for(&state, &session_id).await?;
+    let target = if path.is_empty() { home.clone() } else { path };
+
+    let guard = sftp.lock().await;
+    let entries = crate::sftp::list_dir(&guard, &target).await?;
+    Ok(DirListing {
+        path: target,
+        home,
+        entries,
+    })
+}
+
+/// Reads a file as UTF-8 text, for the built-in viewer/editor.
+#[tauri::command]
+pub async fn sftp_read(
+    state: State<'_, AppState>,
+    session_id: String,
+    path: String,
+) -> Result<String, String> {
+    let (sftp, _) = sftp_for(&state, &session_id).await?;
+    let guard = sftp.lock().await;
+    let bytes = crate::sftp::read_file(&guard, &path).await?;
+    String::from_utf8(bytes).map_err(|_| "这不是文本文件，无法在编辑器里打开".to_string())
+}
+
+#[tauri::command]
+pub async fn sftp_write(
+    state: State<'_, AppState>,
+    session_id: String,
+    path: String,
+    content: String,
+) -> Result<(), String> {
+    let (sftp, _) = sftp_for(&state, &session_id).await?;
+    let guard = sftp.lock().await;
+    crate::sftp::write_file(&guard, &path, content.as_bytes()).await
+}
+
+#[tauri::command]
+pub async fn sftp_mkdir(
+    state: State<'_, AppState>,
+    session_id: String,
+    path: String,
+) -> Result<(), String> {
+    let (sftp, _) = sftp_for(&state, &session_id).await?;
+    let guard = sftp.lock().await;
+    crate::sftp::mkdir(&guard, &path).await
+}
+
+#[tauri::command]
+pub async fn sftp_delete(
+    state: State<'_, AppState>,
+    session_id: String,
+    path: String,
+    is_dir: bool,
+) -> Result<(), String> {
+    let (sftp, _) = sftp_for(&state, &session_id).await?;
+    let guard = sftp.lock().await;
+    if is_dir {
+        crate::transfer::remove_recursive(&guard, &path).await
+    } else {
+        crate::sftp::remove(&guard, &path, false).await
+    }
+}
+
+#[tauri::command]
+pub async fn sftp_rename(
+    state: State<'_, AppState>,
+    session_id: String,
+    from: String,
+    to: String,
+) -> Result<(), String> {
+    let (sftp, _) = sftp_for(&state, &session_id).await?;
+    let guard = sftp.lock().await;
+    crate::sftp::rename(&guard, &from, &to).await
+}
+
+// ---- Keys ----------------------------------------------------------------
+
+/// A stored key as the UI sees it. The private half never crosses this boundary.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyView {
+    pub id: String,
+    pub name: String,
+    /// `ed25519` or `rsa4096`.
+    pub kind: String,
+    /// `SHA256:...` of the public key, as OpenSSH prints it.
+    pub fingerprint: String,
+    /// The public key in authorized_keys form, safe to display and copy.
+    pub public_key: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyGenInput {
+    pub name: String,
+    /// `ed25519` (default) or `rsa4096`.
+    pub kind: String,
+    pub comment: String,
+}
+
+/// Lists stored keys. Only public material is returned.
+#[tauri::command]
+pub fn keys_list(state: State<'_, AppState>) -> Result<Vec<KeyView>, String> {
+    let vault = state.vault.lock().map_err(|e| e.to_string())?;
+    let rows = vault.store().list_items().map_err(|e| e.to_string())?;
+
+    let mut out = Vec::new();
+    for row in rows.iter().filter(|r| r.kind == "key") {
+        let item = vault.decrypt_item(row).map_err(|e| e.to_string())?;
+        out.push(key_view(&item, row.updated_at));
+    }
+    Ok(out)
+}
+
+/// Generates a key pair. The private half is stored encrypted and never returned.
+#[tauri::command]
+pub fn key_generate(state: State<'_, AppState>, input: KeyGenInput) -> Result<KeyView, String> {
+    use russh::keys::ssh_key::{Algorithm, LineEnding, PrivateKey};
+
+    let algorithm = match input.kind.as_str() {
+        "ed25519" => Algorithm::Ed25519,
+        // 4096-bit RSA is slow to generate but what older servers still expect.
+        "rsa4096" => Algorithm::Rsa { hash: None },
+        other => return Err(format!("不支持的密钥类型：{other}")),
+    };
+
+    let mut rng = rand::rngs::OsRng;
+    let key = PrivateKey::random(&mut rng, algorithm).map_err(|e| format!("生成密钥失败：{e}"))?;
+
+    let mut public = key.public_key().clone();
+    if !input.comment.is_empty() {
+        public.set_comment(input.comment.clone());
+    }
+    let public_line = public
+        .to_openssh()
+        .map_err(|e| format!("序列化公钥失败：{e}"))?;
+    let private_pem = key
+        .to_openssh(LineEnding::LF)
+        .map_err(|e| format!("序列化私钥失败：{e}"))?;
+    let fp = public.fingerprint(russh::keys::HashAlg::Sha256).to_string();
+
+    let vault = state.vault.lock().map_err(|e| e.to_string())?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let payload = serde_json::json!({
+        "name": input.name,
+        "kind": input.kind,
+        "fingerprint": fp,
+        "public_key": public_line,
+        // Stored inside the same envelope as everything else.
+        "private_key": private_pem.as_str(),
+    });
+
+    let row = vault
+        .encrypt_item(&id, "key", &payload)
+        .map_err(|e| e.to_string())?;
+    vault.store().put_item(&row).map_err(|e| e.to_string())?;
+
+    Ok(KeyView {
+        id,
+        name: input.name,
+        kind: input.kind,
+        fingerprint: fp,
+        public_key: public_line,
+        created_at: row.updated_at,
+    })
+}
+
+/// Imports an existing private key. A passphrase-protected key is decrypted
+/// once here and stored unencrypted inside the vault envelope, which is itself
+/// encrypted; asking for the passphrase on every connect would add nothing.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyImportInput {
+    pub name: String,
+    #[serde(default)]
+    pub private_key: String,
+    /// A key file to read instead; the contents never pass through the WebView.
+    #[serde(default)]
+    pub path: Option<String>,
+    pub passphrase: Option<String>,
+}
+
+fn key_kind(alg: &russh::keys::ssh_key::Algorithm) -> String {
+    use russh::keys::ssh_key::Algorithm;
+    match alg {
+        Algorithm::Ed25519 => "ed25519".into(),
+        Algorithm::Rsa { .. } => "rsa".into(),
+        Algorithm::Ecdsa { .. } => "ecdsa".into(),
+        other => other.as_str().to_string(),
+    }
+}
+
+fn store_private_key(
+    vault: &crate::vault::Vault,
+    name: &str,
+    key: &russh::keys::PrivateKey,
+) -> Result<KeyView, String> {
+    use russh::keys::ssh_key::LineEnding;
+    let public = key.public_key();
+    let fp = public.fingerprint(russh::keys::HashAlg::Sha256).to_string();
+
+    // The same key imported twice is one key.
+    let rows = vault.store().list_items().map_err(|e| e.to_string())?;
+    for row in rows.iter().filter(|r| r.kind == "key") {
+        let item = vault.decrypt_item(row).map_err(|e| e.to_string())?;
+        if item.payload.get("fingerprint").and_then(|v| v.as_str()) == Some(fp.as_str()) {
+            return Ok(key_view(&item, row.updated_at));
+        }
+    }
+
+    let public_line = public
+        .to_openssh()
+        .map_err(|e| format!("序列化公钥失败：{e}"))?;
+    let private_pem = key
+        .to_openssh(LineEnding::LF)
+        .map_err(|e| format!("序列化私钥失败：{e}"))?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let payload = serde_json::json!({
+        "name": name,
+        "kind": key_kind(&key.algorithm()),
+        "fingerprint": fp,
+        "public_key": public_line,
+        "private_key": private_pem.as_str(),
+    });
+    let row = vault
+        .encrypt_item(&id, "key", &payload)
+        .map_err(|e| e.to_string())?;
+    vault.store().put_item(&row).map_err(|e| e.to_string())?;
+    Ok(KeyView {
+        id,
+        name: name.to_string(),
+        kind: key_kind(&key.algorithm()),
+        fingerprint: fp,
+        public_key: public_line,
+        created_at: row.updated_at,
+    })
+}
+
+fn key_view(item: &PlainItem, updated_at: i64) -> KeyView {
+    let f = |n: &str| str_field(&item.payload, n).unwrap_or_default();
+    KeyView {
+        id: item.id.clone(),
+        name: f("name"),
+        kind: f("kind"),
+        fingerprint: f("fingerprint"),
+        public_key: f("public_key"),
+        created_at: updated_at,
+    }
+}
+
+#[tauri::command]
+pub fn key_import(state: State<'_, AppState>, input: KeyImportInput) -> Result<KeyView, String> {
+    let text = match input.path.as_deref().filter(|p| !p.is_empty()) {
+        Some(path) if input.private_key.trim().is_empty() => {
+            std::fs::read_to_string(path).map_err(|e| format!("无法读取 {path}：{e}"))?
+        }
+        _ => input.private_key.clone(),
+    };
+    let key = russh::keys::decode_secret_key(
+        &ssh::normalize_private_key(&text),
+        input.passphrase.as_deref().filter(|p| !p.is_empty()),
+    )
+    .map_err(|e| {
+        let msg = e.to_string();
+        if msg.to_lowercase().contains("encrypted") || msg.contains("passphrase") {
+            "这把私钥有口令，请填写口令".to_string()
+        } else {
+            format!("私钥无法解析：{msg}")
+        }
+    })?;
+    let vault = state.vault.lock().map_err(|e| e.to_string())?;
+    let name = if input.name.trim().is_empty() {
+        "imported-key".to_string()
+    } else {
+        input.name.trim().to_string()
+    };
+    store_private_key(&vault, &name, &key)
+}
+
+#[tauri::command]
+pub fn key_rename(state: State<'_, AppState>, id: String, name: String) -> Result<(), String> {
+    let vault = state.vault.lock().map_err(|e| e.to_string())?;
+    let row = vault
+        .store()
+        .get_item(&id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "密钥不存在".to_string())?;
+    let mut item = vault.decrypt_item(&row).map_err(|e| e.to_string())?;
+    item.payload["name"] = serde_json::Value::String(name);
+    let row = vault
+        .encrypt_item(&id, "key", &item.payload)
+        .map_err(|e| e.to_string())?;
+    vault.store().put_item(&row).map_err(|e| e.to_string())
+}
+
+// ---- ~/.ssh/config import --------------------------------------------------
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshConfigCandidate {
+    #[serde(flatten)]
+    pub entry: crate::sshconfig::SshConfigEntry,
+    /// A saved host already points at the same user@host:port.
+    pub exists: bool,
+}
+
+#[tauri::command]
+pub fn ssh_config_scan(state: State<'_, AppState>) -> Result<Vec<SshConfigCandidate>, String> {
+    let entries = crate::sshconfig::read_user_config()?;
+    let vault = state.vault.lock().map_err(|e| e.to_string())?;
+    let rows = vault.store().list_items().map_err(|e| e.to_string())?;
+    let mut existing = Vec::new();
+    for row in rows.iter().filter(|r| r.kind == "host") {
+        let item = vault.decrypt_item(row).map_err(|e| e.to_string())?;
+        let h = to_host_view(&item);
+        existing.push((h.address.to_lowercase(), h.port, h.username));
+    }
+    Ok(entries
+        .into_iter()
+        .map(|e| SshConfigCandidate {
+            exists: existing
+                .iter()
+                .any(|(a, p, u)| *a == e.hostname.to_lowercase() && *p == e.port && *u == e.user),
+            entry: e,
+        })
+        .collect())
+}
+
+#[derive(Debug, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportReport {
+    pub hosts: usize,
+    pub keys: usize,
+    pub notes: Vec<String>,
+}
+
+/// Imports the chosen aliases as hosts. Identity files are read from disk and
+/// moved into the key vault; one that needs a passphrase is left for the
+/// agent, which usually already holds it.
+#[tauri::command]
+pub fn ssh_config_import(
+    state: State<'_, AppState>,
+    aliases: Vec<String>,
+) -> Result<ImportReport, String> {
+    let entries = crate::sshconfig::read_user_config()?;
+    let chosen: Vec<_> = entries
+        .into_iter()
+        .filter(|e| aliases.contains(&e.alias))
+        .collect();
+    let vault = state.vault.lock().map_err(|e| e.to_string())?;
+    let mut report = ImportReport::default();
+
+    // Ids are assigned up front so a ProxyJump can point at a host imported
+    // in the same batch.
+    let ids: std::collections::HashMap<String, String> = chosen
+        .iter()
+        .map(|e| (e.alias.clone(), uuid::Uuid::new_v4().to_string()))
+        .collect();
+    let mut existing_by_name = std::collections::HashMap::new();
+    for row in vault
+        .store()
+        .list_items()
+        .map_err(|e| e.to_string())?
+        .iter()
+        .filter(|r| r.kind == "host")
+    {
+        let item = vault.decrypt_item(row).map_err(|e| e.to_string())?;
+        existing_by_name.insert(to_host_view(&item).name, item.id.clone());
+    }
+
+    for e in &chosen {
+        let mut key_id = None;
+        if let Some(path) = &e.identity_file {
+            // The default IdentityFile often does not exist; that is fine.
+            if let Ok(text) = std::fs::read_to_string(path) {
+                match russh::keys::decode_secret_key(&text, None) {
+                    Ok(key) => {
+                        let name = std::path::Path::new(path)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| e.alias.clone());
+                        let before = vault.store().list_items().map(|r| r.len()).unwrap_or(0);
+                        let view = store_private_key(&vault, &name, &key)?;
+                        if vault.store().list_items().map(|r| r.len()).unwrap_or(0) > before {
+                            report.keys += 1;
+                        }
+                        key_id = Some(view.id);
+                    }
+                    Err(_) => report.notes.push(format!(
+                        "{}：{} 需要口令，未导入，将尝试 ssh-agent",
+                        e.alias, path
+                    )),
+                }
+            }
+        }
+        let jump_host_id = e.proxy_jump.as_ref().and_then(|j| {
+            let alias = j.split('@').next_back().unwrap_or(j);
+            let alias = alias.split(':').next().unwrap_or(alias);
+            ids.get(alias).cloned().or_else(|| existing_by_name.get(alias).cloned())
+        });
+        if e.proxy_jump.is_some() && jump_host_id.is_none() {
+            report
+                .notes
+                .push(format!("{}：跳板机 {} 不在已选列表里，已忽略", e.alias, e.proxy_jump.as_deref().unwrap_or("")));
+        }
+        let payload = serde_json::json!({
+            "name": e.alias,
+            "protocol": "ssh",
+            "address": e.hostname,
+            "port": e.port,
+            "username": e.user,
+            "tags": ["ssh-config"],
+            "key_id": key_id,
+            "jump_host_id": jump_host_id,
+            "use_agent": true,
+        });
+        let id = &ids[&e.alias];
+        let row = vault
+            .encrypt_item(id, "host", &payload)
+            .map_err(|e| e.to_string())?;
+        vault.store().put_item(&row).map_err(|e| e.to_string())?;
+        report.hosts += 1;
+    }
+    Ok(report)
+}
+
+// ---- Transfers ---------------------------------------------------------------
+
+/// Starts a download in the background and returns its id at once. Progress
+/// arrives on `transfer-event`.
+#[tauri::command]
+pub async fn sftp_download(
+    state: State<'_, AppState>,
+    session_id: String,
+    remote: String,
+    local: String,
+) -> Result<String, String> {
+    start_transfer(&state, session_id, "download", remote, local).await
+}
+
+/// Uploads local files or directories into `remote_dir`.
+#[tauri::command]
+pub async fn sftp_upload(
+    state: State<'_, AppState>,
+    session_id: String,
+    locals: Vec<String>,
+    remote_dir: String,
+) -> Result<Vec<String>, String> {
+    let mut ids = Vec::new();
+    for local in locals {
+        ids.push(start_transfer(&state, session_id.clone(), "upload", local, remote_dir.clone()).await?);
+    }
+    Ok(ids)
+}
+
+/// Downloads into the user's Downloads folder without asking where.
+#[tauri::command]
+pub async fn sftp_download_to_downloads(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    session_id: String,
+    remote: String,
+) -> Result<String, String> {
+    let dir = app
+        .path()
+        .download_dir()
+        .map_err(|e| format!("找不到下载目录：{e}"))?;
+    let name = remote
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("download")
+        .to_string();
+    let local = crate::transfer::unique_local_path(&dir, &name);
+    start_transfer(
+        &state,
+        session_id,
+        "download",
+        remote,
+        local.to_string_lossy().to_string(),
+    )
+    .await
+}
+
+async fn start_transfer(
+    state: &AppState,
+    session_id: String,
+    direction: &str,
+    from: String,
+    to: String,
+) -> Result<String, String> {
+    let session = {
+        let mgr = state.ssh.lock().map_err(|e| e.to_string())?;
+        mgr.get(&session_id)
+            .ok_or_else(|| "会话不存在".to_string())?
+    };
+    let id = uuid::Uuid::new_v4().to_string();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    state
+        .transfers
+        .lock()
+        .map_err(|e| e.to_string())?
+        .insert(id.clone(), cancel.clone());
+
+    // Both a local path (upload) and a remote one (download) end in the name.
+    let name = std::path::Path::new(from.trim_end_matches('/'))
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let app = state.app.clone();
+    let direction = direction.to_string();
+    let tid = id.clone();
+    tokio::spawn(async move {
+        let base = crate::transfer::TransferEvent {
+            id: tid.clone(),
+            session_id: session_id.clone(),
+            direction: direction.clone(),
+            name,
+            bytes: 0,
+            total: 0,
+            state: "running".into(),
+            error: None,
+        };
+        let _ = app.emit("transfer-event", &base);
+        let emit_app = app.clone();
+        let progress_base = base.clone();
+        let report = move |bytes: u64, total: u64| {
+            let mut ev = progress_base.clone();
+            ev.bytes = bytes;
+            ev.total = total;
+            let _ = emit_app.emit("transfer-event", &ev);
+        };
+
+        let result = async {
+            let sftp = crate::sftp::open_sftp(session.handle()).await?;
+            if direction == "upload" {
+                crate::transfer::upload(&sftp, std::path::Path::new(&from), &to, &cancel, report).await
+            } else {
+                crate::transfer::download(&sftp, &from, std::path::Path::new(&to), &cancel, report).await
+            }
+        }
+        .await;
+
+        let mut done = base.clone();
+        match result {
+            Ok(()) => done.state = "done".into(),
+            Err(e) if cancel.load(std::sync::atomic::Ordering::SeqCst) => {
+                done.state = "cancelled".into();
+                done.error = Some(e);
+            }
+            Err(e) => {
+                done.state = "failed".into();
+                done.error = Some(e);
+            }
+        }
+        let _ = app.emit("transfer-event", &done);
+        if let Some(state) = app.try_state::<AppState>() {
+            if let Ok(mut t) = state.transfers.lock() {
+                t.remove(&tid);
+            }
+        }
+    });
+    Ok(id)
+}
+
+#[tauri::command]
+pub fn transfer_cancel(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let map = state.transfers.lock().map_err(|e| e.to_string())?;
+    if let Some(flag) = map.get(&id) {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn key_delete(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let vault = state.vault.lock().map_err(|e| e.to_string())?;
+    vault.store().delete_item(&id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn app_info() -> serde_json::Value {
+    serde_json::json!({
+        "name": "loki",
+        "version": env!("CARGO_PKG_VERSION"),
+    })
+}

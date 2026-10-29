@@ -1,0 +1,591 @@
+import { useEffect, useRef, useState } from "react";
+import { useApp } from "@/app/store";
+import { usePrefs } from "@/app/prefs";
+import { useTerminals, type TermTab } from "@/features/terminal/terminals";
+import { TerminalPane, terminalRegistry } from "@/features/terminal/TerminalPane";
+import { StatusBar } from "@/features/terminal/StatusBar";
+import { QuickConnect } from "@/features/terminal/QuickConnect";
+import { SftpPanel } from "@/features/sftp/SftpPanel";
+import { AiPanel } from "@/features/ai/AiPanel";
+import { Menu, useMenu } from "@/components/ui";
+import { isAppShortcut, keyLabel, shortcutKey } from "@/app/platform";
+import {
+  IconAlert,
+  IconChevronDown,
+  IconChevronRight,
+  IconCopy,
+  IconFolder,
+  IconPlus,
+  IconRefresh,
+  IconSearch,
+  IconServer,
+  IconShield,
+  IconSparkle,
+  IconTerminal,
+  IconUsb,
+  IconX,
+  IconGlobe,
+  IconEdit,
+} from "@/components/icons";
+
+type Panel = "files" | "ai" | null;
+
+const KIND_ICON = {
+  ssh: <IconServer size={13} />,
+  telnet: <IconGlobe size={13} />,
+  serial: <IconUsb size={13} />,
+  local: <IconTerminal size={13} />,
+};
+
+/**
+ * The terminal workspace: tab strip, one pane per tab (all kept mounted), the
+ * optional side panel, and a status bar.
+ *
+ * Always mounted by App, even while another page is showing, so switching to
+ * the host list and back does not tear down any terminal.
+ */
+export function TerminalView({ visible }: { visible: boolean }) {
+  const tabs = useTerminals((s) => s.tabs);
+  const active = useTerminals((s) => s.active);
+  const sendInput = useTerminals((s) => s.sendInput);
+  const resize = useTerminals((s) => s.resize);
+  const closeTab = useTerminals((s) => s.closeTab);
+  const closeOthers = useTerminals((s) => s.closeOthers);
+  const activate = useTerminals((s) => s.activate);
+  const reconnect = useTerminals((s) => s.reconnect);
+  const rename = useTerminals((s) => s.rename);
+  const openLocal = useTerminals((s) => s.openLocal);
+  const panelWidth = usePrefs((s) => s.panelWidth);
+  const setPref = usePrefs((s) => s.set);
+
+  const [panel, setPanel] = useState<Panel>(null);
+  const [findOpen, setFindOpen] = useState(false);
+  const [quick, setQuick] = useState(false);
+  const [renaming, setRenaming] = useState<string | null>(null);
+  const tabMenu = useMenu<TermTab>();
+
+  const current = tabs.find((t) => t.id === active) ?? null;
+  const isSsh = current?.kind === "ssh" && current.status === "connected";
+
+  // Shortcuts that only make sense while the terminal page is showing.
+  useEffect(() => {
+    if (!visible) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (!isAppShortcut(e)) return;
+      const key = shortcutKey(e);
+      if (key === "f" && current) {
+        e.preventDefault();
+        setFindOpen(true);
+      } else if (key === "w" && current) {
+        e.preventDefault();
+        void closeTab(current.id);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [visible, current, closeTab]);
+
+  // The files panel needs an SSH session; close it when the tab has none.
+  useEffect(() => {
+    if (panel === "files" && !isSsh) setPanel(null);
+  }, [panel, isSsh]);
+
+  return (
+    <div className="workspace" style={{ display: visible ? "flex" : "none" }}>
+      <div className="tabstrip">
+        <div className="tabstrip__tabs">
+          {tabs.map((t) => (
+            <div
+              key={t.id}
+              className={`tab ${t.id === active ? "tab--active" : ""}`}
+              onMouseDown={(e) => {
+                // Middle click closes, as in every browser.
+                if (e.button === 1) {
+                  e.preventDefault();
+                  void closeTab(t.id);
+                }
+              }}
+              onClick={() => activate(t.id)}
+              onDoubleClick={() => setRenaming(t.id)}
+              onContextMenu={(e) => tabMenu.open(e, t)}
+              title={t.title}
+            >
+              <span className={`tab__dot tab__dot--${t.status}`} />
+              <span className="tab__kind">{KIND_ICON[t.kind]}</span>
+              {renaming === t.id ? (
+                <input
+                  className="tab__rename"
+                  autoFocus
+                  defaultValue={t.title}
+                  onClick={(e) => e.stopPropagation()}
+                  onBlur={(e) => {
+                    rename(t.id, e.target.value);
+                    setRenaming(null);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+                    if (e.key === "Escape") setRenaming(null);
+                  }}
+                />
+              ) : (
+                <span className="tab__title">{t.title}</span>
+              )}
+              <button
+                className="tab__close"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  void closeTab(t.id);
+                }}
+                aria-label="关闭标签"
+              >
+                <IconX size={12} />
+              </button>
+            </div>
+          ))}
+          <button className="tabstrip__new" onClick={() => setQuick(true)} title={`新建连接 (${keyLabel("T")})`}>
+            <IconPlus size={15} />
+          </button>
+        </div>
+
+        <div className="tabstrip__tools">
+          <button
+            className={`toolbtn ${findOpen ? "toolbtn--on" : ""}`}
+            onClick={() => setFindOpen(!findOpen)}
+            disabled={!current}
+            title={`在终端中查找 (${keyLabel("F")})`}
+          >
+            <IconSearch size={15} />
+          </button>
+          <button
+            className={`toolbtn ${panel === "files" ? "toolbtn--on" : ""}`}
+            onClick={() => setPanel(panel === "files" ? null : "files")}
+            disabled={!isSsh}
+            title={isSsh ? "文件 (SFTP)" : "文件面板需要 SSH 会话"}
+          >
+            <IconFolder size={15} />
+            <span>文件</span>
+          </button>
+          <button
+            className={`toolbtn ${panel === "ai" ? "toolbtn--on" : ""}`}
+            onClick={() => setPanel(panel === "ai" ? null : "ai")}
+            disabled={!current}
+            title="AI 助手"
+          >
+            <IconSparkle size={15} />
+            <span>助手</span>
+          </button>
+        </div>
+      </div>
+
+      {tabs.length === 0 ? (
+        <div className="content content--center">
+          <div className="empty">
+            <div className="empty__icon">
+              <IconTerminal size={28} />
+            </div>
+            <div className="empty__title">没有打开的会话</div>
+            <div className="empty__hint">从主机列表连接一台服务器，或者打开一个本地终端。</div>
+            <div className="empty__actions">
+              <button className="btn btn--primary" onClick={() => setQuick(true)}>
+                <IconPlus size={14} /> 新建连接
+              </button>
+              <button className="btn" onClick={() => openLocal()}>
+                <IconTerminal size={14} /> 本地终端
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : (
+        <div className="workspace__body">
+          <div className="workspace__main">
+            {findOpen && current && (
+              <FindBar tabId={current.id} onClose={() => setFindOpen(false)} />
+            )}
+            <div className="panes">
+              {tabs.map((t) => (
+                <TerminalPane
+                  key={t.id}
+                  tabId={t.id}
+                  sessionId={t.sessionId}
+                  active={visible && t.id === active}
+                  onInput={(data) => sendInput(t.id, data)}
+                  onResize={(cols, rows) => resize(t.id, cols, rows)}
+                />
+              ))}
+              {current && current.status !== "connected" && (
+                <ConnectOverlay tab={current} onReconnect={() => reconnect(current.id)} />
+              )}
+            </div>
+            {current && <StatusBar tab={current} />}
+          </div>
+
+          {panel && current && (
+            <>
+              <Splitter width={panelWidth} onChange={(w) => setPref("panelWidth", w)} />
+              <div className="sidepanel" style={{ width: panelWidth }}>
+                {panel === "files" && current.sessionId && current.kind === "ssh" ? (
+                  <SftpPanel key={current.sessionId} sessionId={current.sessionId} />
+                ) : panel === "ai" ? (
+                  <AiPanel
+                    sessionId={current.kind === "ssh" ? current.sessionId : null}
+                    onClose={() => setPanel(null)}
+                  />
+                ) : null}
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
+      {quick && <QuickConnect onClose={() => setQuick(false)} />}
+
+      {tabMenu.menu && (
+        <Menu
+          x={tabMenu.menu.x}
+          y={tabMenu.menu.y}
+          onClose={tabMenu.close}
+          items={[
+            {
+              label: "重新连接",
+              icon: <IconRefresh size={14} />,
+              onSelect: () => reconnect(tabMenu.menu!.data.id),
+            },
+            {
+              label: "重命名",
+              icon: <IconEdit size={14} />,
+              onSelect: () => setRenaming(tabMenu.menu!.data.id),
+            },
+            {
+              label: "复制标签",
+              icon: <IconCopy size={14} />,
+              disabled: !tabMenu.menu.data.hostId && !tabMenu.menu.data.target && tabMenu.menu.data.kind !== "local",
+              onSelect: () => duplicate(tabMenu.menu!.data),
+            },
+            "sep",
+            {
+              label: "关闭其他标签",
+              onSelect: () => closeOthers(tabMenu.menu!.data.id),
+              disabled: tabs.length < 2,
+            },
+            {
+              label: "关闭",
+              danger: true,
+              hint: keyLabel("W"),
+              icon: <IconX size={14} />,
+              onSelect: () => void closeTab(tabMenu.menu!.data.id),
+            },
+          ]}
+        />
+      )}
+    </div>
+  );
+}
+
+function duplicate(tab: TermTab) {
+  const t = useTerminals.getState();
+  if (tab.kind === "local") t.openLocal();
+  else if (tab.target) t.openTarget(tab.target);
+  else if (tab.hostId) {
+    const host = useApp.getState().hosts.find((h) => h.id === tab.hostId);
+    if (host) t.openHost(host);
+  }
+}
+
+/** Drag handle between the terminal and the side panel. */
+function Splitter({ width, onChange }: { width: number; onChange: (w: number) => void }) {
+  const start = useRef<{ x: number; w: number } | null>(null);
+  return (
+    <div
+      className="splitter"
+      onMouseDown={(e) => {
+        e.preventDefault();
+        start.current = { x: e.clientX, w: width };
+        const move = (ev: MouseEvent) => {
+          if (!start.current) return;
+          const w = start.current.w - (ev.clientX - start.current.x);
+          onChange(Math.round(Math.max(280, Math.min(720, w))));
+        };
+        const up = () => {
+          start.current = null;
+          window.removeEventListener("mousemove", move);
+          window.removeEventListener("mouseup", up);
+          document.body.classList.remove("is-resizing");
+        };
+        document.body.classList.add("is-resizing");
+        window.addEventListener("mousemove", move);
+        window.addEventListener("mouseup", up);
+      }}
+    />
+  );
+}
+
+function FindBar({ tabId, onClose }: { tabId: string; onClose: () => void }) {
+  const [q, setQ] = useState("");
+  const [caseSensitive, setCase] = useState(false);
+  const [regex, setRegex] = useState(false);
+  const [found, setFound] = useState<boolean | null>(null);
+  const entry = terminalRegistry.get(tabId);
+
+  const opts = {
+    caseSensitive,
+    regex,
+    decorations: {
+      matchBackground: "#2ee6a833",
+      activeMatchBackground: "#d9b16999",
+      matchOverviewRuler: "#2ee6a8",
+      activeMatchColorOverviewRuler: "#d9b169",
+    },
+  };
+
+  const run = (dir: 1 | -1, text = q) => {
+    if (!entry || !text) {
+      setFound(null);
+      return;
+    }
+    const ok =
+      dir === 1 ? entry.search.findNext(text, opts) : entry.search.findPrevious(text, opts);
+    setFound(ok);
+  };
+
+  useEffect(
+    () => () => {
+      entry?.search.clearDecorations();
+      entry?.term.focus();
+    },
+    [entry],
+  );
+
+  return (
+    <div className="findbar">
+      <IconSearch size={14} />
+      <input
+        className="findbar__input"
+        autoFocus
+        placeholder="查找"
+        spellCheck={false}
+        autoCorrect="off"
+        autoCapitalize="off"
+        value={q}
+        onChange={(e) => {
+          setQ(e.target.value);
+          run(1, e.target.value);
+        }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") run(e.shiftKey ? -1 : 1);
+          if (e.key === "Escape") onClose();
+        }}
+      />
+      {found === false && q && <span className="findbar__none">无结果</span>}
+      <button
+        className={`findbar__opt ${caseSensitive ? "findbar__opt--on" : ""}`}
+        onClick={() => setCase(!caseSensitive)}
+        title="区分大小写"
+      >
+        Aa
+      </button>
+      <button
+        className={`findbar__opt ${regex ? "findbar__opt--on" : ""}`}
+        onClick={() => setRegex(!regex)}
+        title="正则表达式"
+      >
+        .*
+      </button>
+      <button className="iconbtn" onClick={() => run(-1)} title="上一个 (⇧↵)">
+        <IconChevronDown size={14} style={{ transform: "rotate(180deg)" }} />
+      </button>
+      <button className="iconbtn" onClick={() => run(1)} title="下一个 (↵)">
+        <IconChevronDown size={14} />
+      </button>
+      <button className="iconbtn" onClick={onClose} title="关闭 (Esc)">
+        <IconX size={14} />
+      </button>
+    </div>
+  );
+}
+
+/** Covers the pane while the tab is connecting, asking, or has failed. */
+function ConnectOverlay({ tab, onReconnect }: { tab: TermTab; onReconnect: () => void }) {
+  const hosts = useApp((s) => s.hosts);
+  const acceptHostKey = useTerminals((s) => s.acceptHostKey);
+  const submitPassword = useTerminals((s) => s.submitPassword);
+  const cancelPrompt = useTerminals((s) => s.cancelPrompt);
+  const closeTab = useTerminals((s) => s.closeTab);
+  const host = hosts.find((h) => h.id === tab.hostId);
+  const openHost = useApp((s) => s.openHost);
+
+  // A closed session keeps its screen readable; only a slim bar appears.
+  if (tab.status === "closed") {
+    return (
+      <div className="pane-banner">
+        <span>连接已断开</span>
+        <button className="btn btn--sm btn--primary" onClick={onReconnect}>
+          <IconRefresh size={13} /> 重新连接
+        </button>
+        <button className="btn btn--sm btn--ghost" onClick={() => void closeTab(tab.id)}>
+          关闭标签
+        </button>
+      </div>
+    );
+  }
+
+  const prompt = tab.prompt;
+  return (
+    <div className="overlay">
+      {prompt?.type === "hostKey" ? (
+        <div className={`overlay__card ${prompt.previous ? "overlay__card--danger" : ""}`}>
+          <div className="overlay__icon">
+            {prompt.previous ? <IconAlert size={22} /> : <IconShield size={22} />}
+          </div>
+          <h3 className="overlay__title">
+            {prompt.previous ? "主机密钥已改变！" : "第一次连接这台主机"}
+          </h3>
+          <p className="overlay__text">
+            {prompt.previous ? (
+              <>
+                <strong>
+                  {prompt.host}:{prompt.port}
+                </strong>{" "}
+                出示的 {prompt.keyType} 密钥与之前保存的不同。可能是服务器重装了系统，
+                <strong>也可能有人在中间拦截</strong>。确认原因前不要继续。
+              </>
+            ) : (
+              <>
+                请确认{" "}
+                <strong>
+                  {prompt.host}:{prompt.port}
+                </strong>{" "}
+                的主机密钥指纹与服务器上的一致。确认后会记住它，以后不再询问。
+              </>
+            )}
+          </p>
+          {prompt.previous && (
+            <div className="kv">
+              <span>之前</span>
+              <code className="fingerprint fingerprint--old">{prompt.previous}</code>
+            </div>
+          )}
+          <div className="kv">
+            <span>{prompt.previous ? "现在" : prompt.keyType}</span>
+            <code className="fingerprint">{prompt.fingerprint}</code>
+          </div>
+          <div className="overlay__hint">
+            服务器上可用 <code>ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub</code> 查看。
+          </div>
+          <div className="overlay__actions">
+            <button className="btn btn--ghost" onClick={() => cancelPrompt(tab.id)}>
+              取消
+            </button>
+            <button
+              className={`btn ${prompt.previous ? "btn--danger" : "btn--primary"}`}
+              onClick={() => acceptHostKey(tab.id)}
+            >
+              {prompt.previous ? "我确认，更新指纹并连接" : "指纹一致，继续连接"}
+            </button>
+          </div>
+        </div>
+      ) : prompt?.type === "password" ? (
+        <PasswordPrompt
+          key={`${prompt.host}-${prompt.retry}`}
+          host={prompt.host}
+          username={prompt.username}
+          retry={prompt.retry}
+          canRemember={!!tab.hostId}
+          onSubmit={(pw, remember) => submitPassword(tab.id, pw, remember)}
+          onCancel={() => cancelPrompt(tab.id)}
+        />
+      ) : tab.status === "failed" ? (
+        <div className="overlay__card">
+          <div className="overlay__icon overlay__icon--danger">
+            <IconAlert size={22} />
+          </div>
+          <h3 className="overlay__title">连接失败</h3>
+          <p className="overlay__text overlay__text--mono">{tab.error}</p>
+          <div className="overlay__actions">
+            {host && (
+              <button className="btn btn--ghost" onClick={() => openHost(host.id)}>
+                编辑主机
+              </button>
+            )}
+            <button className="btn btn--ghost" onClick={() => void closeTab(tab.id)}>
+              关闭
+            </button>
+            <button className="btn btn--primary" onClick={onReconnect}>
+              <IconRefresh size={14} /> 重试
+            </button>
+          </div>
+        </div>
+      ) : (
+        <div className="overlay__connecting">
+          <span className="spinner" />
+          <span>
+            正在连接 <strong>{tab.title}</strong>
+          </span>
+          <IconChevronRight size={14} className="muted" />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PasswordPrompt({
+  host,
+  username,
+  retry,
+  canRemember,
+  onSubmit,
+  onCancel,
+}: {
+  host: string;
+  username: string;
+  retry: boolean;
+  canRemember: boolean;
+  onSubmit: (pw: string, remember: boolean) => void;
+  onCancel: () => void;
+}) {
+  const [pw, setPw] = useState("");
+  const [remember, setRemember] = useState(false);
+  return (
+    <form
+      className="overlay__card"
+      onSubmit={(e) => {
+        e.preventDefault();
+        if (pw) onSubmit(pw, remember);
+      }}
+    >
+      <div className="overlay__icon">
+        <IconShield size={22} />
+      </div>
+      <h3 className="overlay__title">输入密码</h3>
+      <p className="overlay__text">
+        {retry ? "密码不正确，请重试。" : "密钥和 ssh-agent 都没能登录，"}
+        <strong>
+          {username ? `${username}@` : ""}
+          {host}
+        </strong>{" "}
+        需要密码。
+      </p>
+      <input
+        className="field__input"
+        type="password"
+        autoFocus
+        placeholder="密码"
+        value={pw}
+        onChange={(e) => setPw(e.target.value)}
+      />
+      {canRemember && (
+        <label className="check">
+          <input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} />
+          记住密码（加密保存在保险库）
+        </label>
+      )}
+      <div className="overlay__actions">
+        <button type="button" className="btn btn--ghost" onClick={onCancel}>
+          取消
+        </button>
+        <button type="submit" className="btn btn--primary" disabled={!pw}>
+          登录
+        </button>
+      </div>
+    </form>
+  );
+}

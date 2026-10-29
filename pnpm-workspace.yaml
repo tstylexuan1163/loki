@@ -1,0 +1,6 @@
+# esbuild (used by Vite) needs its postinstall to fetch the platform binary.
+# `allowBuilds` is the pnpm 11+ spelling; `onlyBuiltDependencies` covers pnpm 10.
+allowBuilds:
+  esbuild: true
+onlyBuiltDependencies:
+  - esbuild
