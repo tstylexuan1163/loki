@@ -23,20 +23,16 @@ jobs:
   # place instead of racing to create it.
   create-release:
     runs-on: ubuntu-latest
-    outputs:
-      release_id: ${{ steps.release.outputs.id }}
     steps:
       - uses: actions/checkout@v4
-      - id: release
-        env:
+      - env:
           GH_TOKEN: ${{ github.token }}
         run: |
           notes="docs/release-notes/${TAG}.md"
           [ -f "$notes" ] || notes=/dev/null
           if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" --draft --title "loki ${TAG}" --notes-file "$notes" --target "$GITHUB_SHA"
+            gh release create "$TAG" --draft --title "loki ${TAG}" --notes-file "$notes" --verify-tag
           fi
-          echo "id=$(gh api "repos/$GITHUB_REPOSITORY/releases" --jq ".[] | select(.tag_name==\"$TAG\") | .id" | head -1)" >> "$GITHUB_OUTPUT"
 
   build:
     needs: create-release
@@ -81,17 +77,30 @@ jobs:
         # Cross-arch test binaries cannot run on the arm64 runner.
         if: matrix.target != 'x86_64-apple-darwin'
 
+      # Looked up by tag rather than by id: a freshly created draft does not
+      # show up in the releases listing right away, and an empty id makes the
+      # action skip every upload without failing.
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          releaseId: ${{ needs.create-release.outputs.release_id }}
+          tagName: ${{ env.TAG }}
+          releaseName: loki ${{ env.TAG }}
+          releaseDraft: true
           args: ${{ matrix.args }}
 
+  # Publish only once every platform's installer is attached.
   publish:
     needs: [create-release, build]
     runs-on: ubuntu-latest
     steps:
       - env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+        run: |
+          count=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets | length')
+          echo "assets: $count"
+          if [ "$count" -lt 3 ]; then
+            echo "::error::expected installers for every platform, found $count assets"
+            exit 1
+          fi
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
