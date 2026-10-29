@@ -50,21 +50,22 @@ The interface is currently in Simplified Chinese.
 | **Connecting** | Trust-on-first-use host keys stored in the vault, with a loud warning when a key *changes*; tries the host's key → a key from the key vault → ssh-agent → password, and asks for a password when nothing works; keyboard-interactive for PAM servers; jump hosts (ProxyJump); quick connect by typing `user@host:port` |
 | **Files (SFTP)** | A panel beside the terminal on the same connection; upload and download files *and folders* with progress and cancel; drag-and-drop upload; rename, new file/folder, recursive delete; built-in editor |
 | **Port forwarding** | Local (`-L`) and SOCKS5 (`-D`) |
-| **AI assistant** | OpenAI-compatible APIs (OpenAI, OpenRouter, Ollama, LM Studio, vLLM…) and Anthropic; it can read the terminal, run commands, list/read/write files and grep — with three permission modes, and changes to the server always need your approval by default |
+| **AI assistant** | OpenAI Chat Completions–compatible APIs (OpenAI, OpenRouter, DeepSeek, Ollama, LM Studio, vLLM…), OpenAI Responses and Anthropic; replies **stream** in as they are written, with tool calls shown inline where they happen; it can read the terminal, run commands, list/read/write files and grep — with three permission modes, and changes to the server need your approval by default |
 | **Keys** | Generate Ed25519 / RSA-4096, import OpenSSH or PEM keys (with passphrase) |
 | **Import** | Bring hosts in from `~/.ssh/config`, including identity files and ProxyJump |
-| **Vault** | Master password with a one-time recovery code; auto-lock after inactivity |
+| **Vault** | Master password with a one-time recovery code you can copy or save to a file; auto-lock after inactivity |
 | **Sync (optional)** | To a Cloudflare Worker + D1 that *you* deploy; the server only ever sees ciphertext — see [`workers/sync`](workers/sync) |
-| **Look** | Dark and light themes (or follow the system); terminal font, size, cursor and scrollback settings |
+| **Look** | Dark and light themes (or follow the system); 10 terminal colour schemes (loki, One Dark, Dracula, Nord, Tokyo Night, Catppuccin Mocha, Gruvbox, Solarized dark/light, GitHub Light); font, size, cursor and scrollback settings |
+| **Updates** | Checks for new releases and installs them in place; every update package is signature-verified |
 
 <table>
   <tr>
     <td><img src="docs/images/hosts-dark.png" alt="Host list" /></td>
-    <td><img src="docs/images/host-key.png" alt="Host key confirmation and assistant" /></td>
+    <td><img src="docs/images/terminal-ai.png" alt="Streaming AI assistant beside the terminal" /></td>
   </tr>
   <tr>
     <td><img src="docs/images/quick-connect.png" alt="Quick connect" /></td>
-    <td><img src="docs/images/host-editor-light.png" alt="Host editor, light theme" /></td>
+    <td><img src="docs/images/terminal-schemes.png" alt="Terminal colour schemes" /></td>
   </tr>
 </table>
 

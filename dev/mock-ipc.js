@@ -8,8 +8,11 @@
   const emit = (event, payload) =>
     (listeners.get(event) || []).forEach((id) => callbacks.get(id)?.({ event, id, payload }));
 
+  // `?fresh` starts from an empty install, to show onboarding and the
+  // recovery code step.
+  const fresh = location.search.includes("fresh");
   const state = {
-    exists: true,
+    exists: !fresh,
     unlocked: false,
     hosts: [
       host("h1", "prod-api-tokyo", "10.0.12.31", "deploy", ["prod", "k8s"], { has_key: true }),
@@ -60,6 +63,26 @@
     app_info: () => ({ name: "loki", version: "0.7.0" }),
     vault_status: () => ({ exists: state.exists, unlocked: state.unlocked, kdf: null }),
     vault_unlock: () => ((state.unlocked = true), handlers.vault_status()),
+    vault_create: () => {
+      state.exists = true;
+      state.unlocked = true;
+      return { status: handlers.vault_status(), recoveryCode: "NHG8 980J ADBD GH83 F8M4 M2BG R8CE MWRF" };
+    },
+    recovery_code_export: () => null,
+    // A turn streamed token by token, with a tool call in the middle, the way
+    // the engine emits it.
+    ai_send: () => {
+      const say = (text) => text.match(/.{1,3}/gsu) ?? [];
+      const script = [
+        ...say("先看一下磁盘占用。").map((t) => ({ type: "text", text: t })),
+        { type: "toolCall", id: "c1", name: "run_command", arguments: { command: "df -h /" }, auto: true },
+        { type: "toolResult", id: "c1", ok: true, content: "Filesystem  Size  Used Avail Use% Mounted on\n/dev/sda1    78G   33G   45G  43% /" },
+        ...say("根分区用了 **43%**，还剩 45G，暂时不用清理。可以用 `du -sh /var/*` 看看哪个目录最大。").map((t) => ({ type: "text", text: t })),
+        { type: "done", steps: 2 },
+      ];
+      script.forEach((ev, i) => setTimeout(() => emit("ai-event", ev), 300 + i * 70));
+      return null;
+    },
     vault_lock: () => ((state.unlocked = false), handlers.vault_status()),
     hosts_list: () => state.hosts,
     host_save: ({ host: h }) => {

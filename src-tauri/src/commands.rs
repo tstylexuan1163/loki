@@ -114,6 +114,70 @@ pub fn vault_recover(state: State<'_, AppState>, code: String) -> Result<VaultSt
     Ok(vault.status())
 }
 
+/// Writes the recovery code to a file the user picked, right after creation.
+///
+/// The code is passed back in because Rust never keeps it. It is parsed before
+/// anything is written, so this cannot be used to write arbitrary text, and on
+/// Unix the file is created readable by its owner only.
+#[tauri::command]
+pub fn recovery_code_export(path: String, code: String) -> Result<(), String> {
+    let parsed = RecoveryCode::parse(&code).map_err(|_| "恢复码格式不正确".to_string())?;
+    let body = recovery_file_text(&parsed.display);
+    write_private_file(std::path::Path::new(&path), body.as_bytes())
+        .map_err(|e| format!("无法保存到 {path}：{e}"))
+}
+
+fn recovery_file_text(code: &str) -> String {
+    format!(
+        "loki 恢复码 / loki recovery code\n\
+         ================================\n\n\
+         {code}\n\n\
+         忘记主密码时，在解锁页点「忘记密码？」并输入上面的恢复码。\n\
+         它和主密码一样重要：任何拿到它的人都能解开这台电脑上的 loki 保险库。\n\
+         请打印或存进密码管理器，然后删除这个文件。\n\n\
+         If you forget the master password, choose \"忘记密码？\" on the unlock screen and\n\
+         enter the code above. Anyone holding it can open the loki vault on this computer:\n\
+         print it or store it in a password manager, then delete this file.\n\n\
+         生成时间 / Created: {}\n",
+        format_utc(now_secs())
+    )
+}
+
+/// `YYYY-MM-DD HH:MM UTC` for a Unix timestamp, without a date crate.
+fn format_utc(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    // Civil-from-days (Howard Hinnant), valid for the proleptic Gregorian calendar.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02} UTC",
+        rem / 3600,
+        rem % 3600 / 60
+    )
+}
+
+fn write_private_file(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    f.write_all(data)?;
+    f.sync_all()
+}
+
 /// Sets a new master password. The vault must be unlocked first.
 #[tauri::command]
 pub fn vault_change_password(
@@ -2463,6 +2527,38 @@ mod tests {
         let row = vault.encrypt_item(id, "provider", &payload).unwrap();
         vault.store().put_item(&row).unwrap();
         vault
+    }
+
+    #[test]
+    fn recovery_export_refuses_anything_but_a_code_and_writes_privately() {
+        let dir = std::env::temp_dir().join(format!("loki-rc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("code.txt");
+        let p = path.to_string_lossy().to_string();
+
+        // Arbitrary text is rejected and nothing is written.
+        assert!(recovery_code_export(p.clone(), "rm -rf /".into()).is_err());
+        assert!(!path.exists());
+
+        let code = crate::crypto::RecoveryCode::generate().unwrap().display;
+        recovery_code_export(p.clone(), code.clone()).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(&code));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn dates_render_in_utc() {
+        assert_eq!(format_utc(0), "1970-01-01 00:00 UTC");
+        assert_eq!(format_utc(1_793_235_720), "2026-10-29 01:02 UTC");
+        // A leap day, to exercise the calendar arithmetic.
+        assert_eq!(format_utc(1_709_251_140), "2024-02-29 23:59 UTC");
     }
 
     #[test]

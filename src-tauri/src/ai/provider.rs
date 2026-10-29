@@ -275,6 +275,37 @@ async fn openai_complete(
     messages: &[ChatMessage],
     tools: &[ToolSpec],
 ) -> Result<ModelReply, AiError> {
+    let body = openai_body(config, messages, tools);
+    let url = endpoint(&config.base_url, "chat/completions");
+    let parsed = post_json(config, &url, &body).await?;
+    parse_openai_reply(&parsed)
+}
+
+/// Sends a JSON request and returns the parsed JSON reply, turning a non-2xx
+/// status into a provider error that quotes the body.
+async fn post_json(config: &ProviderConfig, url: &str, body: &Value) -> Result<Value, AiError> {
+    let resp = with_auth(client()?.post(url), config.protocol, &config.api_key)
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| AiError::Http(e.to_string()))?;
+
+    let status = resp.status();
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| AiError::Http(e.to_string()))?;
+    if !status.is_success() {
+        return Err(AiError::Provider(format!(
+            "{status}: {}",
+            truncate(&text, 400)
+        )));
+    }
+    serde_json::from_str(&text).map_err(|e| AiError::Parse(e.to_string()))
+}
+
+/// The Chat Completions request body.
+fn openai_body(config: &ProviderConfig, messages: &[ChatMessage], tools: &[ToolSpec]) -> Value {
     let mut wire = Vec::with_capacity(messages.len());
     for m in messages {
         let role = match m.role {
@@ -330,27 +361,11 @@ async fn openai_complete(
         );
         body["tool_choice"] = json!("auto");
     }
+    body
+}
 
-    let url = endpoint(&config.base_url, "chat/completions");
-    let resp = with_auth(client()?.post(&url), config.protocol, &config.api_key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| AiError::Http(e.to_string()))?;
-
-    let status = resp.status();
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| AiError::Http(e.to_string()))?;
-    if !status.is_success() {
-        return Err(AiError::Provider(format!(
-            "{status}: {}",
-            truncate(&text, 400)
-        )));
-    }
-
-    let parsed: Value = serde_json::from_str(&text).map_err(|e| AiError::Parse(e.to_string()))?;
+/// Reads a (non-streamed) Chat Completions reply.
+fn parse_openai_reply(parsed: &Value) -> Result<ModelReply, AiError> {
     let choice = parsed
         .get("choices")
         .and_then(|c| c.get(0))
@@ -373,11 +388,7 @@ async fn openai_complete(
                 .to_string();
             // The arguments arrive as a JSON string and may be malformed; a bad
             // call is reported to the model as a tool error, not a crash.
-            let arguments = f
-                .get("arguments")
-                .and_then(|v| v.as_str())
-                .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                .unwrap_or_else(|| json!({}));
+            let arguments = parse_arguments(f.get("arguments").and_then(|v| v.as_str()));
             tool_calls.push(ToolCall {
                 id,
                 name,
@@ -402,11 +413,27 @@ async fn openai_complete(
     })
 }
 
+/// Tool arguments arrive as a JSON string; a malformed one becomes `{}` and
+/// the tool reports the missing fields to the model.
+fn parse_arguments(raw: Option<&str>) -> Value {
+    raw.filter(|s| !s.trim().is_empty())
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        .unwrap_or_else(|| json!({}))
+}
+
 async fn anthropic_complete(
     config: &ProviderConfig,
     messages: &[ChatMessage],
     tools: &[ToolSpec],
 ) -> Result<ModelReply, AiError> {
+    let body = anthropic_body(config, messages, tools);
+    let url = endpoint(&config.base_url, "messages");
+    let parsed = post_json(config, &url, &body).await?;
+    parse_anthropic_reply(&parsed)
+}
+
+/// The Anthropic Messages request body.
+fn anthropic_body(config: &ProviderConfig, messages: &[ChatMessage], tools: &[ToolSpec]) -> Value {
     // Anthropic takes the system prompt out of band, and tool results are user
     // messages of type `tool_result`.
     let system: String = messages
@@ -469,27 +496,11 @@ async fn anthropic_complete(
                 .collect(),
         );
     }
+    body
+}
 
-    let url = endpoint(&config.base_url, "messages");
-    let resp = with_auth(client()?.post(&url), config.protocol, &config.api_key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| AiError::Http(e.to_string()))?;
-
-    let status = resp.status();
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| AiError::Http(e.to_string()))?;
-    if !status.is_success() {
-        return Err(AiError::Provider(format!(
-            "{status}: {}",
-            truncate(&text, 400)
-        )));
-    }
-
-    let parsed: Value = serde_json::from_str(&text).map_err(|e| AiError::Parse(e.to_string()))?;
+/// Reads a (non-streamed) Anthropic Messages reply.
+fn parse_anthropic_reply(parsed: &Value) -> Result<ModelReply, AiError> {
     let blocks = parsed
         .get("content")
         .and_then(|c| c.as_array())
@@ -544,27 +555,8 @@ async fn responses_complete(
     tools: &[ToolSpec],
 ) -> Result<ModelReply, AiError> {
     let body = responses_body(config, messages, tools);
-
     let url = endpoint(&config.base_url, "responses");
-    let resp = with_auth(client()?.post(&url), config.protocol, &config.api_key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| AiError::Http(e.to_string()))?;
-
-    let status = resp.status();
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| AiError::Http(e.to_string()))?;
-    if !status.is_success() {
-        return Err(AiError::Provider(format!(
-            "{status}: {}",
-            truncate(&text, 400)
-        )));
-    }
-
-    let parsed: Value = serde_json::from_str(&text).map_err(|e| AiError::Parse(e.to_string()))?;
+    let parsed = post_json(config, &url, &body).await?;
     parse_responses_reply(&parsed)
 }
 
@@ -796,6 +788,410 @@ fn truncate(s: &str, max: usize) -> String {
         out.push('…');
         out
     }
+}
+
+// ---- Streaming ---------------------------------------------------------------
+//
+// The turn engine streams so the user sees text as it is written instead of a
+// blank panel followed by a wall of text. All three protocols speak
+// Server-Sent Events; each has its own event shapes, folded into the same
+// `ModelReply` by an accumulator.
+
+/// Splits a Server-Sent Events byte stream into `(event, data)` pairs.
+///
+/// Bytes arrive in arbitrary chunks, so a UTF-8 character or an event can be
+/// split across two of them; both are buffered until complete.
+#[derive(Default)]
+pub struct SseParser {
+    bytes: Vec<u8>,
+    text: String,
+}
+
+impl SseParser {
+    pub fn feed(&mut self, chunk: &[u8]) -> Vec<(Option<String>, String)> {
+        self.bytes.extend_from_slice(chunk);
+        let valid = match std::str::from_utf8(&self.bytes) {
+            Ok(s) => s.len(),
+            Err(e) => e.valid_up_to(),
+        };
+        let decoded: Vec<u8> = self.bytes.drain(..valid).collect();
+        self.text.push_str(&String::from_utf8_lossy(&decoded));
+        if self.text.contains('\r') {
+            self.text = self.text.replace("\r\n", "\n");
+        }
+
+        let mut out = Vec::new();
+        while let Some(end) = self.text.find("\n\n") {
+            let block: String = self.text.drain(..end + 2).collect();
+            let mut event = None;
+            let mut data: Vec<&str> = Vec::new();
+            for line in block.lines() {
+                if let Some(v) = line.strip_prefix("event:") {
+                    event = Some(v.trim().to_string());
+                } else if let Some(v) = line.strip_prefix("data:") {
+                    data.push(v.strip_prefix(' ').unwrap_or(v));
+                }
+            }
+            if !data.is_empty() {
+                out.push((event, data.join("\n")));
+            }
+        }
+        out
+    }
+}
+
+/// Folds one protocol's stream events into a reply.
+enum StreamAcc {
+    Chat {
+        text: String,
+        /// `(id, name, arguments)` by the index the server assigns.
+        calls: Vec<(String, String, String)>,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+    },
+    Anthropic {
+        text: String,
+        /// Tool-use blocks by content index: `(id, name, partial JSON)`.
+        blocks: Vec<Option<(String, String, String)>>,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+    },
+    Responses {
+        text: String,
+        completed: Option<Value>,
+    },
+}
+
+impl StreamAcc {
+    fn new(protocol: Protocol) -> Self {
+        match protocol {
+            Protocol::ChatCompletions => StreamAcc::Chat {
+                text: String::new(),
+                calls: Vec::new(),
+                input_tokens: None,
+                output_tokens: None,
+            },
+            Protocol::Anthropic => StreamAcc::Anthropic {
+                text: String::new(),
+                blocks: Vec::new(),
+                input_tokens: None,
+                output_tokens: None,
+            },
+            Protocol::Responses => StreamAcc::Responses {
+                text: String::new(),
+                completed: None,
+            },
+        }
+    }
+
+    /// Applies one event. Returns `true` when the stream says it is finished.
+    fn apply(
+        &mut self,
+        event: Option<&str>,
+        data: &str,
+        on_text: &mut (dyn FnMut(&str) + Send),
+    ) -> Result<bool, AiError> {
+        if data.trim() == "[DONE]" {
+            return Ok(true);
+        }
+        // Keep-alive comments and non-JSON lines are not errors.
+        let Ok(v) = serde_json::from_str::<Value>(data) else {
+            return Ok(false);
+        };
+        if let Some(msg) = v.pointer("/error/message").and_then(|m| m.as_str()) {
+            return Err(AiError::Provider(msg.to_string()));
+        }
+
+        match self {
+            StreamAcc::Chat {
+                text,
+                calls,
+                input_tokens,
+                output_tokens,
+            } => {
+                if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
+                    *input_tokens = u.get("prompt_tokens").and_then(|x| x.as_u64());
+                    *output_tokens = u.get("completion_tokens").and_then(|x| x.as_u64());
+                }
+                let Some(delta) = v.pointer("/choices/0/delta") else {
+                    return Ok(false);
+                };
+                if let Some(t) = delta.get("content").and_then(|t| t.as_str()) {
+                    if !t.is_empty() {
+                        text.push_str(t);
+                        on_text(t);
+                    }
+                }
+                for c in delta
+                    .get("tool_calls")
+                    .and_then(|c| c.as_array())
+                    .into_iter()
+                    .flatten()
+                {
+                    let idx = c
+                        .get("index")
+                        .and_then(|i| i.as_u64())
+                        .map(|i| i as usize)
+                        .unwrap_or(calls.len());
+                    while calls.len() <= idx {
+                        calls.push(Default::default());
+                    }
+                    let entry = &mut calls[idx];
+                    if let Some(id) = c.get("id").and_then(|x| x.as_str()) {
+                        entry.0 = id.to_string();
+                    }
+                    if let Some(name) = c.pointer("/function/name").and_then(|x| x.as_str()) {
+                        // The name normally arrives once; some servers repeat it.
+                        if entry.1 != name {
+                            entry.1.push_str(name);
+                        }
+                    }
+                    if let Some(args) = c.pointer("/function/arguments").and_then(|x| x.as_str()) {
+                        entry.2.push_str(args);
+                    }
+                }
+                Ok(false)
+            }
+
+            StreamAcc::Anthropic {
+                text,
+                blocks,
+                input_tokens,
+                output_tokens,
+            } => {
+                let kind = event
+                    .map(str::to_string)
+                    .or_else(|| v.get("type").and_then(|t| t.as_str()).map(String::from))
+                    .unwrap_or_default();
+                let index = v.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                match kind.as_str() {
+                    "message_start" => {
+                        *input_tokens = v
+                            .pointer("/message/usage/input_tokens")
+                            .and_then(|x| x.as_u64());
+                    }
+                    "content_block_start" => {
+                        while blocks.len() <= index {
+                            blocks.push(None);
+                        }
+                        let block = &v["content_block"];
+                        if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                            blocks[index] = Some((
+                                block["id"].as_str().unwrap_or("call").to_string(),
+                                block["name"].as_str().unwrap_or("").to_string(),
+                                String::new(),
+                            ));
+                        }
+                    }
+                    "content_block_delta" => {
+                        let delta = &v["delta"];
+                        match delta.get("type").and_then(|t| t.as_str()) {
+                            Some("text_delta") => {
+                                if let Some(t) = delta.get("text").and_then(|t| t.as_str()) {
+                                    text.push_str(t);
+                                    on_text(t);
+                                }
+                            }
+                            Some("input_json_delta") => {
+                                if let Some(Some(b)) = blocks.get_mut(index) {
+                                    b.2.push_str(
+                                        delta
+                                            .get("partial_json")
+                                            .and_then(|p| p.as_str())
+                                            .unwrap_or(""),
+                                    );
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    "message_delta" => {
+                        if let Some(o) = v.pointer("/usage/output_tokens").and_then(|x| x.as_u64())
+                        {
+                            *output_tokens = Some(o);
+                        }
+                    }
+                    "message_stop" => return Ok(true),
+                    _ => {}
+                }
+                Ok(false)
+            }
+
+            StreamAcc::Responses { text, completed } => {
+                let kind = v
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .or(event)
+                    .unwrap_or("");
+                match kind {
+                    "response.output_text.delta" => {
+                        if let Some(t) = v.get("delta").and_then(|t| t.as_str()) {
+                            text.push_str(t);
+                            on_text(t);
+                        }
+                        Ok(false)
+                    }
+                    "response.completed" | "response.incomplete" => {
+                        *completed = v.get("response").cloned();
+                        Ok(true)
+                    }
+                    "response.failed" => Err(AiError::Provider(
+                        v.pointer("/response/error/message")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("模型服务返回失败")
+                            .to_string(),
+                    )),
+                    _ => Ok(false),
+                }
+            }
+        }
+    }
+
+    fn finish(self) -> Result<ModelReply, AiError> {
+        match self {
+            StreamAcc::Chat {
+                text,
+                calls,
+                input_tokens,
+                output_tokens,
+            } => Ok(ModelReply {
+                text,
+                tool_calls: calls
+                    .into_iter()
+                    .filter(|(_, name, _)| !name.is_empty())
+                    .enumerate()
+                    .map(|(i, (id, name, args))| ToolCall {
+                        id: if id.is_empty() {
+                            format!("call_{i}")
+                        } else {
+                            id
+                        },
+                        name,
+                        arguments: parse_arguments(Some(&args)),
+                    })
+                    .collect(),
+                input_tokens,
+                output_tokens,
+            }),
+            StreamAcc::Anthropic {
+                text,
+                blocks,
+                input_tokens,
+                output_tokens,
+            } => Ok(ModelReply {
+                text,
+                tool_calls: blocks
+                    .into_iter()
+                    .flatten()
+                    .map(|(id, name, json)| ToolCall {
+                        id,
+                        name,
+                        arguments: parse_arguments(Some(&json)),
+                    })
+                    .collect(),
+                input_tokens,
+                output_tokens,
+            }),
+            StreamAcc::Responses { text, completed } => {
+                let Some(full) = completed else {
+                    return Err(AiError::Parse("流在完成前中断".into()));
+                };
+                let mut reply = parse_responses_reply(&full)?;
+                if !text.is_empty() {
+                    reply.text = text;
+                }
+                Ok(reply)
+            }
+        }
+    }
+}
+
+/// A client for streamed replies: no overall deadline (a long answer may take
+/// minutes), but a stalled connection is still given up on.
+fn stream_client() -> Result<reqwest::Client, AiError> {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(20))
+        .read_timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| AiError::Http(e.to_string()))
+}
+
+/// Like [`complete`], but streams: `on_text` receives each piece of text as the
+/// model writes it. The returned reply holds the full text and the tool calls.
+///
+/// A server that ignores `"stream": true` and answers with plain JSON still
+/// works; its whole text is passed to `on_text` at once.
+pub async fn complete_stream(
+    config: &ProviderConfig,
+    messages: &[ChatMessage],
+    tools: &[ToolSpec],
+    on_text: &mut (dyn FnMut(&str) + Send),
+) -> Result<ModelReply, AiError> {
+    use futures::StreamExt;
+
+    let (path, mut body) = match config.protocol {
+        Protocol::ChatCompletions => ("chat/completions", openai_body(config, messages, tools)),
+        Protocol::Anthropic => ("messages", anthropic_body(config, messages, tools)),
+        Protocol::Responses => ("responses", responses_body(config, messages, tools)),
+    };
+    body["stream"] = json!(true);
+
+    let url = endpoint(&config.base_url, path);
+    let resp = with_auth(
+        stream_client()?.post(&url),
+        config.protocol,
+        &config.api_key,
+    )
+    .header(reqwest::header::ACCEPT, "text/event-stream")
+    .json(&body)
+    .send()
+    .await
+    .map_err(|e| AiError::Http(e.to_string()))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(AiError::Provider(format!(
+            "{status}: {}",
+            truncate(&text, 400)
+        )));
+    }
+
+    let is_sse = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("text/event-stream"));
+    if !is_sse {
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| AiError::Http(e.to_string()))?;
+        let parsed: Value =
+            serde_json::from_str(&text).map_err(|e| AiError::Parse(e.to_string()))?;
+        let reply = match config.protocol {
+            Protocol::ChatCompletions => parse_openai_reply(&parsed)?,
+            Protocol::Anthropic => parse_anthropic_reply(&parsed)?,
+            Protocol::Responses => parse_responses_reply(&parsed)?,
+        };
+        if !reply.text.is_empty() {
+            on_text(&reply.text);
+        }
+        return Ok(reply);
+    }
+
+    let mut parser = SseParser::default();
+    let mut acc = StreamAcc::new(config.protocol);
+    let mut stream = resp.bytes_stream();
+    'read: while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| AiError::Http(e.to_string()))?;
+        for (event, data) in parser.feed(&chunk) {
+            if acc.apply(event.as_deref(), &data, on_text)? {
+                break 'read;
+            }
+        }
+    }
+    acc.finish()
 }
 
 #[cfg(test)]
@@ -1034,5 +1430,102 @@ mod tests {
     fn truncate_keeps_short_text_whole() {
         assert_eq!(truncate("hello", 10), "hello");
         assert!(truncate(&"x".repeat(500), 10).chars().count() <= 11);
+    }
+
+    /// Runs SSE text through the parser and an accumulator, returning the reply
+    /// and every text piece `on_text` saw.
+    fn run_stream(protocol: Protocol, chunks: &[&[u8]]) -> (ModelReply, Vec<String>) {
+        let mut parser = SseParser::default();
+        let mut acc = StreamAcc::new(protocol);
+        let mut seen = Vec::new();
+        let mut on_text = |t: &str| seen.push(t.to_string());
+        'outer: for c in chunks {
+            for (ev, data) in parser.feed(c) {
+                if acc.apply(ev.as_deref(), &data, &mut on_text).unwrap() {
+                    break 'outer;
+                }
+            }
+        }
+        (acc.finish().unwrap(), seen)
+    }
+
+    #[test]
+    fn sse_parser_survives_split_chunks_and_crlf() {
+        let mut p = SseParser::default();
+        // "中" is three bytes; split it across chunks, and the event too.
+        let bytes = "event: x\r\ndata: 中文\r\n\r\ndata: two\n\n".as_bytes();
+        let mut out = Vec::new();
+        for chunk in [&bytes[..12], &bytes[12..15], &bytes[15..]] {
+            out.extend(p.feed(chunk));
+        }
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], (Some("x".into()), "中文".into()));
+        assert_eq!(out[1], (None, "two".into()));
+    }
+
+    #[test]
+    fn chat_stream_collects_text_and_split_tool_arguments() {
+        let (reply, seen) = run_stream(
+            Protocol::ChatCompletions,
+            &[
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
+                b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"run_command\",\"arguments\":\"{\\\"comm\"}}]}}]}\n\n",
+                b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"and\\\":\\\"ls\\\"}\"}}]}}]}\n\n",
+                b"data: [DONE]\n\n",
+            ],
+        );
+        assert_eq!(seen, ["Hel", "lo"]);
+        assert_eq!(reply.text, "Hello");
+        assert_eq!(reply.tool_calls.len(), 1);
+        assert_eq!(reply.tool_calls[0].id, "c1");
+        assert_eq!(reply.tool_calls[0].name, "run_command");
+        assert_eq!(reply.tool_calls[0].arguments["command"], "ls");
+    }
+
+    #[test]
+    fn anthropic_stream_collects_text_and_tool_use() {
+        let (reply, seen) = run_stream(
+            Protocol::Anthropic,
+            &[
+                b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":9}}}\n\n",
+                b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"looking\"}}\n\n",
+                b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"read_file\",\"input\":{}}}\n\n",
+                b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\"}}\n\n",
+                b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"/etc/hosts\\\"}\"}}\n\n",
+                b"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":4}}\n\n",
+                b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            ],
+        );
+        assert_eq!(seen, ["looking"]);
+        assert_eq!(reply.tool_calls[0].name, "read_file");
+        assert_eq!(reply.tool_calls[0].arguments["path"], "/etc/hosts");
+        assert_eq!(reply.input_tokens, Some(9));
+        assert_eq!(reply.output_tokens, Some(4));
+    }
+
+    #[test]
+    fn responses_stream_streams_text_and_reads_calls_from_completed() {
+        let (reply, seen) = run_stream(
+            Protocol::Responses,
+            &[
+                b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok \"}\n\n",
+                b"data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok \"}]},{\"type\":\"function_call\",\"call_id\":\"r1\",\"name\":\"grep\",\"arguments\":\"{\\\"pattern\\\":\\\"x\\\"}\"}]}}\n\n",
+            ],
+        );
+        assert_eq!(seen, ["ok "]);
+        assert_eq!(reply.text, "ok ");
+        assert_eq!(reply.tool_calls[0].id, "r1");
+        assert_eq!(reply.tool_calls[0].arguments["pattern"], "x");
+    }
+
+    #[test]
+    fn stream_error_events_become_errors() {
+        let mut acc = StreamAcc::new(Protocol::ChatCompletions);
+        let err = acc
+            .apply(None, r#"{"error":{"message":"rate limited"}}"#, &mut |_| {})
+            .unwrap_err();
+        assert!(err.to_string().contains("rate limited"));
     }
 }

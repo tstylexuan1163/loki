@@ -1,6 +1,10 @@
 import { useState } from "react";
+import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import logoUrl from "@/assets/logo.png";
 import { useApp } from "@/app/store";
+import { api, errorMessage } from "@/lib/api";
+import { toast } from "@/components/ui";
+import { IconCopy, IconDownload } from "@/components/icons";
 
 /** Password strength on a 0..1 scale with a rough label. */
 function strength(pw: string): { value: number; label: string; color: string } {
@@ -31,6 +35,32 @@ export function Gate() {
 /** Shown exactly once, right after the vault is created. */
 function RecoveryCodeStep({ code, onDone }: { code: string; onDone: () => void }) {
   const [confirmed, setConfirmed] = useState(false);
+  const [saved, setSaved] = useState<string | null>(null);
+
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(code);
+      toast("恢复码已复制。存进密码管理器后，记得用别的内容覆盖剪贴板。", "success");
+    } catch (e) {
+      toast(errorMessage(e), "error");
+    }
+  }
+
+  async function exportToFile() {
+    const path = await saveDialog({
+      title: "保存恢复码",
+      defaultPath: "loki-recovery-code.txt",
+      filters: [{ name: "文本", extensions: ["txt"] }],
+    });
+    if (!path) return;
+    try {
+      await api.recoveryCodeExport(path, code);
+      setSaved(path);
+      toast("已保存。建议打印或转存到密码管理器后删除这个文件。", "success");
+    } catch (e) {
+      toast(errorMessage(e), "error");
+    }
+  }
 
   return (
     <div className="gate">
@@ -48,8 +78,23 @@ function RecoveryCodeStep({ code, onDone }: { code: string; onDone: () => void }
           {code}
         </div>
 
+        <div className="recovery-actions">
+          <button className="btn" onClick={() => void copy()}>
+            <IconCopy size={14} /> 复制
+          </button>
+          <button className="btn" onClick={() => void exportToFile()}>
+            <IconDownload size={14} /> 保存为文件
+          </button>
+        </div>
+        {saved && (
+          <div className="recovery-saved" title={saved}>
+            已保存到 <code>{saved}</code>
+          </div>
+        )}
+
         <div className="notice">
-          请抄写到纸上或存进密码管理器。<strong>本机不保存它</strong>，关闭此页面后无法再次查看。
+          请抄写到纸上、存进密码管理器，或保存为文件后妥善保管。<strong>本机不保存它</strong>，关闭此页面后无法再次查看。
+          拿到恢复码的人可以解开保险库，不要把文件放在同步盘或共享目录里。
         </div>
 
         <label

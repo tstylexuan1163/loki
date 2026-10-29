@@ -39,7 +39,8 @@ const SYSTEM_PROMPT: &str = "\
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum AiEvent {
-    /// The model's prose for this step.
+    /// A piece of the model's prose, streamed as it is written. The UI
+    /// appends consecutive pieces; a tool call in between starts a new block.
     Text {
         text: String,
     },
@@ -102,21 +103,25 @@ pub async fn run_turn(
     };
 
     for step in 0..MAX_STEPS {
-        let reply = match provider::complete(&req.config, &messages, &catalogue).await {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = events.send(AiEvent::Error {
-                    message: e.to_string(),
-                });
-                return;
-            }
-        };
-
-        if !reply.text.is_empty() {
-            let _ = events.send(AiEvent::Text {
-                text: reply.text.clone(),
+        // Text goes to the UI as it is written; tool calls are only acted on
+        // once the reply is complete, since their arguments arrive in pieces.
+        let text_events = events.clone();
+        let mut on_text = move |t: &str| {
+            let _ = text_events.send(AiEvent::Text {
+                text: t.to_string(),
             });
-        }
+        };
+        let reply =
+            match provider::complete_stream(&req.config, &messages, &catalogue, &mut on_text).await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = events.send(AiEvent::Error {
+                        message: e.to_string(),
+                    });
+                    return;
+                }
+            };
 
         if reply.tool_calls.is_empty() {
             // No tools: the model is done.

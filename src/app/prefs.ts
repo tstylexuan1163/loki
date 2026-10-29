@@ -11,6 +11,8 @@ export type HostsView = "cards" | "list";
 export interface Prefs {
   /** Minutes of inactivity before the vault locks itself; 0 disables it. */
   autoLockMinutes: number;
+  /** Terminal colour scheme id, see `features/terminal/themes.ts`. */
+  terminalScheme: string;
   fontSize: number;
   fontFamily: string;
   lineHeight: number;
@@ -37,6 +39,7 @@ export const FONT_CHOICES = [
 
 const DEFAULTS: Prefs = {
   autoLockMinutes: 15,
+  terminalScheme: "loki",
   fontSize: 13,
   fontFamily: FONT_CHOICES[0].value,
   lineHeight: 1.25,

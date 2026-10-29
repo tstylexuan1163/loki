@@ -48,21 +48,22 @@
 | **连接** | 主机密钥首次确认后加密保存，密钥**变化**时红色警告；依次尝试主机私钥 → 密钥库中的密钥 → ssh-agent → 密码，都不行时弹出密码框；支持只开了 PAM 的服务器（keyboard-interactive）；跳板机（ProxyJump）；输入 `user@host:port` 快速连接 |
 | **文件（SFTP）** | 终端旁的文件面板，复用同一条连接；上传、下载文件和**整个文件夹**，有进度、可取消；拖拽上传；重命名、新建、递归删除；内置编辑器 |
 | **端口转发** | 本地转发（`-L`）和 SOCKS5（`-D`） |
-| **AI 助手** | 支持 OpenAI 兼容接口（OpenAI、OpenRouter、Ollama、LM Studio、vLLM 等）和 Anthropic；能读终端、执行命令、列目录、读写文件、grep；三种权限模式，默认情况下任何改动服务器的操作都要你确认 |
+| **AI 助手** | 支持 OpenAI Chat Completions 兼容接口（OpenAI、OpenRouter、DeepSeek、Ollama、LM Studio、vLLM 等）、OpenAI Responses 和 Anthropic；回复**流式**输出，工具调用按发生顺序穿插在回答中；能读终端、执行命令、列目录、读写文件、grep；三种权限模式，默认情况下改动服务器的操作都要你确认 |
 | **密钥** | 生成 Ed25519 / RSA-4096，导入 OpenSSH 或 PEM 私钥（支持口令） |
 | **导入** | 从 `~/.ssh/config` 一键导入主机，私钥文件和跳板机一并带入 |
-| **保险库** | 主密码 + 一次性恢复码；空闲自动锁定 |
+| **保险库** | 主密码 + 一次性恢复码（可复制或保存为文件）；空闲自动锁定 |
 | **同步（可选）** | 同步到**你自己**部署的 Cloudflare Worker + D1，服务端只见到密文，见 [`workers/sync`](workers/sync) |
-| **外观** | 深色、浅色或跟随系统；终端字体、字号、光标、回滚行数可调 |
+| **外观** | 深色、浅色或跟随系统；10 套终端配色（loki、One Dark、Dracula、Nord、Tokyo Night、Catppuccin Mocha、Gruvbox、Solarized 深/浅、GitHub Light）；字体、字号、光标、回滚行数可调 |
+| **更新** | 应用内检查并安装新版本，每个更新包都强制校验签名 |
 
 <table>
   <tr>
     <td><img src="docs/images/hosts-dark.png" alt="主机列表" /></td>
-    <td><img src="docs/images/host-key.png" alt="主机指纹确认与 AI 助手" /></td>
+    <td><img src="docs/images/terminal-ai.png" alt="终端旁的流式 AI 助手" /></td>
   </tr>
   <tr>
     <td><img src="docs/images/quick-connect.png" alt="快速连接" /></td>
-    <td><img src="docs/images/host-editor-light.png" alt="主机编辑器（浅色主题）" /></td>
+    <td><img src="docs/images/terminal-schemes.png" alt="终端配色" /></td>
   </tr>
 </table>
 

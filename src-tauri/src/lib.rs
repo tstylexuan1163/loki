@@ -88,6 +88,7 @@ pub fn run() {
             commands::vault_create,
             commands::vault_unlock,
             commands::vault_recover,
+            commands::recovery_code_export,
             commands::vault_change_password,
             commands::vault_lock,
             commands::hosts_list,

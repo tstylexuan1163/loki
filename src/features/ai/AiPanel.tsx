@@ -61,12 +61,84 @@ interface ToolCallView {
   /** Set when the model produced this call, so the history round-trips. */
 }
 
+/**
+ * One block of a turn, kept in the order it happened: the model writes, calls
+ * a tool, writes again. Rendering text first and every tool card after it (as
+ * the first version did) put the answer above the work that produced it.
+ */
+type Part = { kind: "text"; text: string } | { kind: "tool"; call: ToolCallView };
+
 interface Turn {
   role: "user" | "assistant";
-  text: string;
-  toolCalls: ToolCallView[];
+  parts: Part[];
   error?: string;
 }
+
+/** Applies one engine event to the parts of the turn that is running. */
+function applyEvent(parts: Part[], ev: AiEvent): Part[] {
+  if (ev.type === "text") {
+    const last = parts[parts.length - 1];
+    // Consecutive pieces belong to the same paragraph; after a tool call the
+    // model is writing a new block.
+    if (last?.kind === "text") {
+      return [...parts.slice(0, -1), { kind: "text", text: last.text + ev.text }];
+    }
+    return [...parts, { kind: "text", text: ev.text }];
+  }
+  if (ev.type === "toolCall") {
+    return [
+      ...parts,
+      { kind: "tool", call: { id: ev.id, name: ev.name, args: ev.arguments, auto: ev.auto } },
+    ];
+  }
+  if (ev.type === "toolResult") {
+    return parts.map((p) =>
+      p.kind === "tool" && p.call.id === ev.id
+        ? { kind: "tool", call: { ...p.call, result: { ok: ev.ok, content: ev.content } } }
+        : p,
+    );
+  }
+  return parts;
+}
+
+/**
+ * Rebuilds the message list the engine produced, step by step: each step is
+ * the text the model wrote plus the tools it called, followed by their results.
+ * A text block after a tool call starts the next step.
+ */
+function turnToMessages(parts: Part[]): ChatMessage[] {
+  const out: ChatMessage[] = [];
+  let step: { text: string; calls: ToolCallView[] } | null = null;
+  const flush = () => {
+    if (!step) return;
+    const done = step.calls.filter((c) => c.result);
+    if (step.text || done.length) {
+      out.push({
+        role: "assistant",
+        content: step.text,
+        // The engine echoes the exact arguments back to the model.
+        toolCalls: done.map((c) => ({ id: c.id, name: c.name, arguments: c.args })),
+      });
+      for (const c of done) out.push({ role: "tool", content: c.result!.content, toolCallId: c.id });
+    }
+    step = null;
+  };
+  for (const p of parts) {
+    if (p.kind === "text") {
+      if (step && step.calls.length) flush();
+      step ??= { text: "", calls: [] };
+      step.text += p.text;
+    } else {
+      step ??= { text: "", calls: [] };
+      step.calls.push(p.call);
+    }
+  }
+  flush();
+  return out;
+}
+
+const textOf = (t: Turn) =>
+  t.parts.map((p) => (p.kind === "text" ? p.text : "")).join("");
 
 /**
  * The assistant panel beside the terminal.
@@ -90,7 +162,7 @@ export function AiPanel({
   const [model, setModel] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const bottomRef = useRef<HTMLDivElement>(null);
+  const logRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     void (async () => {
@@ -106,8 +178,12 @@ export function AiPanel({
     })();
   }, []);
 
+  // Follow the stream while the reader is at the bottom; leave them alone if
+  // they scrolled up to read something earlier.
+  const pinned = useRef(true);
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    const el = logRef.current;
+    if (el && pinned.current) el.scrollTop = el.scrollHeight;
   }, [turns]);
 
   const activeModelOptions = providers.find((p) => p.id === providerId)?.models ?? [];
@@ -120,31 +196,11 @@ export function AiPanel({
     void listen<AiEvent>("ai-event", (evt) => {
       const ev = evt.payload;
       setTurns((prev) => {
-        const next = [...prev];
-        const last = next[next.length - 1];
+        const last = prev[prev.length - 1];
         if (!last || last.role !== "assistant") return prev;
-
-        if (ev.type === "text") {
-          next[next.length - 1] = { ...last, text: last.text + ev.text };
-        } else if (ev.type === "toolCall") {
-          next[next.length - 1] = {
-            ...last,
-            toolCalls: [
-              ...last.toolCalls,
-              { id: ev.id, name: ev.name, args: ev.arguments, auto: ev.auto },
-            ],
-          };
-        } else if (ev.type === "toolResult") {
-          next[next.length - 1] = {
-            ...last,
-            toolCalls: last.toolCalls.map((c) =>
-              c.id === ev.id ? { ...c, result: { ok: ev.ok, content: ev.content } } : c,
-            ),
-          };
-        } else if (ev.type === "error") {
-          next[next.length - 1] = { ...last, error: ev.message };
-        }
-        return next;
+        const updated: Turn =
+          ev.type === "error" ? { ...last, error: ev.message } : { ...last, parts: applyEvent(last.parts, ev) };
+        return [...prev.slice(0, -1), updated];
       });
 
       if (ev.type === "done" || ev.type === "error") setRunning(false);
@@ -162,24 +218,8 @@ export function AiPanel({
   const history = useCallback((): ChatMessage[] => {
     const out: ChatMessage[] = [];
     for (const t of turns) {
-      if (t.role === "user") {
-        out.push({ role: "user", content: t.text });
-      } else {
-        const calls = t.toolCalls
-          .filter((c) => c.result)
-          .map((c) => ({
-            id: c.id,
-            name: c.name,
-            // The engine echoes the exact arguments back to the model.
-            arguments: c.args,
-          }));
-        out.push({ role: "assistant", content: t.text, toolCalls: calls });
-        for (const c of t.toolCalls) {
-          if (c.result) {
-            out.push({ role: "tool", content: c.result.content, toolCallId: c.id });
-          }
-        }
-      }
+      if (t.role === "user") out.push({ role: "user", content: textOf(t) });
+      else out.push(...turnToMessages(t.parts));
     }
     return out;
   }, [turns]);
@@ -192,12 +232,13 @@ export function AiPanel({
       return;
     }
 
-    const userTurn: Turn = { role: "user", text, toolCalls: [] };
-    const assistantTurn: Turn = { role: "assistant", text: "", toolCalls: [] };
+    const userTurn: Turn = { role: "user", parts: [{ kind: "text", text }] };
+    const assistantTurn: Turn = { role: "assistant", parts: [] };
     // History must go to Rust *without* the placeholder assistant turn.
     const prior = history();
     setTurns((prev) => [...prev, userTurn, assistantTurn]);
     setDraft("");
+    pinned.current = true;
     setRunning(true);
     setError(null);
 
@@ -279,7 +320,14 @@ export function AiPanel({
         <div className="ai__note">当前标签不是 SSH 会话，助手只能聊天，不能操作服务器。</div>
       )}
 
-      <div className="ai__log">
+      <div
+        className="ai__log"
+        ref={logRef}
+        onScroll={(e) => {
+          const el = e.currentTarget;
+          pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+        }}
+      >
         {turns.length === 0 && (
           <div className="ai__welcome">
             <div className="ai__welcome-icon">
@@ -301,28 +349,35 @@ export function AiPanel({
           </div>
         )}
 
-        {turns.map((t, i) => (
-          <div key={i} className={`ai__turn ai__turn--${t.role}`}>
-            {t.role === "assistant" && <div className="ai__who">助手</div>}
-            {t.text && (
-              <div className="ai__text">{t.role === "assistant" ? <RichText text={t.text} /> : t.text}</div>
-            )}
+        {turns.map((t, i) => {
+          const live = running && i === turns.length - 1;
+          return (
+            <div key={i} className={`ai__turn ai__turn--${t.role}`}>
+              {t.role === "assistant" && <div className="ai__who">助手</div>}
+              {t.parts.map((p, j) =>
+                p.kind === "text" ? (
+                  <div key={j} className="ai__text">
+                    {t.role === "assistant" ? <RichText text={p.text} /> : p.text}
+                    {/* A caret on the block being written right now. */}
+                    {live && j === t.parts.length - 1 && <span className="ai__caret" />}
+                  </div>
+                ) : (
+                  <ToolCard
+                    key={p.call.id}
+                    call={p.call}
+                    onApprove={async (approved) => {
+                      await aiApi.approve(p.call.id, approved);
+                    }}
+                  />
+                ),
+              )}
+              {t.error && <div className="error">{t.error}</div>}
+            </div>
+          );
+        })}
 
-            {t.toolCalls.map((c) => (
-              <ToolCard
-                key={c.id}
-                call={c}
-                onApprove={async (approved) => {
-                  await aiApi.approve(c.id, approved);
-                }}
-              />
-            ))}
-
-            {t.error && <div className="error">{t.error}</div>}
-          </div>
-        ))}
-
-        {running && (
+        {/* Only while nothing is being written: the caret already says "busy". */}
+        {running && turns[turns.length - 1]?.parts.at(-1)?.kind !== "text" && (
           <div className="ai__thinking">
             <span className="dots">
               <i />
@@ -332,7 +387,6 @@ export function AiPanel({
             正在思考
           </div>
         )}
-        <div ref={bottomRef} />
       </div>
 
       {error && <div className="error" style={{ margin: "0 10px 8px" }}>{error}</div>}

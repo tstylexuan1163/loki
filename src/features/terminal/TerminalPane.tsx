@@ -7,33 +7,9 @@ import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { termBacklog, type TermEvent } from "@/lib/api";
 import { usePrefs } from "@/app/prefs";
+import { schemeById } from "@/features/terminal/themes";
 import { isAppShortcut, isMac, shortcutKey } from "@/app/platform";
 import "@xterm/xterm/css/xterm.css";
-
-/** A palette that matches the app's emerald-on-black identity. */
-const THEME = {
-  background: "#0b0f0e",
-  foreground: "#e3ece8",
-  cursor: "#2ee6a8",
-  cursorAccent: "#0b0f0e",
-  selectionBackground: "rgba(46, 230, 168, 0.28)",
-  black: "#1b2422",
-  red: "#f2637a",
-  green: "#2ee6a8",
-  yellow: "#e5c07b",
-  blue: "#6aa8ff",
-  magenta: "#c792ea",
-  cyan: "#5eead4",
-  white: "#d5dfdb",
-  brightBlack: "#5d6f6a",
-  brightRed: "#ff8497",
-  brightGreen: "#5cf5c2",
-  brightYellow: "#f0cf94",
-  brightBlue: "#9cc4ff",
-  brightMagenta: "#ddb6fb",
-  brightCyan: "#8ff5e4",
-  brightWhite: "#ffffff",
-};
 
 /** Live xterm instances by tab id, for the find bar and toolbar actions. */
 export const terminalRegistry = new Map<
@@ -91,7 +67,7 @@ export function TerminalPane({ tabId, sessionId, active, onInput, onResize }: Te
     const p = usePrefs.getState();
 
     const term = new Terminal({
-      theme: THEME,
+      theme: schemeById(p.terminalScheme).theme,
       fontFamily: p.fontFamily,
       fontSize: p.fontSize,
       lineHeight: p.lineHeight,
@@ -265,6 +241,7 @@ export function TerminalPane({ tabId, sessionId, active, onInput, onResize }: Te
       usePrefs.subscribe((p) => {
         const term = termRef.current;
         if (!term) return;
+        term.options.theme = schemeById(p.terminalScheme).theme;
         term.options.fontSize = p.fontSize;
         term.options.fontFamily = p.fontFamily;
         term.options.lineHeight = p.lineHeight;

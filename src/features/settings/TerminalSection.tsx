@@ -1,14 +1,44 @@
 import { FONT_CHOICES, usePrefs, type CursorStyle } from "@/app/prefs";
 import { Segmented, Switch } from "@/components/ui";
 import { keyLabel } from "@/app/platform";
+import { TERMINAL_SCHEMES, schemeById } from "@/features/terminal/themes";
 
 /** Terminal appearance and behaviour; applied live to every open pane. */
 export function TerminalSection() {
   const p = usePrefs();
   const set = p.set;
+  const scheme = schemeById(p.terminalScheme).theme;
 
   return (
     <>
+      <section className="settings__group">
+        <div className="settings__group-title">配色</div>
+        <div className="scheme-grid">
+          {TERMINAL_SCHEMES.map((s) => (
+            <button
+              key={s.id}
+              className={`scheme ${p.terminalScheme === s.id ? "scheme--on" : ""}`}
+              onClick={() => set("terminalScheme", s.id)}
+              style={{ background: s.theme.background, color: s.theme.foreground }}
+              title={s.name}
+            >
+              <span className="scheme__prompt">
+                <span style={{ color: s.theme.green }}>user@host</span>:
+                <span style={{ color: s.theme.blue }}>~</span>$ ls
+              </span>
+              <span className="scheme__dots">
+                {[s.theme.red, s.theme.green, s.theme.yellow, s.theme.blue, s.theme.magenta, s.theme.cyan].map(
+                  (c, i) => (
+                    <i key={i} style={{ background: c }} />
+                  ),
+                )}
+              </span>
+              <span className="scheme__name">{s.name}</span>
+            </button>
+          ))}
+        </div>
+      </section>
+
       <section className="settings__group">
         <div className="settings__group-title">字体</div>
         <div className="settings__row">
@@ -59,11 +89,11 @@ export function TerminalSection() {
           className="term-preview"
           style={{ fontFamily: p.fontFamily, fontSize: p.fontSize, lineHeight: p.lineHeight }}
         >
-          <span style={{ color: "#2ee6a8" }}>deploy@prod-api</span>:<span style={{ color: "#6aa8ff" }}>~/app</span>$ systemctl status nginx
+          <span style={{ color: scheme.green }}>deploy@prod-api</span>:<span style={{ color: scheme.blue }}>~/app</span>$ systemctl status nginx
           <br />
-          <span style={{ color: "#2ee6a8" }}>●</span> nginx.service - A high performance web server
+          <span style={{ color: scheme.green }}>●</span> nginx.service - A high performance web server
           <br />
-          {"   "}Active: <span style={{ color: "#2ee6a8" }}>active (running)</span> since Mon 09:12:44 UTC
+          {"   "}Active: <span style={{ color: scheme.green }}>active (running)</span> since Mon 09:12:44 UTC
         </div>
       </section>
 

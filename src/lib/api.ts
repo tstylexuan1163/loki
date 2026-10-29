@@ -79,6 +79,9 @@ export const api = {
   vaultStatus: () => invoke<VaultStatus>("vault_status"),
   vaultCreate: (password: string) => invoke<CreateVaultResult>("vault_create", { password }),
   vaultRecover: (code: string) => invoke<VaultStatus>("vault_recover", { code }),
+  /** Writes the just-created recovery code to a file the user picked. */
+  recoveryCodeExport: (path: string, code: string) =>
+    invoke<void>("recovery_code_export", { path, code }),
   vaultChangePassword: (newPassword: string) =>
     invoke<VaultStatus>("vault_change_password", { newPassword }),
   vaultUnlock: (password: string) => invoke<VaultStatus>("vault_unlock", { password }),
