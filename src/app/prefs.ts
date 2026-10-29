@@ -49,7 +49,7 @@ const DEFAULTS: Prefs = {
   copyOnSelect: false,
   showStats: true,
   hostsView: "cards",
-  panelWidth: 360,
+  panelWidth: 420,
   recentTargets: [],
 };
 

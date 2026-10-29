@@ -8,48 +8,17 @@ import {
   type PermissionMode,
   type ProviderView,
 } from "@/lib/api";
-import { IconCheck, IconSend, IconSparkle, IconTrash, IconX, IconChevronRight } from "@/components/icons";
-import { Fragment, type ReactNode } from "react";
-
-/**
- * Renders the model's reply with just enough markdown to be readable: fenced
- * code blocks, inline code and bold. Anything else stays plain text — no HTML
- * from the model is ever interpreted.
- */
-function RichText({ text }: { text: string }) {
-  const parts = text.split(/```(\w*)\n?([\s\S]*?)```/g);
-  const out: ReactNode[] = [];
-  for (let i = 0; i < parts.length; i += 3) {
-    out.push(<Inline key={`t${i}`} text={parts[i]} />);
-    if (i + 2 < parts.length) {
-      out.push(
-        <pre key={`c${i}`} className="ai__code">
-          <code>{parts[i + 2].replace(/\n$/, "")}</code>
-        </pre>,
-      );
-    }
-  }
-  return <>{out}</>;
-}
-
-function Inline({ text }: { text: string }) {
-  const bits = text.split(/(`[^`\n]+`|\*\*[^*\n]+\*\*)/g);
-  return (
-    <>
-      {bits.map((b, i) =>
-        b.startsWith("`") && b.endsWith("`") && b.length > 1 ? (
-          <code key={i} className="ai__inline">
-            {b.slice(1, -1)}
-          </code>
-        ) : b.startsWith("**") && b.endsWith("**") && b.length > 4 ? (
-          <strong key={i}>{b.slice(2, -2)}</strong>
-        ) : (
-          <Fragment key={i}>{b}</Fragment>
-        ),
-      )}
-    </>
-  );
-}
+import {
+  IconAlert,
+  IconCheck,
+  IconChevronRight,
+  IconClock,
+  IconSend,
+  IconSparkle,
+  IconTrash,
+  IconX,
+} from "@/components/icons";
+import { Markdown } from "@/features/ai/Markdown";
 
 interface ToolCallView {
   id: string;
@@ -354,20 +323,19 @@ export function AiPanel({
           return (
             <div key={i} className={`ai__turn ai__turn--${t.role}`}>
               {t.role === "assistant" && <div className="ai__who">助手</div>}
-              {t.parts.map((p, j) =>
-                p.kind === "text" ? (
-                  <div key={j} className="ai__text">
-                    {t.role === "assistant" ? <RichText text={p.text} /> : p.text}
-                    {/* A caret on the block being written right now. */}
-                    {live && j === t.parts.length - 1 && <span className="ai__caret" />}
+              {segments(t.parts).map((seg, j, all) =>
+                seg.kind === "text" ? (
+                  <div
+                    key={j}
+                    className={`ai__text ${live && j === all.length - 1 ? "ai__text--live" : ""}`}
+                  >
+                    {t.role === "assistant" ? <Markdown text={seg.text} /> : seg.text}
                   </div>
                 ) : (
-                  <ToolCard
-                    key={p.call.id}
-                    call={p.call}
-                    onApprove={async (approved) => {
-                      await aiApi.approve(p.call.id, approved);
-                    }}
+                  <ToolGroup
+                    key={j}
+                    calls={seg.calls}
+                    onApprove={(id, approved) => void aiApi.approve(id, approved)}
                   />
                 ),
               )}
@@ -417,47 +385,113 @@ export function AiPanel({
   );
 }
 
-function ToolCard({
-  call,
+/** Consecutive tool calls are shown together, as one block of steps. */
+type Segment = { kind: "text"; text: string } | { kind: "tools"; calls: ToolCallView[] };
+
+function segments(parts: Part[]): Segment[] {
+  const out: Segment[] = [];
+  for (const p of parts) {
+    const last = out[out.length - 1];
+    if (p.kind === "text") out.push({ kind: "text", text: p.text });
+    else if (last?.kind === "tools") last.calls.push(p.call);
+    else out.push({ kind: "tools", calls: [p.call] });
+  }
+  return out;
+}
+
+const TOOL_LABEL: Record<string, string> = {
+  read_terminal: "读取终端",
+  run_command: "运行命令",
+  list_directory: "列出目录",
+  read_file: "读取文件",
+  write_file: "写入文件",
+  grep: "搜索内容",
+};
+
+/**
+ * A run of tool calls. Several finished calls fold into one line ("执行了 7
+ * 步") so the answer stays readable; a call waiting for approval always shows.
+ */
+function ToolGroup({
+  calls,
   onApprove,
 }: {
-  call: ToolCallView;
-  onApprove: (approved: boolean) => Promise<void>;
+  calls: ToolCallView[];
+  onApprove: (id: string, approved: boolean) => void;
 }) {
+  const pending = calls.some((c) => !c.result);
+  const failed = calls.filter((c) => c.result && !c.result.ok).length;
+  const [open, setOpen] = useState(false);
+  const expanded = open || pending || calls.length === 1;
+
+  return (
+    <div className={`steps ${failed ? "steps--warn" : ""}`}>
+      {calls.length > 1 && (
+        <button className="steps__head" onClick={() => setOpen(!open)} disabled={pending}>
+          <IconChevronRight size={12} className={`steps__chev ${expanded ? "steps__chev--open" : ""}`} />
+          <span>
+            {pending ? "正在执行" : "执行了"} {calls.length} 步
+            {failed > 0 && <span className="steps__failed"> · {failed} 步失败</span>}
+          </span>
+          <span className="steps__names">
+            {[...new Set(calls.map((c) => TOOL_LABEL[c.name] ?? c.name))].join("、")}
+          </span>
+        </button>
+      )}
+      {expanded && (
+        <div className="steps__list">
+          {calls.map((c) => (
+            <ToolRow key={c.id} call={c} onApprove={(ok) => onApprove(c.id, ok)} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ToolRow({ call, onApprove }: { call: ToolCallView; onApprove: (approved: boolean) => void }) {
   const [open, setOpen] = useState(false);
   const waiting = !call.result;
   const needsHuman = waiting && !call.auto;
+  const state = call.result ? (call.result.ok ? "ok" : "err") : needsHuman ? "ask" : "run";
 
   return (
-    <div className={`toolcard ${call.result && !call.result.ok ? "toolcard--err" : ""}`}>
-      <div className="toolcard__head" onClick={() => setOpen(!open)}>
-        <IconChevronRight size={12} className={`toolcard__chev ${open ? "toolcard__chev--open" : ""}`} />
-        <span className="toolcard__name">{call.name}</span>
-        <span className="toolcard__summary">{summarize(call.args)}</span>
-        {call.result ? (
-          <span className={`toolcard__state ${call.result.ok ? "" : "toolcard__state--err"}`}>
-            {call.result.ok ? <IconCheck size={12} /> : "失败"}
-          </span>
-        ) : waiting ? (
-          <span className="toolcard__state">{needsHuman ? "等待确认" : "运行中"}</span>
-        ) : null}
-      </div>
+    <div className={`step step--${state}`}>
+      <button className="step__head" onClick={() => setOpen(!open)} disabled={!call.result}>
+        <span className="step__icon">
+          {state === "ok" ? (
+            <IconCheck size={12} />
+          ) : state === "err" ? (
+            <IconAlert size={12} />
+          ) : state === "ask" ? (
+            <IconClock size={12} />
+          ) : (
+            <span className="spinner spinner--xs" />
+          )}
+        </span>
+        <span className="step__label">{TOOL_LABEL[call.name] ?? call.name}</span>
+        <code className="step__summary">{summarize(call.args)}</code>
+        {call.result && (
+          <IconChevronRight size={12} className={`step__chev ${open ? "step__chev--open" : ""}`} />
+        )}
+      </button>
 
       {needsHuman && (
-        <>
-          <pre className="toolcard__args">{JSON.stringify(call.args, null, 2)}</pre>
-          <div className="toolcard__actions">
-            <button className="btn btn--ghost" onClick={() => void onApprove(false)}>
+        <div className="step__ask">
+          <pre className="step__args">{JSON.stringify(call.args, null, 2)}</pre>
+          <div className="step__actions">
+            <span className="step__ask-text">需要你确认</span>
+            <button className="btn btn--sm btn--ghost" onClick={() => onApprove(false)}>
               拒绝
             </button>
-            <button className="btn btn--primary" onClick={() => void onApprove(true)}>
+            <button className="btn btn--sm btn--primary" onClick={() => onApprove(true)}>
               允许
             </button>
           </div>
-        </>
+        </div>
       )}
 
-      {open && call.result && <pre className="toolcard__out">{call.result.content}</pre>}
+      {open && call.result && <pre className="step__out">{call.result.content || "（没有输出）"}</pre>}
     </div>
   );
 }
@@ -466,6 +500,6 @@ function ToolCard({
 function summarize(args: unknown): string {
   if (!args || typeof args !== "object") return "";
   const a = args as Record<string, unknown>;
-  const v = a.command ?? a.path ?? a.pattern ?? a.lines;
+  const v = a.command ?? a.path ?? a.pattern ?? (a.lines != null ? `最近 ${a.lines} 行` : null);
   return v == null ? "" : String(v);
 }

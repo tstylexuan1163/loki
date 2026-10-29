@@ -69,18 +69,54 @@
       return { status: handlers.vault_status(), recoveryCode: "NHG8 980J ADBD GH83 F8M4 M2BG R8CE MWRF" };
     },
     recovery_code_export: () => null,
-    // A turn streamed token by token, with a tool call in the middle, the way
-    // the engine emits it.
+    // A turn streamed token by token, with tool calls in between, the way the
+    // engine emits it. The reply mirrors a real ops answer: headings, a
+    // numbered list, inline code, a table and a code block.
     ai_send: () => {
-      const say = (text) => text.match(/.{1,3}/gsu) ?? [];
-      const script = [
-        ...say("先看一下磁盘占用。").map((t) => ({ type: "text", text: t })),
-        { type: "toolCall", id: "c1", name: "run_command", arguments: { command: "df -h /" }, auto: true },
-        { type: "toolResult", id: "c1", ok: true, content: "Filesystem  Size  Used Avail Use% Mounted on\n/dev/sda1    78G   33G   45G  43% /" },
-        ...say("根分区用了 **43%**，还剩 45G，暂时不用清理。可以用 `du -sh /var/*` 看看哪个目录最大。").map((t) => ({ type: "text", text: t })),
-        { type: "done", steps: 2 },
+      const say = (text) => (text.match(/[\s\S]{1,4}/gu) ?? []).map((t) => ({ type: "text", text: t }));
+      const tool = (id, command, content) => [
+        { type: "toolCall", id, name: "run_command", arguments: { command }, auto: true },
+        { type: "toolResult", id, ok: true, content },
       ];
-      script.forEach((ev, i) => setTimeout(() => emit("ai-event", ev), 300 + i * 70));
+      const script = [
+        ...say("我先收集一下这台机器的基本信息。"),
+        ...tool("c1", 'uname -a; echo "=== hostname ==="; hostname', "Linux magpie 5.15.167 #0 SMP aarch64 GNU/Linux\n=== hostname ===\nmagpie"),
+        ...tool("c2", 'free -h; echo "=== cpu ==="; grep -c ^processor /proc/cpuinfo', "Mem: 1.9G total, 612M used\n=== cpu ===\n4"),
+        ...tool("c3", "ls /etc/init.d/ 2>/dev/null", "dockerd\nlinkease\nttyd\nopenclash"),
+        ...tool("c4", "netstat -tulnp 2>/dev/null | head -50", "tcp 0.0.0.0:7681 LISTEN ttyd\ntcp :::9090 LISTEN clash"),
+        ...tool("c5", "ps w 2>/dev/null | head -60", "1 root /sbin/procd"),
+        ...tool("c6", "ubus call service list 2>/dev/null | head", "{}"),
+        ...tool("c7", 'ip -4 addr show | grep -E "^[0-9]+:|inet "', "inet 192.168.1.1/24"),
+        ...say(`## 概况
+
+这是一台 **OpenWrt** 路由器（aarch64，4 核，1.9G 内存），主要跑着 OpenClash、Docker 和 linkease。
+
+### 几个值得注意的点
+
+1. **安全**：\`ttyd\` 监听 \`0.0.0.0:7681\`，是免登录的 Web shell 入口；OpenClash 的 **9090 控制面板**也监听所有地址。建议给 ttyd 加密码，把 9090 限制到 \`127.0.0.1\`。
+2. **敏感信息**：\`/etc/config/macc\` 里有明文的 \`refresh_token\`（JWT），虽然权限是 600，但会随备份扩散。
+3. **可回收**：Docker 装而不用（约 300M+），\`/root/tsup\` 还留着 140M 安装包。
+4. 进程里有几个 \`nc 198.18.11.x 443\` 的探测，是 OpenClash 的节点连通性检测，正常现象。
+
+| 端口 | 服务 | 监听 | 建议 |
+|---|---|---|---|
+| 7681 | ttyd | 0.0.0.0 | 加密码或只监听内网 |
+| 9090 | Clash 面板 | ::: | 改为 127.0.0.1 |
+
+限制 9090 的做法：
+
+\`\`\`sh
+uci set openclash.config.cn_port='9090'
+uci set openclash.config.dashboard_forward_domain='127.0.0.1'
+uci commit openclash && /etc/init.d/openclash restart
+\`\`\`
+
+> 改之前建议先备份 \`/etc/config/openclash\`。
+
+需要我帮你收紧 ttyd / Clash 9090 的监听范围，或者清掉 Docker 和 tsup 省空间吗？`),
+        { type: "done", steps: 8 },
+      ];
+      script.forEach((ev, i) => setTimeout(() => emit("ai-event", ev), 200 + i * 18));
       return null;
     },
     vault_lock: () => ((state.unlocked = false), handlers.vault_status()),
