@@ -136,6 +136,11 @@ function ProviderDialog({
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
+  // The backend only reuses a saved key while the address stays on the same
+  // server; say so before the user wonders why the test now fails with 401.
+  const keyDropped =
+    !!initial?.hasKey && !apiKey.trim() && !sameServer(initial.baseUrl, baseUrl);
+
   /** The draft, as the backend commands expect it. */
   function draft(): ProviderInput {
     return {
@@ -144,7 +149,7 @@ function ProviderDialog({
       protocol,
       baseUrl: baseUrl.trim(),
       models,
-      // Blank means "keep the stored key", which is what the backend does.
+      // Blank means "keep the stored key" — for the same server only.
       apiKey: apiKey.trim() || undefined,
     };
   }
@@ -271,7 +276,11 @@ function ProviderDialog({
                 className="input"
                 type={showKey ? "text" : "password"}
                 placeholder={
-                  initial?.hasKey ? "已保存，留空则不修改" : "不需要密钥的本地服务器可以留空"
+                  keyDropped
+                    ? "地址换了服务器，请重新填写密钥"
+                    : initial?.hasKey
+                      ? "已保存，留空则不修改"
+                      : "不需要密钥的本地服务器可以留空"
                 }
                 value={apiKey}
                 onChange={(e) => setApiKey(e.target.value)}
@@ -286,7 +295,13 @@ function ProviderDialog({
                 {showKey ? <IconEyeOff size={15} /> : <IconEye size={15} />}
               </button>
             </div>
-            <div className="pfield__hint">密钥和主机密码一样，加密后才写入本机数据库。</div>
+            {keyDropped ? (
+              <div className="pfield__hint pfield__hint--warn">
+                基础 URL 指向了另一台服务器。为防止原密钥被发到新地址，已保存的密钥不会再用于这个地址；留空保存将清除它。
+              </div>
+            ) : (
+              <div className="pfield__hint">密钥和主机密码一样，加密后才写入本机数据库。</div>
+            )}
           </div>
         </div>
 
@@ -379,4 +394,19 @@ function ProviderDialog({
       </div>
     </Modal>
   );
+}
+
+/**
+ * Same scheme, host and port — the rule the backend uses before it lets a
+ * saved key go to an edited address. A draft that does not parse yet counts as
+ * a different server.
+ */
+function sameServer(a: string, b: string): boolean {
+  try {
+    const x = new URL(a.trim());
+    const y = new URL(b.trim());
+    return x.protocol === y.protocol && x.host.toLowerCase() === y.host.toLowerCase();
+  } catch {
+    return false;
+  }
 }

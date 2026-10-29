@@ -1414,11 +1414,7 @@ fn provider_from_payload(p: &serde_json::Value) -> ProviderView {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
-        base_url: p
-            .get("base_url")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
+        base_url: crate::ai::provider::stored_base_url(p),
         models: {
             // `model` is the 0.7 shape: a single string. Fold it into the list
             // so an upgraded install keeps its provider usable.
@@ -1473,38 +1469,21 @@ pub fn ai_provider_save(
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    // A blank key on an edit keeps the stored one, so the UI never has to hold
-    // the secret just to rename a provider.
-    let existing_key = if input.id.is_some() {
-        vault
-            .store()
-            .get_item(&id)
-            .map_err(|e| e.to_string())?
-            .map(|row| vault.decrypt_item(&row))
-            .transpose()
-            .map_err(|e| e.to_string())?
-            .and_then(|item| {
-                item.payload
-                    .get("api_key")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-            })
-    } else {
-        None
-    };
-
-    let api_key = input
-        .api_key
-        .as_ref()
-        .filter(|k| !k.is_empty())
-        .cloned()
-        .or(existing_key)
-        .unwrap_or_default();
-
     // Reject a malformed address here rather than at request time, where the
     // error would surface as a confusing network failure.
     let base_url =
         crate::ai::provider::validate_base_url(&input.base_url).map_err(|e| e.to_string())?;
+
+    // A blank key on an edit keeps the stored one, so the UI never has to hold
+    // the secret just to rename a provider — but only while the address still
+    // points at the same server.
+    let api_key = match input.api_key.as_ref().filter(|k| !k.is_empty()) {
+        Some(k) => k.clone(),
+        None => match &input.id {
+            Some(id) => reusable_key(&vault, id, &base_url)?,
+            None => String::new(),
+        },
+    };
 
     // Trim, drop blanks, de-duplicate while keeping the user's order.
     let mut models: Vec<String> = Vec::new();
@@ -1535,6 +1514,32 @@ pub fn ai_provider_save(
 pub fn ai_provider_delete(state: State<'_, AppState>, id: String) -> Result<(), String> {
     let vault = state.vault.lock().map_err(|e| e.to_string())?;
     vault.store().delete_item(&id).map_err(|e| e.to_string())
+}
+
+/// The stored API key of provider `id`, if `new_base_url` is on the same
+/// server (scheme, host, port) as the stored address; otherwise empty.
+///
+/// Without this check, editing a provider's address to another host and
+/// clicking "test connection" would send the old provider's key to the new one.
+fn reusable_key(
+    vault: &crate::vault::Vault,
+    id: &str,
+    new_base_url: &str,
+) -> Result<String, String> {
+    let Some(row) = vault.store().get_item(id).map_err(|e| e.to_string())? else {
+        return Ok(String::new());
+    };
+    let item = vault.decrypt_item(&row).map_err(|e| e.to_string())?;
+    let stored_url = crate::ai::provider::stored_base_url(&item.payload);
+    if !crate::ai::provider::same_origin(&stored_url, new_base_url) {
+        return Ok(String::new());
+    }
+    Ok(item
+        .payload
+        .get("api_key")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string())
 }
 
 /// Reads one provider, key included, for the turn engine. Not exposed to the UI.
@@ -1582,7 +1587,7 @@ fn load_provider(
         id: f("id"),
         name: f("name"),
         protocol,
-        base_url: f("base_url"),
+        base_url: crate::ai::provider::stored_base_url(&item.payload),
         model: models.first().cloned().unwrap_or_default(),
         models,
         api_key: f("api_key"),
@@ -1592,37 +1597,25 @@ fn load_provider(
 /// Builds a runtime config from a dialog's draft.
 ///
 /// The dialog can ask for the model list or test the connection *before* saving,
-/// so a blank key means "use the one already stored for this id".
+/// so a blank key means "use the one already stored for this id" — as long as
+/// the draft still points at the server that key was saved for.
 fn config_from_input(
     state: &AppState,
     input: &ProviderInput,
 ) -> Result<crate::ai::provider::ProviderConfig, String> {
+    let base_url =
+        crate::ai::provider::validate_base_url(&input.base_url).map_err(|e| e.to_string())?;
+
     let api_key = match input.api_key.as_ref().filter(|k| !k.is_empty()) {
         Some(k) => k.clone(),
         None => match &input.id {
             Some(id) => {
                 let vault = state.vault.lock().map_err(|e| e.to_string())?;
-                vault
-                    .store()
-                    .get_item(id)
-                    .map_err(|e| e.to_string())?
-                    .map(|row| vault.decrypt_item(&row))
-                    .transpose()
-                    .map_err(|e| e.to_string())?
-                    .and_then(|item| {
-                        item.payload
-                            .get("api_key")
-                            .and_then(|v| v.as_str())
-                            .map(String::from)
-                    })
-                    .unwrap_or_default()
+                reusable_key(&vault, id, &base_url)?
             }
             None => String::new(),
         },
     };
-
-    let base_url =
-        crate::ai::provider::validate_base_url(&input.base_url).map_err(|e| e.to_string())?;
 
     Ok(crate::ai::provider::ProviderConfig {
         id: input.id.clone().unwrap_or_default(),
@@ -2453,4 +2446,66 @@ pub fn app_info() -> serde_json::Value {
         "name": "loki",
         "version": env!("CARGO_PKG_VERSION"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::KdfParams;
+    use crate::store::Store;
+    use crate::vault::Vault;
+
+    fn vault_with(id: &str, payload: serde_json::Value) -> Vault {
+        let mut vault = Vault::new(Store::open_in_memory().unwrap()).unwrap();
+        // `create` enforces the production KDF floor, so weaker test params
+        // are refused; the default costs about a second.
+        vault.create("test-password", KdfParams::default()).unwrap();
+        let row = vault.encrypt_item(id, "provider", &payload).unwrap();
+        vault.store().put_item(&row).unwrap();
+        vault
+    }
+
+    #[test]
+    fn stored_key_is_only_reused_for_the_same_server() {
+        let vault = vault_with(
+            "p1",
+            serde_json::json!({
+                "base_url": "https://api.openai.com/v1",
+                "models": ["gpt-4o"],
+                "api_key": "sk-secret",
+            }),
+        );
+        // Same server, different path: the user just fixed the version.
+        assert_eq!(
+            reusable_key(&vault, "p1", "https://api.openai.com/v2").unwrap(),
+            "sk-secret"
+        );
+        // Another host must never receive the stored key.
+        assert_eq!(
+            reusable_key(&vault, "p1", "https://proxy.example.com/v1").unwrap(),
+            ""
+        );
+        // Unknown id: nothing to reuse.
+        assert_eq!(
+            reusable_key(&vault, "nope", "https://api.openai.com/v1").unwrap(),
+            ""
+        );
+    }
+
+    #[test]
+    fn legacy_rows_compare_against_their_upgraded_url() {
+        // A 0.7 row stored the URL without /v1 and a single `model`.
+        let vault = vault_with(
+            "old",
+            serde_json::json!({
+                "base_url": "https://api.anthropic.com",
+                "model": "claude",
+                "api_key": "ak",
+            }),
+        );
+        assert_eq!(
+            reusable_key(&vault, "old", "https://api.anthropic.com/v1").unwrap(),
+            "ak"
+        );
+    }
 }

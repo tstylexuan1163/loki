@@ -3390,6 +3390,10 @@ textarea.field__input {
   line-height: 1.55;
 }
 
+.pfield__hint--warn {
+  color: var(--warn);
+}
+
 .input {
   width: 100%;
   height: 34px;

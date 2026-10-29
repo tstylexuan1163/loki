@@ -42,9 +42,13 @@ v0.7 存的是 `"model": "gpt-4o"`（单数、字符串）和**不带版本**的
 |---|---|
 | `"model": "x"`（无 `models`） | 折成 `models: ["x"]` |
 | `protocol: "open_ai"` | `Protocol::parse` 映射为 `ChatCompletions` |
-| `base_url: "https://api.openai.com"` | `normalize_base_url` 补 `/v1` |
+| `base_url: "https://api.openai.com"`（且无 `models`） | `stored_base_url` → `normalize_base_url` 补 `/v1` |
 
-对应函数：`provider_from_payload` / `load_provider`（commands.rs）、`Protocol::parse` / `normalize_base_url`（ai/provider.rs）。
+只有**没有 `models` 字段的 0.7 旧记录**才补 `/v1`；新记录一律按用户填写的原样使用。
+早期实现对所有地址都补，会把 `https://generativelanguage.googleapis.com/v1beta/openai`
+这类最后一段不是版本号的兼容地址改坏成 `…/openai/v1`。
+
+对应函数：`provider_from_payload` / `load_provider`（commands.rs）、`Protocol::parse` / `stored_base_url` / `normalize_base_url`（ai/provider.rs）。
 **改动时不要删掉这些兼容分支**，否则老用户的服务商会失效。
 
 ---
@@ -72,7 +76,7 @@ interface ProviderInput {  // 前端 → 后端
   protocol: string;
   baseUrl: string;
   models: string[];
-  apiKey?: string;         // 留空 = 沿用已存的密钥
+  apiKey?: string;         // 留空 = 沿用已存的密钥（仅限同一服务器，见下）
 }
 ```
 
@@ -97,7 +101,14 @@ interface ProviderInput {  // 前端 → 后端
 | `responses` | `POST {base}/responses` | OpenAI Responses API |
 | `anthropic` | `POST {base}/messages` | Anthropic Messages |
 
-`{base}` 由 `normalize_base_url` 保证带版本段（`/v1`、`/v1beta`、`/api/v1` 都认）。
+`{base}` 就是保存的基础 URL，原样拼接端点；只有 0.7 旧记录会先补 `/v1`（见上）。
+
+### 已保存密钥的沿用规则
+
+编辑服务商时密钥留空，后端会沿用已保存的密钥——**但仅当新地址与保存的地址是同一台服务器**
+（协议、主机、端口都相同，`same_origin`）。保存、「测试连接」、「获取模型列表」三处都走
+`reusable_key`。换到另一台服务器时不沿用：否则把 OpenAI 服务商的地址改成某个代理再点测试，
+OpenAI 的密钥就会被发给那个代理。对话框里会提示“地址换了服务器，请重新填写密钥”，留空保存会清除旧密钥。
 
 ---
 
@@ -130,8 +141,10 @@ interface ProviderInput {  // 前端 → 后端
 | 函数 | 作用 |
 |---|---|
 | `Protocol::parse(&str)` | 兼容 `open_ai` 旧值；未知值回退 `chat_completions` |
-| `normalize_base_url` | 补版本段；`/v1`、`/v1beta`、`/api/v1` 视为已带版本 |
-| `endpoint(base, path)` | 拼端点，避免 `//` |
+| `stored_base_url(payload)` | 读记录的基础 URL；仅 0.7 旧记录经 `normalize_base_url` 补 `/v1` |
+| `normalize_base_url` | 给旧地址补版本段；`/v1`、`/v1beta`、`/api/v1` 视为已带版本 |
+| `same_origin(a, b)` | 协议 + 主机 + 端口相同才算同一服务器，决定能否沿用已存密钥 |
+| `endpoint(base, path)` | 原样拼端点，避免 `//`，不再自动补版本 |
 | `with_auth(req, protocol, key)` | **key 为空时不发认证头**；Anthropic 用 `x-api-key` + `anthropic-version` |
 | `list_models(config)` | `GET {base}/models`，兼容 `{data:[…]}` 和裸数组，去重排序 |
 | `test_connection(config)` | 有 model → 发一条 "ping"；无 model → 只调 `list_models` |

@@ -177,11 +177,13 @@ fn trim_base(base: &str) -> &str {
     base.trim_end_matches('/')
 }
 
-/// Makes sure the stored base URL carries an API version segment.
+/// Gives a 0.7-era base URL the version segment it relied on.
 ///
 /// Providers saved by 0.7 stored `https://api.openai.com` and the request
 /// builder appended `/v1`; 0.8 stores what the user typed (Hatoba's convention).
-/// This keeps old rows working without a rewrite pass.
+/// Only legacy rows go through this (see [`stored_base_url`]): applied to every
+/// URL it would corrupt endpoints whose last segment is not a version, such as
+/// Gemini's `…/v1beta/openai`.
 pub fn normalize_base_url(base: &str) -> String {
     let trimmed = trim_base(base).to_string();
     let last = trimmed.rsplit('/').next().unwrap_or("");
@@ -196,13 +198,42 @@ pub fn normalize_base_url(base: &str) -> String {
     }
 }
 
-/// Joins the base URL and an endpoint path.
+/// The base URL a stored provider row should use.
+///
+/// A row without a `models` list was written by 0.7, whose URLs lacked the
+/// version segment; every newer row holds exactly what the user typed.
+pub fn stored_base_url(payload: &Value) -> String {
+    let raw = payload
+        .get("base_url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if payload.get("models").is_none() && !raw.is_empty() {
+        normalize_base_url(raw)
+    } else {
+        trim_base(raw).to_string()
+    }
+}
+
+/// Whether two base URLs point at the same server: scheme, host and port.
+///
+/// A stored API key is only ever sent back to the server it was saved for.
+/// Editing a provider's address to another host must not quietly hand the old
+/// key to the new one.
+pub fn same_origin(a: &str, b: &str) -> bool {
+    match (reqwest::Url::parse(a.trim()), reqwest::Url::parse(b.trim())) {
+        (Ok(a), Ok(b)) => {
+            a.scheme() == b.scheme()
+                && a.host_str().map(str::to_ascii_lowercase)
+                    == b.host_str().map(str::to_ascii_lowercase)
+                && a.port_or_known_default() == b.port_or_known_default()
+        }
+        _ => false,
+    }
+}
+
+/// Joins the base URL and an endpoint path, exactly as given.
 fn endpoint(base: &str, path: &str) -> String {
-    format!(
-        "{}/{}",
-        normalize_base_url(base),
-        path.trim_start_matches('/')
-    )
+    format!("{}/{}", trim_base(base), path.trim_start_matches('/'))
 }
 
 /// Attaches the API key only when there is one.
@@ -838,10 +869,56 @@ mod tests {
             endpoint("https://api.openai.com/v1/", "chat/completions"),
             "https://api.openai.com/v1/chat/completions"
         );
+        // The URL is used as typed: no version segment is invented.
         assert_eq!(
-            endpoint("https://api.openai.com", "/responses"),
-            "https://api.openai.com/v1/responses"
+            endpoint(
+                "https://generativelanguage.googleapis.com/v1beta/openai",
+                "chat/completions"
+            ),
+            "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
         );
+    }
+
+    #[test]
+    fn only_legacy_rows_gain_a_version_segment() {
+        // 0.7 row: no `models` list, URL without a version.
+        let legacy = json!({ "base_url": "https://api.openai.com", "model": "gpt-4o" });
+        assert_eq!(stored_base_url(&legacy), "https://api.openai.com/v1");
+        // Current row: kept exactly as typed, even when it does not end in /vN.
+        let current = json!({
+            "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+            "models": ["gemini-2.5-flash"],
+        });
+        assert_eq!(
+            stored_base_url(&current),
+            "https://generativelanguage.googleapis.com/v1beta/openai"
+        );
+    }
+
+    #[test]
+    fn same_origin_compares_scheme_host_and_port() {
+        assert!(same_origin(
+            "https://api.openai.com/v1",
+            "https://API.openai.com/v2/"
+        ));
+        // An explicit default port is the same origin.
+        assert!(same_origin(
+            "https://api.openai.com/v1",
+            "https://api.openai.com:443/v1"
+        ));
+        assert!(!same_origin(
+            "https://api.openai.com/v1",
+            "https://evil.example/v1"
+        ));
+        assert!(!same_origin(
+            "https://api.openai.com/v1",
+            "http://api.openai.com/v1"
+        ));
+        assert!(!same_origin(
+            "http://localhost:11434/v1",
+            "http://localhost:1234/v1"
+        ));
+        assert!(!same_origin("not a url", "https://api.openai.com"));
     }
 
     #[test]
