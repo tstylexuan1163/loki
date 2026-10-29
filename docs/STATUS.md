@@ -1,6 +1,6 @@
 # loki — 构建进度
 
-> **当前版本 v0.9.1**（修复见 [release-notes/v0.9.1.md](release-notes/v0.9.1.md)）。打包产物：`src-tauri/target/release/bundle/dmg/loki_0.9.1_aarch64.dmg`
+> **当前版本 v0.10.0**（见 [release-notes/v0.10.0.md](release-notes/v0.10.0.md)）。打包产物：`src-tauri/target/release/bundle/dmg/loki_0.10.0_aarch64.dmg`
 > 与 `.../macos/loki.app`（ad-hoc 签名，arm64）。v0.8.0 的新增内容见第 13 节；
 > AI 服务商改造的详细说明单独写在 [AI_PROVIDER_SETTINGS.md](AI_PROVIDER_SETTINGS.md)。
 
@@ -424,6 +424,6 @@ macOS 未改配置，行为不变。**Windows 实机效果未验证**（开发�
 | 回答与工具调用的顺序 | 前端一轮回复改为按发生顺序的「文本块 / 工具卡片」列表；历史回放按同样的步骤重建消息 | 模拟界面：块顺序为 文本 → 工具 → 文本，流式过程中光标跟随 |
 | 恢复码导出 | 恢复码页增加「复制」「保存为文件」；保存由 Rust 写入，先校验是合法恢复码再写，Unix 上权限 600 | 单元测试：任意文本被拒且不落盘；写入后权限为 600 |
 | 终端配色 | 10 套方案，设置 → 终端 → 配色；xterm 调色板与终端周边（激活标签、代码块、编辑器）通过 `--bg-term` / `--term-fg` 一起切换，实时生效 | 模拟界面：切换后 ANSI 绿、标签背景/文字随方案变化 |
-| 白色图标 | `branding/make-white-icon.py` 从原深色图生成白底双色版，`tauri icon` 重新生成全套图标；原图保留为 `branding/icon-dark-1024.png` | 目测 |
+| 白色图标 | 新设计稿 `branding/logo-white-src.webp`；`branding/make-icon.py` 沿卡片圆角边框裁掉白底和投影（外部透明），居中放到 1024 画布、四周留 4% 透明边；`tauri icon` 重新生成全套图标；旧深色图保留为 `branding/icon-dark-1024.png` | 深色背景上目测四角无白边 |
 
 未验证：真实模型端点的流式效果（单元测试覆盖了三种协议的事件格式，模拟界面覆盖了渲染）。
