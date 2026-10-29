@@ -15,6 +15,22 @@ import {
 export type TermStatus = "connecting" | "connected" | "failed" | "closed";
 export type TabKind = "ssh" | "telnet" | "serial" | "local";
 
+/**
+ * Connection parameters for a tab that has no saved host: a quick-connect
+ * telnet or serial target. Kept on the tab so reconnect works without asking
+ * again, exactly like `QuickTarget` does for SSH.
+ */
+export type DirectTarget =
+  | { kind: "telnet"; host: string; port: number }
+  | {
+      kind: "serial";
+      path: string;
+      baud: number;
+      dataBits: number;
+      parity: string;
+      stopBits: number;
+    };
+
 /** Something the user must answer before the connection can continue. */
 export type TabPrompt =
   | {
@@ -35,6 +51,8 @@ export interface TermTab {
   kind: TabKind;
   hostId: string | null;
   target: QuickTarget | null;
+  /** Set for unsaved telnet/serial tabs; `target` is the SSH equivalent. */
+  direct: DirectTarget | null;
   status: TermStatus;
   /** Backend session id once connected. */
   sessionId: string | null;
@@ -49,6 +67,8 @@ interface TermState {
 
   openHost(host: HostView): string;
   openTarget(target: QuickTarget): string;
+  openTelnet(target: { host: string; port: number }): string;
+  openSerial(opts: Omit<Extract<DirectTarget, { kind: "serial" }>, "kind">): string;
   openLocal(): string;
   acceptHostKey(tabId: string): void;
   submitPassword(tabId: string, password: string, remember: boolean): void;
@@ -71,6 +91,12 @@ let lastSize = { cols: 120, rows: 32 };
 export const noteSize = (cols: number, rows: number) => {
   lastSize = { cols, rows };
 };
+
+/** `/dev/tty.usbserial-1420` is too long for a tab; keep the last segment. */
+export function serialLabel(path: string): string {
+  const parts = path.split("/").filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : path;
+}
 
 let subscribed = false;
 const newId = () => `tab-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
@@ -176,6 +202,28 @@ export const useTerminals = create<TermState>((set, get) => {
           connectedAt: Date.now(),
           title: tab.title || info.target,
         });
+      } else if (tab.direct) {
+        // Unsaved quick-connect target: the parameters live on the tab.
+        const info =
+          tab.direct.kind === "telnet"
+            ? await directApi.telnetOpen({
+                host: tab.direct.host,
+                port: tab.direct.port,
+                cols: lastSize.cols,
+                rows: lastSize.rows,
+              })
+            : await directApi.serialOpen({
+                path: tab.direct.path,
+                baud: tab.direct.baud,
+                dataBits: tab.direct.dataBits,
+                parity: tab.direct.parity,
+                stopBits: tab.direct.stopBits,
+              });
+        patch(tabId, {
+          status: "connected",
+          sessionId: info.id,
+          connectedAt: Date.now(),
+        });
       } else {
         // Saved telnet/serial hosts go through session_open, which dispatches
         // on the stored protocol.
@@ -224,7 +272,7 @@ export const useTerminals = create<TermState>((set, get) => {
       const title =
         host.name ||
         (host.protocol === "serial" ? host.address : `${host.username}@${host.address}`);
-      const id = add({ title, kind: host.protocol, hostId: host.id, target: null });
+      const id = add({ title, kind: host.protocol, hostId: host.id, target: null, direct: null });
       if (host.protocol === "ssh") void attempt(id);
       else void openDirect(id);
       return id;
@@ -236,13 +284,38 @@ export const useTerminals = create<TermState>((set, get) => {
         kind: "ssh",
         hostId: null,
         target,
+        direct: null,
       });
       void attempt(id);
       return id;
     },
 
+    openTelnet({ host, port }) {
+      const id = add({
+        title: `${host}:${port}`,
+        kind: "telnet",
+        hostId: null,
+        target: null,
+        direct: { kind: "telnet", host, port },
+      });
+      void openDirect(id);
+      return id;
+    },
+
+    openSerial(opts) {
+      const id = add({
+        title: `${serialLabel(opts.path)} · ${opts.baud}`,
+        kind: "serial",
+        hostId: null,
+        target: null,
+        direct: { kind: "serial", ...opts },
+      });
+      void openDirect(id);
+      return id;
+    },
+
     openLocal() {
-      const id = add({ title: "本地终端", kind: "local", hostId: null, target: null });
+      const id = add({ title: "本地终端", kind: "local", hostId: null, target: null, direct: null });
       void openDirect(id);
       return id;
     },

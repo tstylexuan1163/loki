@@ -3,9 +3,26 @@ import { api, errorMessage, type HostView, type VaultStatus } from "@/lib/api";
 import { useTerminals } from "@/features/terminal/terminals";
 
 export type Phase = "boot" | "onboarding" | "locked" | "unlocked";
+/**
+ * Connection details handed to the host editor when "save as host" is used from
+ * a quick-connect tab. Only non-secret fields: the editor still asks for
+ * credentials itself.
+ */
+export interface HostPrefill {
+  protocol: "ssh" | "telnet" | "serial";
+  name?: string;
+  address: string;
+  port?: number;
+  username?: string;
+  baud?: number;
+  dataBits?: number;
+  parity?: string;
+  stopBits?: number;
+}
+
 export type Page =
   | { kind: "hosts" }
-  | { kind: "host-edit"; hostId: string | null }
+  | { kind: "host-edit"; hostId: string | null; prefill?: HostPrefill }
   | { kind: "terminal" }
   | { kind: "keys" }
   | { kind: "forwards" };

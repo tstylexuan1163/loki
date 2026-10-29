@@ -151,7 +151,11 @@ export function App() {
           ) : page.kind === "forwards" ? (
             <ForwardsPage />
           ) : editing ? (
-            <HostEditor key={page.hostId ?? "new"} hostId={page.hostId} />
+            <HostEditor
+              key={page.hostId ?? `new-${page.prefill?.address ?? ""}-${page.prefill?.protocol ?? ""}`}
+              hostId={page.hostId}
+              prefill={page.prefill}
+            />
           ) : page.kind === "hosts" ? (
             <HostsPage />
           ) : null}

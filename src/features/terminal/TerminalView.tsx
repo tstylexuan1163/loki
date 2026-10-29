@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { useApp } from "@/app/store";
+import { useApp, type HostPrefill } from "@/app/store";
 import { usePrefs } from "@/app/prefs";
-import { useTerminals, type TermTab } from "@/features/terminal/terminals";
+import { serialLabel, useTerminals, type TermTab } from "@/features/terminal/terminals";
 import { TerminalPane, terminalRegistry } from "@/features/terminal/TerminalPane";
 import { StatusBar } from "@/features/terminal/StatusBar";
 import { QuickConnect } from "@/features/terminal/QuickConnect";
@@ -256,9 +256,24 @@ export function TerminalView({ visible }: { visible: boolean }) {
               onSelect: () => setRenaming(tabMenu.menu!.data.id),
             },
             {
+              label: "保存为主机",
+              icon: <IconServer size={14} />,
+              // Only for connections that are not already saved to the vault.
+              disabled: !prefillFromTab(tabMenu.menu.data),
+              onSelect: () => {
+                const prefill = prefillFromTab(tabMenu.menu!.data);
+                if (!prefill) return;
+                useApp.setState({ page: { kind: "host-edit", hostId: null, prefill } });
+              },
+            },
+            {
               label: "复制标签",
               icon: <IconCopy size={14} />,
-              disabled: !tabMenu.menu.data.hostId && !tabMenu.menu.data.target && tabMenu.menu.data.kind !== "local",
+              disabled:
+                !tabMenu.menu.data.hostId &&
+                !tabMenu.menu.data.target &&
+                !tabMenu.menu.data.direct &&
+                tabMenu.menu.data.kind !== "local",
               onSelect: () => duplicate(tabMenu.menu!.data),
             },
             "sep",
@@ -285,10 +300,57 @@ function duplicate(tab: TermTab) {
   const t = useTerminals.getState();
   if (tab.kind === "local") t.openLocal();
   else if (tab.target) t.openTarget(tab.target);
+  else if (tab.direct?.kind === "telnet")
+    t.openTelnet({ host: tab.direct.host, port: tab.direct.port });
+  else if (tab.direct?.kind === "serial")
+    t.openSerial({
+      path: tab.direct.path,
+      baud: tab.direct.baud,
+      dataBits: tab.direct.dataBits,
+      parity: tab.direct.parity,
+      stopBits: tab.direct.stopBits,
+    });
   else if (tab.hostId) {
     const host = useApp.getState().hosts.find((h) => h.id === tab.hostId);
     if (host) t.openHost(host);
   }
+}
+
+/**
+ * Connection details of an unsaved tab, for the "save as host" action.
+ *
+ * Returns null for tabs that already point at a saved host, and for local
+ * shells, which have nothing to save.
+ */
+function prefillFromTab(tab: TermTab): HostPrefill | null {
+  if (tab.hostId) return null;
+  if (tab.target) {
+    const { username, address, port } = tab.target;
+    return {
+      protocol: "ssh",
+      name: username ? `${username}@${address}` : address,
+      address,
+      port,
+      username,
+    };
+  }
+  if (tab.direct?.kind === "telnet") {
+    const { host, port } = tab.direct;
+    return { protocol: "telnet", name: `${host}:${port}`, address: host, port };
+  }
+  if (tab.direct?.kind === "serial") {
+    const d = tab.direct;
+    return {
+      protocol: "serial",
+      name: serialLabel(d.path),
+      address: d.path,
+      baud: d.baud,
+      dataBits: d.dataBits,
+      parity: d.parity,
+      stopBits: d.stopBits,
+    };
+  }
+  return null;
 }
 
 /** Drag handle between the terminal and the side panel. */

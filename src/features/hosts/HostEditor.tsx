@@ -9,7 +9,7 @@ import {
   type Protocol,
   type SerialPortInfo,
 } from "@/lib/api";
-import { useApp } from "@/app/store";
+import { useApp, type HostPrefill } from "@/app/store";
 import { Switch, confirmDialog, toast } from "@/components/ui";
 import {
   IconArrowUp,
@@ -30,21 +30,47 @@ const PROTOCOLS: { id: Protocol; label: string; hint: string; icon: React.ReactN
   { id: "serial", label: "串口", hint: "交换机、开发板控制台", icon: <IconUsb size={16} /> },
 ];
 
-export function HostEditor({ hostId }: { hostId: string | null }) {
+export function HostEditor({
+  hostId,
+  prefill,
+}: {
+  hostId: string | null;
+  /** Values from "save as host" on a quick-connect tab. */
+  prefill?: HostPrefill;
+}) {
   const hosts = useApp((s) => s.hosts);
   const backToHosts = useApp((s) => s.backToHosts);
   const refreshHosts = useApp((s) => s.refreshHosts);
   const existing = useMemo(() => hosts.find((h) => h.id === hostId) ?? null, [hosts, hostId]);
 
-  const [protocol, setProtocol] = useState<Protocol>(existing?.protocol ?? "ssh");
-  const [name, setName] = useState(existing?.name ?? "");
-  const [address, setAddress] = useState(existing?.address ?? "");
-  const [port, setPort] = useState(String(existing?.port ?? 22));
-  const [username, setUsername] = useState(existing?.username ?? "");
-  const [baud, setBaud] = useState(String(existing?.baud ?? 115200));
-  const [dataBits, setDataBits] = useState(String(existing?.data_bits ?? 8));
-  const [parity, setParity] = useState(existing?.parity ?? "none");
-  const [stopBits, setStopBits] = useState(String(existing?.stop_bits ?? 1));
+  // A saved host wins; otherwise the prefill from a quick-connect tab seeds the
+  // form so the user only has to add credentials and a name.
+  const seed = useMemo(() => {
+    if (existing) {
+      return {
+        protocol: existing.protocol,
+        name: existing.name,
+        address: existing.address,
+        port: existing.port,
+        username: existing.username,
+        baud: existing.baud ?? undefined,
+        dataBits: existing.data_bits ?? undefined,
+        parity: existing.parity ?? undefined,
+        stopBits: existing.stop_bits ?? undefined,
+      };
+    }
+    return prefill;
+  }, [existing, prefill]);
+
+  const [protocol, setProtocol] = useState<Protocol>(seed?.protocol ?? "ssh");
+  const [name, setName] = useState(seed?.name ?? "");
+  const [address, setAddress] = useState(seed?.address ?? "");
+  const [port, setPort] = useState(String(seed?.port ?? (seed?.protocol === "telnet" ? 23 : 22)));
+  const [username, setUsername] = useState(seed?.username ?? "");
+  const [baud, setBaud] = useState(String(seed?.baud ?? 115200));
+  const [dataBits, setDataBits] = useState(String(seed?.dataBits ?? 8));
+  const [parity, setParity] = useState(seed?.parity ?? "none");
+  const [stopBits, setStopBits] = useState(String(seed?.stopBits ?? 1));
   const [ports, setPorts] = useState<SerialPortInfo[]>([]);
   const [tags, setTags] = useState<string[]>(existing?.tags ?? []);
   const [tagDraft, setTagDraft] = useState("");

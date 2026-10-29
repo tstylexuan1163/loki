@@ -148,7 +148,10 @@ uci commit openclash && /etc/init.d/openclash restart
     update_check: () => null,
     forward_list: () => state.forwards,
     sync_status: () => null,
-    serial_ports: () => [{ path: "/dev/tty.usbserial-1420", name: "usbserial", vendor: null, product: null }],
+    serial_ports: () => [
+      { path: "/dev/tty.usbserial-1420", name: "usbserial-1420", vendor: "FTDI", product: "FT232R" },
+      { path: "/dev/tty.usbmodem1101", name: "usbmodem1101", vendor: "Silicon Labs", product: "CP2102" },
+    ],
     ssh_config_scan: () => [
       { alias: "prod", hostname: "10.0.0.5", user: "deploy", port: 2200, identityFile: "~/.ssh/id_ed25519", proxyJump: "bastion", exists: false },
       { alias: "bastion", hostname: "bastion.example.com", user: "ops", port: 22, identityFile: null, proxyJump: null, exists: true },
@@ -167,6 +170,45 @@ uci commit openclash && /etc/init.d/openclash restart
       sessions.set(id, name);
       setTimeout(() => emit("term-event", { type: "data", sessionId: id, data: b64(banner(name)) }), 50);
       return { kind: "connected", session: { id, title: name, status: "connected" } };
+    },
+    telnet_open: ({ input }) => {
+      const id = `t${++state.opened}`;
+      const label = `${input.host}:${input.port}`;
+      sessions.set(id, label);
+      setTimeout(
+        () =>
+          emit("term-event", {
+            type: "data",
+            sessionId: id,
+            data: b64(
+              `\x1b[1;33mTrying ${input.host}...\x1b[0m\r\n` +
+                `Connected to ${input.host}.\r\n\r\n` +
+                `\x1b[1mCisco IOS Software, C2960X Software\x1b[0m (C2960X-UNIVERSALK9-M)\r\n` +
+                `loki-sw01> `,
+            ),
+          }),
+        60,
+      );
+      return { id, status: "connected", kind: "telnet", target: label };
+    },
+    serial_open: ({ input }) => {
+      const id = `u${++state.opened}`;
+      const label = `${input.path} @ ${input.baud}`;
+      sessions.set(id, label);
+      setTimeout(
+        () =>
+          emit("term-event", {
+            type: "data",
+            sessionId: id,
+            data: b64(
+              `\r\nU-Boot 2024.01 (Oct 29 2026 - 09:00:00 +0800)\r\n\r\n` +
+                `DRAM:  2 GiB\r\nLoading Environment from MMC... OK\r\n` +
+                `=> `,
+            ),
+          }),
+        60,
+      );
+      return { id, status: "connected", kind: "serial", target: label };
     },
     local_open: () => {
       const id = `l${++state.opened}`;

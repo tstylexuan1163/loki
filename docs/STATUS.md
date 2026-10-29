@@ -427,3 +427,53 @@ macOS 未改配置，行为不变。**Windows 实机效果未验证**（开发�
 | 白色图标 | 新设计稿 `branding/logo-white-src.webp`；`branding/make-icon.py` 沿卡片圆角边框裁掉白底和投影（外部透明），居中放到 1024 画布、四周留 4% 透明边；`tauri icon` 重新生成全套图标；旧深色图保留为 `branding/icon-dark-1024.png` | 深色背景上目测四角无白边 |
 
 未验证：真实模型端点的流式效果（单元测试覆盖了三种协议的事件格式，模拟界面覆盖了渲染）。
+
+## 十七、快速连接支持 SSH / Telnet / 串口 / 本地 ✅
+
+计划见 [plans/2026-10-29-next-features.md](plans/2026-10-29-next-features.md) 第 4 项。
+
+### 做了什么
+
+- 快速连接面板（标签「+」、侧栏「会话 +」、⌘T / Ctrl+Shift+T）顶部加协议切换
+  （Segmented：SSH / Telnet / 串口 / 本地），默认 SSH，**上次选中的协议记在 `prefs.quickProtocol`**。
+- **Telnet**：输入 `host` 或 `host:port`（默认 23，方括号支持 IPv6），回车连接；最近连接按协议区分，
+  telnet 存成 `telnet://host:port`，无协议前缀的旧数据仍按 SSH 处理；只列 telnet 主机；面板底部提示明文风险。
+- **串口**：面板内是表单——设备输入框 + 「刷新」+ 检测到的设备下拉（`serial_ports`）、
+  波特率（300…230400，默认 115200）；数据位 / 校验 / 停止位收在「高级选项」里，默认 8 / 无 / 1。
+- **本地**：单独一段，说明不经过网络。
+- `terminals.ts`：新增 `openTelnet()` / `openSerial()`；`TermTab` 增加 `direct` 字段保存连接参数，
+  `openDirect()` 在没有 hostId 时用 `direct` 调 `directApi.telnetOpen` / `serialOpen`；`reconnect` 复用同一路径。
+  标签标题：telnet 为 `host:port`，串口为 `设备名 · 波特率`。
+- 标签右键菜单新增**「保存为主机」**：把未保存标签的连接参数带进主机编辑器（`Page.host-edit.prefill`），
+  协议、地址、端口或串口设备 / 波特率都会预填，名称用地址或设备名。SSH 快速连接标签同样可用。
+  「复制标签」也支持 telnet / 串口标签。
+- `dev/mock-ipc.js`：`serial_ports` 返回两个设备，新增 `telnet_open` / `serial_open`（返回 DirectInfo 并推送
+  各自的开机横幅）。
+
+### 怎么验证的
+
+模拟界面（`pnpm dev` → `/dev/mock.html`，Safari）逐项走了一遍：
+
+| 项 | 结果 |
+|---|---|
+| 面板顶部四段协议切换 | ✅ SSH 默认，列表与改动前一致（含 6 台主机 + 本地终端） |
+| Telnet 段 | ✅ 占位符「host 或 host:port（默认 23）」、只列 telnet 主机、明文警告 |
+| Telnet 连接 | ✅ 输入 `192.168.1.1` + 回车 → 标签 `192.168.1.1:23`，显示 Cisco 横幅与 `loki-sw01>`，状态栏「Telnet · 明文」 |
+| 串口表单 | ✅ 自动填入设备、「检测到 2 个设备」、波特率 115200 |
+| 串口「高级选项」 | ✅ 展开后 数据位 8 / 校验 无 / 停止位 1 |
+| 串口连接 | ✅ 标签 `ttyserial-1420 · 115200`，显示 U-Boot 横幅，状态栏「串口」 |
+| 标签右键「保存为主机」 | ✅ 跳到新建主机，连接方式=串口、名称=`ttyserial-1420`、设备与波特率均预填 |
+| 「复制标签」对 telnet/串口可用 | ✅ 菜单项为启用状态（未逐一点击） |
+
+静态检查全部通过：`cargo fmt` / `cargo clippy --all-targets -- -D warnings`（0 警告）/
+`cargo test`（85 通过）/ `npx tsc --noEmit` / `npx vite build`。
+
+### 未验证 / 已知限制
+
+- **「重新连接」没有在模拟界面里点通**：浏览器会拦截部分右键事件，几次尝试点偏；代码上
+  `reconnect()` 对非 SSH 标签走的就是首次连接用的 `openDirect()`（参数取自 `tab.direct`），
+  但这一条只做了代码核对，没有实测点击。真实应用里应再确认一次。
+- **真实 Telnet / 串口服务器未实测**：本轮全部在模拟后端上验证。真实 telnet 需要网络设备，
+  串口需要实际设备或 `socat` 虚拟串口；串口的收发此前也未做过真机验证（见 §九）。
+- SSH 模式下仍会列出所有已保存主机（改动前的行为），因此在 SSH 段里也能看到 telnet/串口主机并打开它们；
+  这是为了不改动既有体验，不是遗漏。

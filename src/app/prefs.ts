@@ -7,6 +7,8 @@ import { persist } from "zustand/middleware";
 
 export type CursorStyle = "block" | "bar" | "underline";
 export type HostsView = "cards" | "list";
+/** Which tab the quick-connect palette opens with. */
+export type QuickProtocol = "ssh" | "telnet" | "serial" | "local";
 
 export interface Prefs {
   /** Minutes of inactivity before the vault locks itself; 0 disables it. */
@@ -25,8 +27,14 @@ export interface Prefs {
   hostsView: HostsView;
   /** Width of the side panel (files / assistant) in pixels. */
   panelWidth: number;
-  /** Recent quick-connect targets, newest first. */
+  /**
+   * Recent quick-connect targets, newest first. Telnet entries are stored as
+   * `telnet://host:port`; anything without a scheme prefix is SSH (0.10 wrote
+   * bare `user@host:port` strings).
+   */
   recentTargets: string[];
+  /** Protocol the quick-connect palette last used. */
+  quickProtocol: QuickProtocol;
 }
 
 export const FONT_CHOICES = [
@@ -51,6 +59,7 @@ const DEFAULTS: Prefs = {
   hostsView: "cards",
   panelWidth: 420,
   recentTargets: [],
+  quickProtocol: "ssh",
 };
 
 interface PrefsState extends Prefs {
