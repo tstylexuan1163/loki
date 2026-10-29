@@ -107,9 +107,16 @@ pub struct LiveSession {
     writer: tokio::sync::Mutex<russh::ChannelWriteHalf<Msg>>,
     output: Arc<Mutex<OutputBuffer>>,
     closed: Arc<AtomicBool>,
+    /// Attached by `session_record_start`; the pump writes every chunk here.
+    recorder: Arc<Mutex<Option<crate::recorder::Recorder>>>,
 }
 
 impl LiveSession {
+    /// Where a recording can be attached; the pump writes to it as it runs.
+    pub fn recorder_slot(&self) -> Arc<Mutex<Option<crate::recorder::Recorder>>> {
+        self.recorder.clone()
+    }
+
     /// The underlying connection, for opening extra subsystems (SFTP, forwarding).
     pub fn handle(&self) -> &Arc<Handle<ClientHandler>> {
         &self.handle
@@ -788,6 +795,8 @@ async fn open_shell(
     let sid = session_id.clone();
     let output = Arc::new(Mutex::new(OutputBuffer::default()));
     let output_for_pump = output.clone();
+    let recorder = Arc::new(Mutex::new(None::<crate::recorder::Recorder>));
+    let recorder_for_pump = recorder.clone();
     let closed = Arc::new(AtomicBool::new(false));
     let closed_for_pump = closed.clone();
     tokio::spawn(async move {
@@ -797,6 +806,13 @@ async fn open_shell(
                 ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
                     if let Ok(mut buf) = output_for_pump.lock() {
                         buf.push(&data);
+                    }
+                    // Record from the pump, not the UI: long output outlives
+                    // the scrollback and the pane.
+                    if let Ok(mut slot) = recorder_for_pump.lock() {
+                        if let Some(rec) = slot.as_mut() {
+                            rec.write(&data);
+                        }
                     }
                     let payload = base64::engine::general_purpose::STANDARD.encode(&data);
                     if events
@@ -819,6 +835,13 @@ async fn open_shell(
                 _ => {}
             }
         }
+        // The stream is over: close any recording so the file gets its footer
+        // even when the server dropped us rather than the user closing the tab.
+        if let Ok(mut slot) = recorder_for_pump.lock() {
+            if let Some(mut rec) = slot.take() {
+                rec.finish(&format!("# 结束: {}\n", crate::recorder::local_stamp()));
+            }
+        }
         // Exactly one terminal event, whether the stream ended cleanly or not.
         closed_for_pump.store(true, Ordering::SeqCst);
         let _ = events.send(TermEvent::Closed {
@@ -839,6 +862,7 @@ async fn open_shell(
         writer: tokio::sync::Mutex::new(write_half),
         output,
         closed,
+        recorder,
     }))
 }
 

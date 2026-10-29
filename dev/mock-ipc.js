@@ -216,6 +216,17 @@ uci commit openclash && /etc/init.d/openclash restart
       return { id, status: "connected", kind: "local", target: "zsh" };
     },
     term_backlog: () => "",
+    terminal_export: ({ defaultName }) => `/Users/mock/Downloads/${defaultName}`,
+    session_record_start: ({ sessionId }) => {
+      state.recording = { path: "/Users/mock/Downloads/session.txt", startedAt: "2026-10-29 22:50:11", bytes: 0 };
+      return state.recording;
+    },
+    session_record_stop: () => {
+      const rec = state.recording;
+      state.recording = null;
+      return rec ? { path: rec.path, bytes: 48213 } : null;
+    },
+    session_record_status: () => state.recording ?? null,
     term_write: ({ sessionId, data }) => {
       const text = decodeURIComponent(escape(atob(data)));
       emit("term-event", { type: "data", sessionId, data: b64(text === "\r" ? "\r\n$ " : text) });

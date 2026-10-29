@@ -230,6 +230,8 @@ pub async fn lock_vault(
 /// forwards and transfers. A locked app must not keep anything open that the
 /// UI can no longer show or stop.
 pub async fn close_everything(state: &AppState) {
+    // Recordings must be flushed before their sessions disappear.
+    finish_all_recordings(state);
     if let Ok(mut f) = state.forwards.lock() {
         for view in f.list() {
             f.remove(&view.id);
@@ -1104,6 +1106,15 @@ pub async fn term_resize(
 
 #[tauri::command]
 pub async fn session_close(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    // Stop a running recording before the session is dropped, so the file is
+    // closed with its footer rather than left to the pump.
+    if let Ok((_, slot)) = recorder_target(&state, &id) {
+        if let Ok(mut guard) = slot.lock() {
+            if let Some(mut recorder) = guard.take() {
+                recorder.finish(&format!("# 结束: {}\n", crate::recorder::local_stamp()));
+            }
+        }
+    }
     let session = {
         let mut mgr = state.ssh.lock().map_err(|e| e.to_string())?;
         mgr.remove(&id)
@@ -1366,11 +1377,244 @@ pub async fn direct_resize(
 
 #[tauri::command]
 pub fn direct_close(state: State<'_, AppState>, session_id: String) -> Result<(), String> {
+    if let Ok((_, slot)) = recorder_target(&state, &session_id) {
+        if let Ok(mut guard) = slot.lock() {
+            if let Some(mut recorder) = guard.take() {
+                recorder.finish(&format!("# 结束: {}\n", crate::recorder::local_stamp()));
+            }
+        }
+    }
     let mut mgr = state.direct.lock().map_err(|e| e.to_string())?;
     if !mgr.remove(&session_id) {
         return Err("会话不存在".into());
     }
     Ok(())
+}
+
+// ---- Terminal export & session recording ---------------------------------
+
+/// Turns a session title into something usable as a file name stem.
+fn safe_file_stem(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if ch.is_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            out.push(ch);
+        } else if ch.is_whitespace()
+            || matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+        {
+            out.push('-');
+        }
+    }
+    let trimmed = out.trim_matches(['-', '.'].as_slice());
+    let stem: String = trimmed.chars().take(60).collect();
+    if stem.is_empty() {
+        "loki".to_string()
+    } else {
+        stem
+    }
+}
+
+/// Asks the OS for a save location. Runs off the main thread: the blocking
+/// dialog must not be called there.
+fn pick_save_path(
+    app: &tauri::AppHandle,
+    default_name: &str,
+) -> Result<Option<std::path::PathBuf>, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let picked = app
+        .dialog()
+        .file()
+        .set_file_name(default_name)
+        .blocking_save_file();
+    match picked {
+        None => Ok(None),
+        Some(fp) => fp
+            .into_path()
+            .map(Some)
+            .map_err(|e| format!("保存路径无效：{e}")),
+    }
+}
+
+/// Writes terminal text to a file the user picks.
+///
+/// The path comes from the native dialog and never from the WebView, so a
+/// compromised renderer cannot choose where to write.
+#[tauri::command]
+pub async fn terminal_export(
+    app: tauri::AppHandle,
+    default_name: String,
+    text: String,
+) -> Result<Option<String>, String> {
+    let app_for_dialog = app.clone();
+    let name = default_name.clone();
+    let picked =
+        tauri::async_runtime::spawn_blocking(move || pick_save_path(&app_for_dialog, &name))
+            .await
+            .map_err(|e| e.to_string())??;
+    let Some(path) = picked else {
+        return Ok(None);
+    };
+
+    // Normalise line endings: the terminal hands us CRLF, a text file should not.
+    let body = text.replace("\r\n", "\n");
+    std::fs::write(&path, body).map_err(|e| format!("写入失败：{e}"))?;
+    Ok(Some(path.display().to_string()))
+}
+
+/// The shared slot a session's recorder lives in.
+type RecorderSlot = std::sync::Arc<std::sync::Mutex<Option<crate::recorder::Recorder>>>;
+
+/// A session's display title plus where its recording would attach.
+type RecorderTarget = (String, RecorderSlot);
+
+/// Where a recording for this session would go.
+fn recorder_target(state: &AppState, session_id: &str) -> Result<RecorderTarget, String> {
+    let from_ssh = {
+        let mgr = state.ssh.lock().map_err(|e| e.to_string())?;
+        mgr.get(session_id)
+            .map(|s| (s.info.title.clone(), s.recorder_slot()))
+    };
+    if let Some(hit) = from_ssh {
+        return Ok(hit);
+    }
+
+    let mgr = state.direct.lock().map_err(|e| e.to_string())?;
+    let title = mgr
+        .info(session_id)
+        .map(|i| i.target)
+        .ok_or_else(|| "会话不存在".to_string())?;
+    let slot = mgr
+        .recorder_slot(session_id)
+        .ok_or_else(|| "会话不存在".to_string())?;
+    Ok((title, slot))
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordInfo {
+    pub path: String,
+    pub started_at: String,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordStopped {
+    pub path: String,
+    pub bytes: u64,
+}
+
+/// Starts recording a session's output to a file the user picks.
+///
+/// `plain` strips escape sequences; otherwise the raw byte stream (with colour)
+/// is kept. Returns `None` when the user cancels the dialog.
+#[tauri::command]
+pub async fn session_record_start(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    session_id: String,
+    plain: bool,
+) -> Result<Option<RecordInfo>, String> {
+    let (title, slot) = recorder_target(&state, &session_id)?;
+
+    // One recording per session: two writers on one file would interleave.
+    if slot.lock().map_err(|e| e.to_string())?.is_some() {
+        return Err("这个会话已经在录制".into());
+    }
+
+    let stem = safe_file_stem(&title);
+    let ext = if plain { "txt" } else { "log" };
+    let default_name = format!("{stem}-{}.{ext}", crate::recorder::file_stamp());
+
+    let app_for_dialog = app.clone();
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        pick_save_path(&app_for_dialog, &default_name)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    let Some(path) = picked else {
+        return Ok(None);
+    };
+
+    let mode = if plain {
+        "纯文本（已去除控制字符）"
+    } else {
+        "原始输出（含颜色控制符）"
+    };
+    let header = format!(
+        "# loki 会话记录\n# 目标: {title}\n# 开始: {}\n# 模式: {mode}\n\n",
+        crate::recorder::local_stamp()
+    );
+
+    let recorder = crate::recorder::Recorder::start(&path, &header, plain)
+        .map_err(|e| format!("无法创建文件：{e}"))?;
+    let info = RecordInfo {
+        path: path.display().to_string(),
+        started_at: recorder.started_at().to_string(),
+        bytes: recorder.bytes(),
+    };
+
+    *slot.lock().map_err(|e| e.to_string())? = Some(recorder);
+    Ok(Some(info))
+}
+
+/// Stops recording and closes the file.
+#[tauri::command]
+pub fn session_record_stop(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Option<RecordStopped>, String> {
+    let (_, slot) = recorder_target(&state, &session_id)?;
+    let taken = slot.lock().map_err(|e| e.to_string())?.take();
+    let Some(mut recorder) = taken else {
+        return Ok(None);
+    };
+
+    let path = recorder.path().display().to_string();
+    let footer = format!("# 结束: {}\n", crate::recorder::local_stamp());
+    let bytes = recorder.finish(&footer);
+    Ok(Some(RecordStopped { path, bytes }))
+}
+
+/// Current recording for a session, if any.
+#[tauri::command]
+pub fn session_record_status(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Option<RecordInfo>, String> {
+    let Ok((_, slot)) = recorder_target(&state, &session_id) else {
+        return Ok(None);
+    };
+    let guard = slot.lock().map_err(|e| e.to_string())?;
+    Ok(guard.as_ref().map(|r| RecordInfo {
+        path: r.path().display().to_string(),
+        started_at: r.started_at().to_string(),
+        bytes: r.bytes(),
+    }))
+}
+
+/// Finishes every open recording. Used when sessions go away wholesale.
+fn finish_all_recordings(state: &AppState) {
+    let mut slots = Vec::new();
+    if let Ok(mgr) = state.ssh.lock() {
+        for session in mgr.list() {
+            if let Some(live) = mgr.get(&session.id) {
+                slots.push(live.recorder_slot());
+            }
+        }
+    }
+    if let Ok(mgr) = state.direct.lock() {
+        slots.extend(mgr.recorder_slots());
+    }
+
+    for slot in slots {
+        if let Ok(mut guard) = slot.lock() {
+            if let Some(mut recorder) = guard.take() {
+                recorder.finish(&format!("# 结束: {}\n", crate::recorder::local_stamp()));
+            }
+        }
+    }
 }
 
 // ---- Sync ----------------------------------------------------------------

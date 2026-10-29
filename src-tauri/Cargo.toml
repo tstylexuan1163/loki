@@ -26,6 +26,8 @@ russh = { version = "0.54", default-features = false, features = ["ring", "flate
 russh-sftp = "3"
 # Serial console: switches, routers, and embedded boards.
 serialport = "4"
+# Local timestamps for recording headers. Already in the tree via tauri.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # In-app update check and install. Rust-only: the JS binding is not used, so the
 # npm package is not required.
 tauri-plugin-updater = "2"

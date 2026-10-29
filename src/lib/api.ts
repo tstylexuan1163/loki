@@ -459,3 +459,27 @@ export const updateApi = {
   check: () => invoke<UpdateInfo | null>("update_check"),
   install: () => invoke<void>("update_install"),
 };
+
+// ---- Terminal export & session recording ---------------------------------
+
+export interface RecordInfo {
+  path: string;
+  startedAt: string;
+  bytes: number;
+}
+
+export interface RecordStopped {
+  path: string;
+  bytes: number;
+}
+
+export const recordApi = {
+  /** Writes `text` to a file the user picks; `null` when they cancel. */
+  exportText: (defaultName: string, text: string) =>
+    invoke<string | null>("terminal_export", { defaultName, text }),
+  start: (sessionId: string, plain: boolean) =>
+    invoke<RecordInfo | null>("session_record_start", { sessionId, plain }),
+  stop: (sessionId: string) =>
+    invoke<RecordStopped | null>("session_record_stop", { sessionId }),
+  status: (sessionId: string) => invoke<RecordInfo | null>("session_record_status", { sessionId }),
+};

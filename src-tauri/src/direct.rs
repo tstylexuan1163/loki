@@ -113,6 +113,8 @@ struct Entry {
     session: Arc<DirectSession>,
     /// Output produced before a pane attached, replayed once on request.
     backlog: Arc<std::sync::Mutex<Vec<u8>>>,
+    /// Attached by `session_record_start`; the reader writes every chunk here.
+    recorder: Arc<std::sync::Mutex<Option<crate::recorder::Recorder>>>,
 }
 
 pub struct DirectManager {
@@ -141,6 +143,24 @@ impl DirectManager {
         } else {
             false
         }
+    }
+
+    /// The session's display info, e.g. to name an exported file.
+    pub fn info(&self, id: &str) -> Option<DirectInfo> {
+        self.entries.get(id).map(|e| e.info.clone())
+    }
+
+    /// Where a recording can be attached for this session.
+    pub fn recorder_slot(
+        &self,
+        id: &str,
+    ) -> Option<Arc<std::sync::Mutex<Option<crate::recorder::Recorder>>>> {
+        self.entries.get(id).map(|e| e.recorder.clone())
+    }
+
+    /// Every recorder slot, for shutdown.
+    pub fn recorder_slots(&self) -> Vec<Arc<std::sync::Mutex<Option<crate::recorder::Recorder>>>> {
+        self.entries.values().map(|e| e.recorder.clone()).collect()
     }
 
     /// Takes output produced before the UI attached, draining the buffer so a
@@ -203,12 +223,15 @@ impl DirectManager {
 
         let session_for_reader = session.clone();
         let backlog_for_reader = backlog.clone();
+        let recorder = Arc::new(std::sync::Mutex::new(None::<crate::recorder::Recorder>));
+        let recorder_for_reader = recorder.clone();
         self.entries.insert(
             id.clone(),
             Entry {
                 info: info.clone(),
                 session,
                 backlog,
+                recorder,
             },
         );
 
@@ -246,6 +269,7 @@ impl DirectManager {
                             continue;
                         }
                         push_bounded(&backlog_for_reader, &data);
+                        write_recording(&recorder_for_reader, &data);
                         let payload = base64_encode(&data);
                         if events
                             .send(TermEvent::Data {
@@ -309,8 +333,11 @@ impl DirectManager {
         let backlog = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
         let backlog_for_reader = backlog.clone();
 
+        let recorder = Arc::new(std::sync::Mutex::new(None::<crate::recorder::Recorder>));
+        let recorder_for_reader = recorder.clone();
         let (handle, stop) = conn.start(move |bytes| {
             push_bounded(&backlog_for_reader, &bytes);
+            write_recording(&recorder_for_reader, &bytes);
             let payload = base64_encode(&bytes);
             let _ = events.send(TermEvent::Data {
                 session_id: sid.clone(),
@@ -335,6 +362,7 @@ impl DirectManager {
                     stop,
                 }),
                 backlog,
+                recorder,
             },
         );
 
@@ -351,6 +379,8 @@ impl DirectManager {
     ) -> Result<DirectInfo, String> {
         let backlog = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
         let backlog_for_reader = backlog.clone();
+        let recorder = Arc::new(std::sync::Mutex::new(None::<crate::recorder::Recorder>));
+        let recorder_for_reader = recorder.clone();
         let sid = id.clone();
         let data_events = events.clone();
         let exit_sid = id.clone();
@@ -360,6 +390,7 @@ impl DirectManager {
             rows,
             move |bytes| {
                 push_bounded(&backlog_for_reader, &bytes);
+                write_recording(&recorder_for_reader, &bytes);
                 let _ = data_events.send(TermEvent::Data {
                     session_id: sid.clone(),
                     data: base64_encode(&bytes),
@@ -395,9 +426,22 @@ impl DirectManager {
                 info: info.clone(),
                 session: Arc::new(DirectSession::Local { pty }),
                 backlog,
+                recorder,
             },
         );
         Ok(info)
+    }
+}
+
+/// Appends one chunk to the session's recorder, if one is attached.
+///
+/// Recording happens here rather than in the UI so a long `show running-config`
+/// survives the scrollback limit and the pane being closed.
+fn write_recording(slot: &std::sync::Mutex<Option<crate::recorder::Recorder>>, data: &[u8]) {
+    if let Ok(mut guard) = slot.lock() {
+        if let Some(rec) = guard.as_mut() {
+            rec.write(data);
+        }
     }
 }
 

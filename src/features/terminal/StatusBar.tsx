@@ -1,8 +1,15 @@
 import { useEffect, useState } from "react";
 import { usePrefs } from "@/app/prefs";
 import { IconClock, IconCpu, IconDisk, IconMemory, IconShield } from "@/components/icons";
-import { formatBytes, sessionApi, type ServerStats } from "@/lib/api";
-import type { TermTab } from "@/features/terminal/terminals";
+import { formatBytes, recordApi, sessionApi, type RecordInfo, type ServerStats } from "@/lib/api";
+import { useTerminals, type TermTab } from "@/features/terminal/terminals";
+import { toast } from "@/components/ui";
+
+/** Last path segment, for a compact status line. */
+function fileName(path: string): string {
+  const parts = path.split(/[\\/]/);
+  return parts[parts.length - 1] || path;
+}
 
 function uptime(secs: number | null): string {
   if (secs == null) return "—";
@@ -30,8 +37,44 @@ function Meter({ value }: { value: number | null }) {
  */
 export function StatusBar({ tab }: { tab: TermTab }) {
   const showStats = usePrefs((s) => s.showStats);
+  const setRecording = useTerminals((s) => s.setRecording);
   const [stats, setStats] = useState<ServerStats | null>(null);
   const [unsupported, setUnsupported] = useState(false);
+  // Mirrors the tab's recording, refreshed so the byte count keeps moving.
+  const [rec, setRec] = useState<RecordInfo | null>(tab.recording);
+
+  useEffect(() => setRec(tab.recording), [tab.recording]);
+
+  useEffect(() => {
+    if (!tab.recording || !tab.sessionId) return;
+    const sid = tab.sessionId;
+    let stopped = false;
+    const timer = window.setInterval(() => {
+      void recordApi
+        .status(sid)
+        .then((info) => {
+          if (!stopped && info) setRec(info);
+        })
+        .catch(() => {
+          /* the session may have gone; the tab state will catch up */
+        });
+    }, 2000);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [tab.recording, tab.sessionId]);
+
+  async function stopRecording() {
+    if (!tab.sessionId) return;
+    try {
+      const res = await recordApi.stop(tab.sessionId);
+      setRecording(tab.id, null);
+      if (res) toast(`已保存 ${res.path}（${formatBytes(res.bytes)}）`, "success");
+    } catch (e) {
+      toast(String(e), "error");
+    }
+  }
 
   const live = tab.kind === "ssh" && tab.status === "connected" && !!tab.sessionId;
 
@@ -98,6 +141,17 @@ export function StatusBar({ tab }: { tab: TermTab }) {
         {tab.kind === "ssh" && <IconShield size={12} />}
         {label}
       </span>
+
+      {rec && (
+        <button
+          className="statusbar__rec"
+          onClick={() => void stopRecording()}
+          title={`录制到 ${rec.path}（点击停止）`}
+        >
+          <span className="rec-dot" />
+          录制中 {fileName(rec.path)} · {formatBytes(rec.bytes)}
+        </button>
+      )}
 
       <span className="spacer" />
 

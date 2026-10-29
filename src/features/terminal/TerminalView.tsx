@@ -7,8 +7,10 @@ import { StatusBar } from "@/features/terminal/StatusBar";
 import { QuickConnect } from "@/features/terminal/QuickConnect";
 import { SftpPanel } from "@/features/sftp/SftpPanel";
 import { AiPanel } from "@/features/ai/AiPanel";
-import { Menu, useMenu } from "@/components/ui";
+import { Menu, confirmDialog, toast, useMenu } from "@/components/ui";
 import { isAppShortcut, keyLabel, shortcutKey } from "@/app/platform";
+import { recordApi, formatBytes } from "@/lib/api";
+import { bufferToText, fileStamp, safeStem } from "@/features/terminal/exportText";
 import {
   IconAlert,
   IconChevronDown,
@@ -26,6 +28,7 @@ import {
   IconX,
   IconGlobe,
   IconEdit,
+  IconDownload,
 } from "@/components/icons";
 
 type Panel = "files" | "ai" | null;
@@ -54,6 +57,7 @@ export function TerminalView({ visible }: { visible: boolean }) {
   const activate = useTerminals((s) => s.activate);
   const reconnect = useTerminals((s) => s.reconnect);
   const rename = useTerminals((s) => s.rename);
+  const setRecording = useTerminals((s) => s.setRecording);
   const openLocal = useTerminals((s) => s.openLocal);
   const panelWidth = usePrefs((s) => s.panelWidth);
   const setPref = usePrefs((s) => s.set);
@@ -63,6 +67,118 @@ export function TerminalView({ visible }: { visible: boolean }) {
   const [quick, setQuick] = useState(false);
   const [renaming, setRenaming] = useState<string | null>(null);
   const tabMenu = useMenu<TermTab>();
+  const moreMenu = useMenu<undefined>();
+
+  /** Exports the scrollback (or the selection) of a tab. */
+  async function exportTab(tab: TermTab, selection: boolean) {
+    const entry = terminalRegistry.get(tab.id);
+    if (!entry) {
+      toast("这个标签还没有终端内容", "error");
+      return;
+    }
+    const text = selection ? entry.term.getSelection() : bufferToText(entry.term);
+    if (!text.trim()) {
+      toast(selection ? "没有选中的内容" : "终端还没有输出", "info");
+      return;
+    }
+    const name = `${safeStem(tab.title)}-${fileStamp()}.txt`;
+    try {
+      const path = await recordApi.exportText(name, text);
+      if (path) toast(`已导出到 ${path}`, "success");
+    } catch (e) {
+      toast(String(e), "error");
+    }
+  }
+
+  /** Starts recording a session's output to a file. */
+  async function startRecording(tab: TermTab, plain: boolean) {
+    if (!tab.sessionId || tab.status !== "connected") {
+      toast("只有已连接的标签可以录制", "info");
+      return;
+    }
+    const ok = await confirmDialog({
+      title: "开始录制会话",
+      body: (
+        <div className="rec-hint">
+          <p>录制会从此刻起把该会话的输出写入文件，超过回滚行数的内容也不会丢。</p>
+          <p>
+            录交换机的长配置前，先关闭分页：Cisco <code>terminal length 0</code>，华为 / H3C{" "}
+            <code>screen-length 0 temporary</code>，Juniper <code>set cli screen-length 0</code>。
+          </p>
+          <p className="muted">
+            {plain
+              ? "文件为纯文本，颜色控制符会被去掉。"
+              : "保留原始控制字符（含颜色），适合之后回放。"}
+          </p>
+        </div>
+      ),
+      confirmLabel: "选择文件并开始",
+    });
+    if (!ok) return;
+
+    try {
+      const info = await recordApi.start(tab.sessionId, plain);
+      if (info) {
+        setRecording(tab.id, info);
+        toast(`录制中：${info.path}`, "success");
+      }
+    } catch (e) {
+      toast(String(e), "error");
+    }
+  }
+
+  /** Stops recording and reports where the file went. */
+  async function stopRecording(tab: TermTab) {
+    if (!tab.sessionId) return;
+    try {
+      const res = await recordApi.stop(tab.sessionId);
+      setRecording(tab.id, null);
+      if (res) toast(`已保存 ${res.path}（${formatBytes(res.bytes)}）`, "success");
+    } catch (e) {
+      toast(String(e), "error");
+    }
+  }
+
+  /** The three actions, shared by the tab menu and the toolbar menu. */
+  function sessionActionItems(tab: TermTab) {
+    const connected = tab.status === "connected" && !!tab.sessionId;
+    const items = [
+      {
+        label: "导出终端内容…",
+        icon: <IconDownload size={14} />,
+        onSelect: () => void exportTab(tab, false),
+      },
+      {
+        label: "导出选中内容…",
+        icon: <IconDownload size={14} />,
+        onSelect: () => void exportTab(tab, true),
+      },
+      "sep" as const,
+    ];
+    if (tab.recording) {
+      items.push({
+        label: "停止录制",
+        icon: <IconAlert size={14} />,
+        hint: formatBytes(tab.recording.bytes),
+        danger: true,
+        onSelect: () => void stopRecording(tab),
+      } as never);
+    } else {
+      items.push({
+        label: "开始录制…",
+        icon: <IconAlert size={14} />,
+        disabled: !connected,
+        onSelect: () => void startRecording(tab, true),
+      } as never);
+      items.push({
+        label: "开始录制（保留颜色）…",
+        icon: <IconAlert size={14} />,
+        disabled: !connected,
+        onSelect: () => void startRecording(tab, false),
+      } as never);
+    }
+    return items;
+  }
 
   const current = tabs.find((t) => t.id === active) ?? null;
   const isSsh = current?.kind === "ssh" && current.status === "connected";
@@ -112,6 +228,7 @@ export function TerminalView({ visible }: { visible: boolean }) {
             >
               <span className={`tab__dot tab__dot--${t.status}`} />
               <span className="tab__kind">{KIND_ICON[t.kind]}</span>
+              {t.recording && <span className="tab__rec" title="录制中" />}
               {renaming === t.id ? (
                 <input
                   className="tab__rename"
@@ -173,6 +290,17 @@ export function TerminalView({ visible }: { visible: boolean }) {
           >
             <IconSparkle size={15} />
             <span>助手</span>
+          </button>
+          <button
+            className="toolbtn"
+            onClick={(e) => {
+              if (current) moreMenu.openBelow(e.currentTarget, undefined);
+            }}
+            disabled={!current}
+            title="导出与录制"
+          >
+            <IconDownload size={15} />
+            <span>更多</span>
           </button>
         </div>
       </div>
@@ -239,6 +367,15 @@ export function TerminalView({ visible }: { visible: boolean }) {
 
       {quick && <QuickConnect onClose={() => setQuick(false)} />}
 
+      {moreMenu.menu && current && (
+        <Menu
+          x={moreMenu.menu.x}
+          y={moreMenu.menu.y}
+          onClose={moreMenu.close}
+          items={sessionActionItems(current)}
+        />
+      )}
+
       {tabMenu.menu && (
         <Menu
           x={tabMenu.menu.x}
@@ -255,6 +392,8 @@ export function TerminalView({ visible }: { visible: boolean }) {
               icon: <IconEdit size={14} />,
               onSelect: () => setRenaming(tabMenu.menu!.data.id),
             },
+            "sep",
+            ...sessionActionItems(tabMenu.menu.data),
             {
               label: "保存为主机",
               icon: <IconServer size={14} />,

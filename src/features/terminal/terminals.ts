@@ -59,6 +59,8 @@ export interface TermTab {
   error: string | null;
   prompt: TabPrompt | null;
   connectedAt: number | null;
+  /** Non-null while this session is being recorded to a file. */
+  recording: import("@/lib/api").RecordInfo | null;
 }
 
 interface TermState {
@@ -82,6 +84,7 @@ interface TermState {
   activate(tabId: string): void;
   cycle(delta: number): void;
   rename(tabId: string, title: string): void;
+  setRecording(tabId: string, info: import("@/lib/api").RecordInfo | null): void;
   /** Drops every tab without talking to the backend (it already closed them). */
   reset(): void;
 }
@@ -114,7 +117,8 @@ export const useTerminals = create<TermState>((set, get) => {
       // tracks lifecycle so the tab strip stays accurate.
       if (ev.type !== "closed") return;
       const tab = get().tabs.find((t) => t.sessionId === ev.sessionId);
-      if (tab) patch(tab.id, { status: "closed" });
+      // The file is already closed by the Rust side; drop the indicator.
+      if (tab) patch(tab.id, { status: "closed", recording: null });
     });
   }
 
@@ -243,7 +247,12 @@ export const useTerminals = create<TermState>((set, get) => {
     }
   }
 
-  function add(tab: Omit<TermTab, "id" | "status" | "sessionId" | "error" | "prompt" | "connectedAt">) {
+  function add(
+    tab: Omit<
+      TermTab,
+      "id" | "status" | "sessionId" | "error" | "prompt" | "connectedAt" | "recording"
+    >,
+  ) {
     const full: TermTab = {
       ...tab,
       id: newId(),
@@ -252,6 +261,7 @@ export const useTerminals = create<TermState>((set, get) => {
       error: null,
       prompt: null,
       connectedAt: null,
+      recording: null,
     };
     set({ tabs: [...get().tabs, full], active: full.id });
     return full.id;
@@ -410,6 +420,10 @@ export const useTerminals = create<TermState>((set, get) => {
 
     rename(tabId, title) {
       if (title.trim()) patch(tabId, { title: title.trim() });
+    },
+
+    setRecording(tabId, info) {
+      patch(tabId, { recording: info });
     },
 
     reset() {

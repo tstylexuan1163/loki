@@ -6,6 +6,7 @@ pub mod crypto;
 pub mod direct;
 pub mod forward;
 pub mod local;
+pub mod recorder;
 pub mod serial;
 pub mod sftp;
 pub mod ssh;
@@ -109,6 +110,10 @@ pub fn run() {
             commands::transfer_cancel,
             commands::update_check,
             commands::update_install,
+            commands::terminal_export,
+            commands::session_record_start,
+            commands::session_record_stop,
+            commands::session_record_status,
             commands::serial_ports,
             commands::telnet_open,
             commands::serial_open,
