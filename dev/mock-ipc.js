@@ -15,14 +15,19 @@
     exists: !fresh,
     unlocked: false,
     hosts: [
-      host("h1", "prod-api-tokyo", "10.0.12.31", "deploy", ["prod", "k8s"], { has_key: true }),
-      host("h2", "staging-web", "staging.example.com", "ubuntu", ["staging"], { has_password: true }),
-      host("h3", "db-primary", "10.0.40.2", "postgres", ["prod", "db"], { jump_host_id: "h5", key_id: "k1" }),
-      host("h4", "core-switch", "/dev/tty.usbserial-1420", "", ["network"], { protocol: "serial", baud: 9600 }),
-      host("h5", "bastion", "bastion.example.com", "ops", ["prod"], { has_key: true }),
-      host("h6", "lab-router", "192.168.1.1", "", ["lab"], { protocol: "telnet", port: 23 }),
+      host("h1", "prod-api-tokyo", "10.0.12.31", "deploy", ["服务器", "生产"], { has_key: true }),
+      host("h2", "staging-web", "staging.example.com", "ubuntu", ["服务器"], { has_password: true }),
+      host("h3", "db-primary", "10.0.40.2", "postgres", ["服务器", "生产"], { jump_host_id: "h5", key_id: "k1" }),
+      host("h4", "core-switch", "/dev/tty.usbserial-1420", "", ["交换机"], { protocol: "serial", baud: 9600 }),
+      host("h5", "bastion", "bastion.example.com", "ops", ["服务器", "生产"], { has_key: true }),
+      host("h6", "lab-router", "192.168.1.1", "", ["交换机"], { protocol: "telnet", port: 23 }),
       // Saved without a login name: connecting asks for one, then a password.
-      host("h7", "nas", "192.168.88.89", "", ["lab"]),
+      host("h7", "nas", "192.168.88.89", "", []),
+    ],
+    categories: [
+      { id: "c-srv", name: "服务器", color: "#4c9aff", order: 0 },
+      { id: "c-sw", name: "交换机", color: "#f59e0b", order: 1 },
+      { id: "c-prod", name: "生产", color: null, order: 2 },
     ],
     keys: [
       { id: "k1", name: "loki-2026-10-29", kind: "ed25519", fingerprint: "SHA256:QrhJScFAmN1bMZe5Yz7V8BGKQ00UtF5x8Iiual2NXfU", publicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKq0x7n0mock loki", createdAt: 0 },
@@ -161,6 +166,46 @@ uci commit openclash && /etc/init.d/openclash restart
       return id;
     },
     host_delete: ({ id }) => ((state.hosts = state.hosts.filter((h) => h.id !== id)), null),
+    // Categories behave like the Rust side: names on hosts, records for order
+    // and colour, renames and deletes rewrite the hosts.
+    categories_list: () => {
+      const same = (a, b) => a.toLowerCase() === b.toLowerCase();
+      for (const h of state.hosts)
+        for (const t of h.tags)
+          if (!state.categories.some((c) => same(c.name, t)))
+            state.categories.push({ id: `c${Date.now()}${t}`, name: t, color: null, order: state.categories.length });
+      return [...state.categories]
+        .sort((a, b) => a.order - b.order)
+        .map((c) => ({ ...c, count: state.hosts.filter((h) => h.tags.some((t) => same(t, c.name))).length }));
+    },
+    category_save: ({ input }) => {
+      const name = input.name.trim();
+      if (!name) throw "分类名称不能为空";
+      if (state.categories.some((c) => c.id !== input.id && c.name.toLowerCase() === name.toLowerCase()))
+        throw `已经有名为「${name}」的分类`;
+      if (input.id) {
+        const c = state.categories.find((x) => x.id === input.id);
+        for (const h of state.hosts) h.tags = h.tags.map((t) => (t === c.name ? name : t));
+        Object.assign(c, { name, color: input.color ?? null });
+        return c.id;
+      }
+      const id = `c${Date.now()}`;
+      state.categories.push({ id, name, color: input.color ?? null, order: state.categories.length });
+      return id;
+    },
+    category_delete: ({ id }) => {
+      const c = state.categories.find((x) => x.id === id);
+      if (c) for (const h of state.hosts) h.tags = h.tags.filter((t) => t !== c.name);
+      state.categories = state.categories.filter((x) => x.id !== id);
+      return null;
+    },
+    categories_reorder: ({ ids }) => {
+      ids.forEach((id, i) => {
+        const c = state.categories.find((x) => x.id === id);
+        if (c) c.order = i;
+      });
+      return null;
+    },
     host_duplicate: ({ id }) => {
       const h = state.hosts.find((x) => x.id === id);
       const copy = { ...h, id: `h${Date.now()}`, name: `${h.name} 副本` };

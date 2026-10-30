@@ -90,6 +90,11 @@ export const api = {
   hostsList: () => invoke<HostView[]>("hosts_list"),
   hostSave: (host: HostInput) => invoke<string>("host_save", { host }),
   hostDelete: (id: string) => invoke<void>("host_delete", { id }),
+  categoriesList: () => invoke<CategoryView[]>("categories_list"),
+  categorySave: (input: { id?: string; name: string; color?: string | null }) =>
+    invoke<string>("category_save", { input }),
+  categoryDelete: (id: string) => invoke<void>("category_delete", { id }),
+  categoriesReorder: (ids: string[]) => invoke<void>("categories_reorder", { ids }),
   hostDuplicate: (id: string) => invoke<string>("host_duplicate", { id }),
 
   sessionsList: () => invoke<SessionView[]>("sessions_list"),
@@ -104,6 +109,45 @@ export function errorMessage(e: unknown): string {
 }
 
 /** Stable per-tag colour, so "prod" is always the same hue. */
+/**
+ * A host category. Hosts list theirs by name in `HostView.tags`, so a host can
+ * be in several; this record adds the order and an optional colour.
+ */
+export interface CategoryView {
+  id: string;
+  name: string;
+  color: string | null;
+  order: number;
+  count: number;
+}
+
+/** Colours offered when picking one for a category. */
+export const CATEGORY_COLORS = [
+  "#3fb68b",
+  "#4c9aff",
+  "#a78bfa",
+  "#f472b6",
+  "#f59e0b",
+  "#ef4444",
+  "#14b8a6",
+  "#94a3b8",
+];
+
+/** A category's colour: the one picked, else derived from its name. */
+export function categoryColor(name: string, categories: CategoryView[]): string {
+  const c = categories.find((x) => x.name.toLowerCase() === name.toLowerCase());
+  return c?.color || tagColor(name);
+}
+
+/** A host's categories in the user's category order. */
+export function sortedCategories(tags: string[], categories: CategoryView[]): string[] {
+  const rank = (t: string) => {
+    const i = categories.findIndex((c) => c.name.toLowerCase() === t.toLowerCase());
+    return i < 0 ? Number.MAX_SAFE_INTEGER : i;
+  };
+  return [...tags].sort((a, b) => rank(a) - rank(b));
+}
+
 export function tagColor(tag: string): string {
   let h = 0;
   for (let i = 0; i < tag.length; i++) h = (h * 31 + tag.charCodeAt(i)) % 360;

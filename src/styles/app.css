@@ -356,6 +356,29 @@ kbd,
   padding: 6px 10px;
 }
 
+/* Open sessions, grouped by their host's category. */
+.sidebar__group {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.sidebar__group + .sidebar__group {
+  margin-top: 6px;
+}
+
+.sidebar__grouphead {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px 2px;
+  font-size: 11px;
+  color: var(--text-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .sidebar__spacer {
   flex: 1;
 }
@@ -982,6 +1005,144 @@ kbd,
   gap: 12px;
 }
 
+/* ---- Host categories ------------------------------------------------------ */
+
+.hostgroup + .hostgroup {
+  margin-top: 18px;
+}
+
+.hostgroup__head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 10px;
+  padding: 2px 4px;
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.hostgroup__head:hover {
+  background: var(--bg-hover, var(--accent-soft));
+}
+
+.hostgroup__chev {
+  color: var(--text-faint);
+  transition: transform 0.12s ease;
+}
+
+.hostgroup__chev--open {
+  transform: rotate(90deg);
+}
+
+.hostgroup__count {
+  min-width: 18px;
+  padding: 0 6px;
+  border-radius: 99px;
+  background: var(--bg-sunken);
+  color: var(--text-faint);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 18px;
+  text-align: center;
+}
+
+.catman {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 4px 20px 20px;
+}
+
+.catman__empty {
+  padding: 8px 0;
+}
+
+.catman__row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.catman__swatchwrap {
+  position: relative;
+}
+
+.catman__swatch {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.12);
+  cursor: pointer;
+}
+
+.catman__swatch--on {
+  border-color: var(--text);
+}
+
+.catman__palette {
+  position: absolute;
+  top: 24px;
+  left: -6px;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px;
+  border-radius: 10px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--shadow-pop);
+}
+
+.catman__auto {
+  padding: 0 6px;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.catman__name {
+  flex: 1;
+  min-width: 0;
+  height: 32px;
+  padding: 0 10px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  background: var(--bg-sunken);
+  color: var(--text);
+  font-size: 13px;
+  outline: none;
+}
+
+.catman__name:focus {
+  border-color: var(--accent-dim);
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
+
+.catman__count {
+  width: 44px;
+  text-align: right;
+  color: var(--text-faint);
+  font-size: 12px;
+}
+
+.catman__add {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.catman__add .field__input {
+  flex: 1;
+}
+
+.iconbtn--danger:hover:not(:disabled) {
+  color: var(--danger);
+}
+
 .hostcard {
   display: flex;
   flex-direction: column;
@@ -1390,6 +1551,32 @@ textarea.field__input {
   border: none;
   outline: none;
   font-size: 13px;
+}
+
+/* Category picker in the host editor: toggle chips plus a "new" field. */
+.catpick {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.catpick__new {
+  height: 26px;
+  min-width: 150px;
+  padding: 0 10px;
+  border-radius: 99px;
+  border: 1px dashed var(--border-strong);
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
+  outline: none;
+}
+
+.catpick__new:focus {
+  border-style: solid;
+  border-color: var(--accent-dim);
+  box-shadow: 0 0 0 3px var(--accent-glow);
 }
 
 .proto-picker {
@@ -1838,6 +2025,21 @@ textarea.field__input {
   border: none;
   border-bottom: 1px solid var(--border);
   outline: none;
+}
+
+/* Category filter under the search field. */
+.palette__cats {
+  display: flex;
+  gap: 6px;
+  padding: 8px 14px;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--border);
+  scrollbar-width: none;
+}
+
+.palette__cats .chip {
+  height: 24px;
+  flex-shrink: 0;
 }
 
 .palette__list {

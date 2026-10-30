@@ -1,6 +1,7 @@
 //! loki — an SSH client with an AI assistant beside every terminal.
 
 pub mod ai;
+pub mod categories;
 pub mod commands;
 pub mod crypto;
 pub mod direct;
@@ -97,6 +98,10 @@ pub fn run() {
             commands::vault_lock,
             commands::hosts_list,
             commands::host_save,
+            commands::categories_list,
+            commands::category_save,
+            commands::category_delete,
+            commands::categories_reorder,
             commands::host_delete,
             commands::host_duplicate,
             commands::known_hosts_list,

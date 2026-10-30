@@ -17,6 +17,7 @@ import { UpdateBanner } from "@/components/UpdateBanner";
 import { useUpdates } from "@/app/updates";
 import { isAppShortcut, isMac, isWindows, keyLabel, shortcutKey } from "@/app/platform";
 import { ConfirmHost, Toasts, toast } from "@/components/ui";
+import { categoryColor, sortedCategories } from "@/lib/api";
 import {
   IconForward,
   IconGlobe,
@@ -174,6 +175,38 @@ export function App() {
   );
 }
 
+/**
+ * Open sessions grouped by their host's first category, in category order.
+ * A session sits in one group only, even when its host has several
+ * categories. Without any categorised session there are no headings at all.
+ */
+function groupTabs(
+  tabs: TermTab[],
+  hosts: import("@/lib/api").HostView[],
+  categories: import("@/lib/api").CategoryView[],
+): { name: string | null; color: string; tabs: TermTab[] }[] {
+  const firstCategory = (t: TermTab) => {
+    const host = hosts.find((h) => h.id === t.hostId);
+    return host ? (sortedCategories(host.tags, categories)[0] ?? null) : null;
+  };
+  const keyed = tabs.map((t) => ({ t, cat: firstCategory(t) }));
+  if (keyed.every((k) => k.cat === null)) return [{ name: null, color: "", tabs }];
+
+  const rank = (name: string) => {
+    const i = categories.findIndex((c) => c.name.toLowerCase() === name.toLowerCase());
+    return i < 0 ? categories.length : i;
+  };
+  const names = [...new Set(keyed.flatMap((k) => (k.cat ? [k.cat] : [])))].sort((a, b) => rank(a) - rank(b));
+  const groups = names.map((name) => ({
+    name,
+    color: categoryColor(name, categories),
+    tabs: keyed.filter((k) => k.cat === name).map((k) => k.t),
+  }));
+  const loose = keyed.filter((k) => k.cat === null).map((k) => k.t);
+  if (loose.length) groups.push({ name: "未分类", color: "var(--text-faint)", tabs: loose });
+  return groups;
+}
+
 const TAB_ICON = {
   ssh: <IconServer size={14} />,
   telnet: <IconGlobe size={14} />,
@@ -191,7 +224,9 @@ function Sidebar({
   onNew: () => void;
 }) {
   const page = useApp((s) => s.page);
-  const hostsCount = useApp((s) => s.hosts.length);
+  const hosts = useApp((s) => s.hosts);
+  const categories = useApp((s) => s.categories);
+  const hostsCount = hosts.length;
   const tabs = useTerminals((s) => s.tabs);
   const active = useTerminals((s) => s.active);
   const activate = useTerminals((s) => s.activate);
@@ -232,30 +267,40 @@ function Sidebar({
       </div>
       <div className="sidebar__sessions">
         {tabs.length === 0 && <div className="sidebar__hint">没有打开的会话</div>}
-        {tabs.map((t: TermTab) => (
-          <button
-            key={t.id}
-            className={`session ${page.kind === "terminal" && t.id === active ? "session--active" : ""}`}
-            onClick={() => {
-              activate(t.id);
-              go({ kind: "terminal" });
-            }}
-            title={t.title}
-          >
-            <span className="session__icon">{TAB_ICON[t.kind]}</span>
-            <span className="session__title">{t.title}</span>
-            <span className={`session__dot session__dot--${t.status}`} />
-            <span
-              className="session__close"
-              role="button"
-              onClick={(e) => {
-                e.stopPropagation();
-                void closeTab(t.id);
-              }}
-            >
-              ×
-            </span>
-          </button>
+        {groupTabs(tabs, hosts, categories).map((g) => (
+          <div key={g.name ?? ""} className="sidebar__group">
+            {g.name !== null && (
+              <div className="sidebar__grouphead">
+                <i className="tag__dot" style={{ background: g.color }} />
+                {g.name}
+              </div>
+            )}
+            {g.tabs.map((t: TermTab) => (
+              <button
+                key={t.id}
+                className={`session ${page.kind === "terminal" && t.id === active ? "session--active" : ""}`}
+                onClick={() => {
+                  activate(t.id);
+                  go({ kind: "terminal" });
+                }}
+                title={t.title}
+              >
+                <span className="session__icon">{TAB_ICON[t.kind]}</span>
+                <span className="session__title">{t.title}</span>
+                <span className={`session__dot session__dot--${t.status}`} />
+                <span
+                  className="session__close"
+                  role="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    void closeTab(t.id);
+                  }}
+                >
+                  ×
+                </span>
+              </button>
+            ))}
+          </div>
         ))}
       </div>
 

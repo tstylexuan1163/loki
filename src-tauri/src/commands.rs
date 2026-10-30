@@ -346,7 +346,7 @@ pub fn host_save(state: State<'_, AppState>, host: HostInput) -> Result<String, 
         "address": host.address,
         "port": host.port,
         "username": host.username,
-        "tags": host.tags,
+        "tags": crate::categories::normalize(&host.tags),
         "baud": host.baud,
         "data_bits": host.data_bits,
         "parity": host.parity,
@@ -365,7 +365,283 @@ pub fn host_save(state: State<'_, AppState>, host: HostInput) -> Result<String, 
         .encrypt_item(&id, "host", &payload)
         .map_err(|e| e.to_string())?;
     vault.store().put_item(&row).map_err(|e| e.to_string())?;
+    // A category typed in the editor exists from now on, with its place in
+    // the order, not just as a name on this host.
+    ensure_categories(&vault)?;
     Ok(id)
+}
+
+// ---- Host categories ------------------------------------------------------
+
+/// A category as the UI sees it, with how many hosts are in it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CategoryView {
+    pub id: String,
+    pub name: String,
+    /// A CSS colour picked by the user; `None` means derived from the name.
+    pub color: Option<String>,
+    pub order: i64,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CategoryInput {
+    pub id: Option<String>,
+    pub name: String,
+    pub color: Option<String>,
+}
+
+/// Every category record, decrypted, in display order. Duplicate names (two
+/// devices that created the same category before syncing) show once.
+fn load_categories(vault: &crate::vault::Vault) -> Result<Vec<crate::vault::PlainItem>, String> {
+    let rows = vault.store().list_items().map_err(|e| e.to_string())?;
+    let mut items = Vec::new();
+    for row in rows.iter().filter(|r| r.kind == crate::categories::KIND) {
+        items.push(vault.decrypt_item(row).map_err(|e| e.to_string())?);
+    }
+    let order =
+        |i: &crate::vault::PlainItem| i.payload.get("order").and_then(|v| v.as_i64()).unwrap_or(0);
+    let name = |i: &crate::vault::PlainItem| {
+        i.payload
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    items.sort_by(|a, b| order(a).cmp(&order(b)).then_with(|| name(a).cmp(&name(b))));
+    let mut seen: Vec<String> = Vec::new();
+    items.retain(|i| {
+        let n = name(i);
+        if n.trim().is_empty() || seen.iter().any(|s| crate::categories::same(s, &n)) {
+            return false;
+        }
+        seen.push(n);
+        true
+    });
+    Ok(items)
+}
+
+fn category_name(item: &crate::vault::PlainItem) -> String {
+    item.payload
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn host_tags(item: &crate::vault::PlainItem) -> Vec<String> {
+    item.payload
+        .get("tags")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|t| t.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn decrypted_hosts(vault: &crate::vault::Vault) -> Result<Vec<crate::vault::PlainItem>, String> {
+    let rows = vault.store().list_items().map_err(|e| e.to_string())?;
+    rows.iter()
+        .filter(|r| r.kind == "host")
+        .map(|r| vault.decrypt_item(r).map_err(|e| e.to_string()))
+        .collect()
+}
+
+fn put_category(
+    vault: &crate::vault::Vault,
+    id: &str,
+    name: &str,
+    color: Option<&str>,
+    order: i64,
+) -> Result<(), String> {
+    let row = vault
+        .encrypt_item(
+            id,
+            crate::categories::KIND,
+            &serde_json::json!({ "name": name, "color": color, "order": order }),
+        )
+        .map_err(|e| e.to_string())?;
+    vault.store().put_item(&row).map_err(|e| e.to_string())
+}
+
+/// Gives every name used on a host a category record. This is also how tags
+/// from older versions, imports and sync become categories.
+fn ensure_categories(vault: &crate::vault::Vault) -> Result<(), String> {
+    let cats = load_categories(vault)?;
+    let known: Vec<String> = cats.iter().map(category_name).collect();
+    let hosts = decrypted_hosts(vault)?;
+    let used: Vec<String> = hosts.iter().flat_map(host_tags).collect();
+    let first = cats
+        .iter()
+        .filter_map(|c| c.payload.get("order").and_then(|v| v.as_i64()))
+        .max()
+        .map(|m| m + 1)
+        .unwrap_or(0);
+    // Hosts come back in save order, which says nothing to the user; new
+    // categories line up by name instead.
+    let mut fresh = crate::categories::missing(&known, &used);
+    fresh.sort_by_key(|n| n.to_lowercase());
+    for (order, name) in (first..).zip(fresh) {
+        put_category(vault, &uuid::Uuid::new_v4().to_string(), &name, None, order)?;
+    }
+    Ok(())
+}
+
+/// Applies `edit` to every host's category list, writing only hosts it changed.
+fn rewrite_host_tags(
+    vault: &crate::vault::Vault,
+    edit: impl Fn(&[String]) -> Vec<String>,
+) -> Result<(), String> {
+    for mut item in decrypted_hosts(vault)? {
+        let before = host_tags(&item);
+        let after = edit(&before);
+        if after != before {
+            item.payload["tags"] = serde_json::json!(after);
+            let row = vault
+                .encrypt_item(&item.id, "host", &item.payload)
+                .map_err(|e| e.to_string())?;
+            vault.store().put_item(&row).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+fn list_categories(vault: &crate::vault::Vault) -> Result<Vec<CategoryView>, String> {
+    ensure_categories(vault)?;
+    let hosts = decrypted_hosts(vault)?;
+    Ok(load_categories(vault)?
+        .into_iter()
+        .map(|c| {
+            let name = category_name(&c);
+            let count = hosts
+                .iter()
+                .filter(|h| {
+                    host_tags(h)
+                        .iter()
+                        .any(|t| crate::categories::same(t, &name))
+                })
+                .count();
+            CategoryView {
+                count,
+                color: c
+                    .payload
+                    .get("color")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(String::from),
+                order: c.payload.get("order").and_then(|v| v.as_i64()).unwrap_or(0),
+                name,
+                id: c.id,
+            }
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub fn categories_list(state: State<'_, AppState>) -> Result<Vec<CategoryView>, String> {
+    let vault = state.vault.lock().map_err(|e| e.to_string())?;
+    list_categories(&vault)
+}
+
+/// Creates a category, or renames / recolours one. A rename is applied to
+/// every host in it.
+fn save_category(vault: &crate::vault::Vault, input: &CategoryInput) -> Result<String, String> {
+    let name = crate::categories::valid_name(&input.name)?;
+    let color = input
+        .color
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty());
+    let cats = load_categories(vault)?;
+    if cats.iter().any(|c| {
+        crate::categories::same(&category_name(c), &name) && Some(&c.id) != input.id.as_ref()
+    }) {
+        return Err(format!("已经有名为「{name}」的分类"));
+    }
+    match &input.id {
+        Some(id) => {
+            let current = cats
+                .iter()
+                .find(|c| &c.id == id)
+                .ok_or_else(|| "分类不存在".to_string())?;
+            let old = category_name(current);
+            let order = current
+                .payload
+                .get("order")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            put_category(vault, id, &name, color, order)?;
+            if old != name {
+                rewrite_host_tags(vault, |tags| crate::categories::rename(tags, &old, &name))?;
+            }
+            Ok(id.clone())
+        }
+        None => {
+            let next = cats
+                .iter()
+                .filter_map(|c| c.payload.get("order").and_then(|v| v.as_i64()))
+                .max()
+                .map(|m| m + 1)
+                .unwrap_or(0);
+            let id = uuid::Uuid::new_v4().to_string();
+            put_category(vault, &id, &name, color, next)?;
+            Ok(id)
+        }
+    }
+}
+
+#[tauri::command]
+pub fn category_save(state: State<'_, AppState>, input: CategoryInput) -> Result<String, String> {
+    let vault = state.vault.lock().map_err(|e| e.to_string())?;
+    save_category(&vault, &input)
+}
+
+/// Deletes a category. Its hosts stay; they just lose that category.
+fn delete_category(vault: &crate::vault::Vault, id: &str) -> Result<(), String> {
+    let Some(row) = vault.store().get_item(id).map_err(|e| e.to_string())? else {
+        return Ok(());
+    };
+    if row.kind != crate::categories::KIND {
+        return Err("不是分类".into());
+    }
+    let name = category_name(&vault.decrypt_item(&row).map_err(|e| e.to_string())?);
+    rewrite_host_tags(vault, |tags| crate::categories::remove(tags, &name))?;
+    vault.store().delete_item(id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn category_delete(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let vault = state.vault.lock().map_err(|e| e.to_string())?;
+    delete_category(&vault, &id)
+}
+
+/// Stores a new display order: `ids` first to last.
+fn reorder_categories(vault: &crate::vault::Vault, ids: &[String]) -> Result<(), String> {
+    for (i, id) in ids.iter().enumerate() {
+        let Some(row) = vault.store().get_item(id).map_err(|e| e.to_string())? else {
+            continue;
+        };
+        if row.kind != crate::categories::KIND {
+            continue;
+        }
+        let mut item = vault.decrypt_item(&row).map_err(|e| e.to_string())?;
+        item.payload["order"] = serde_json::json!(i as i64);
+        let row = vault
+            .encrypt_item(id, crate::categories::KIND, &item.payload)
+            .map_err(|e| e.to_string())?;
+        vault.store().put_item(&row).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn categories_reorder(state: State<'_, AppState>, ids: Vec<String>) -> Result<(), String> {
+    let vault = state.vault.lock().map_err(|e| e.to_string())?;
+    reorder_categories(&vault, &ids)
 }
 
 #[tauri::command]
@@ -3400,6 +3676,99 @@ mod tests {
         let row = vault.encrypt_item(id, "provider", &payload).unwrap();
         vault.store().put_item(&row).unwrap();
         vault
+    }
+
+    fn put_host(vault: &Vault, id: &str, tags: &[&str]) {
+        let row = vault
+            .encrypt_item(
+                id,
+                "host",
+                &serde_json::json!({ "name": id, "address": "10.0.0.1", "tags": tags }),
+            )
+            .unwrap();
+        vault.store().put_item(&row).unwrap();
+    }
+
+    fn tags_of(vault: &Vault, id: &str) -> Vec<String> {
+        host_tags(
+            &vault
+                .decrypt_item(&vault.store().get_item(id).unwrap().unwrap())
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn categories_cover_old_tags_and_follow_renames_and_deletes() {
+        let vault = vault_with("p1", serde_json::json!({}));
+        put_host(&vault, "h1", &["prod", "switch"]);
+        put_host(&vault, "h2", &["switch"]);
+
+        // Tags from before categories existed become categories, with counts.
+        let cats = list_categories(&vault).unwrap();
+        let names: Vec<(&str, usize)> = cats.iter().map(|c| (c.name.as_str(), c.count)).collect();
+        assert_eq!(names, vec![("prod", 1), ("switch", 2)]);
+
+        // A duplicate name is refused, ignoring case.
+        let dup = save_category(
+            &vault,
+            &CategoryInput {
+                id: None,
+                name: "PROD".into(),
+                color: None,
+            },
+        );
+        assert!(dup.is_err());
+
+        // Renaming rewrites every host in it.
+        let switch = cats.iter().find(|c| c.name == "switch").unwrap().id.clone();
+        save_category(
+            &vault,
+            &CategoryInput {
+                id: Some(switch.clone()),
+                name: "交换机".into(),
+                color: Some("#4fa".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(tags_of(&vault, "h1"), vec!["prod", "交换机"]);
+        assert_eq!(tags_of(&vault, "h2"), vec!["交换机"]);
+        let renamed = list_categories(&vault).unwrap();
+        let sw = renamed.iter().find(|c| c.id == switch).unwrap();
+        assert_eq!(
+            (sw.name.as_str(), sw.color.as_deref(), sw.count),
+            ("交换机", Some("#4fa"), 2)
+        );
+        // The old name did not come back as a stray category.
+        assert_eq!(renamed.len(), 2);
+
+        // Reordering puts it first.
+        let prod = renamed
+            .iter()
+            .find(|c| c.name == "prod")
+            .unwrap()
+            .id
+            .clone();
+        reorder_categories(&vault, &[switch.clone(), prod.clone()]).unwrap();
+        let order: Vec<String> = list_categories(&vault)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(order, vec!["交换机", "prod"]);
+
+        // Deleting removes it from hosts but keeps the hosts.
+        delete_category(&vault, &switch).unwrap();
+        assert_eq!(tags_of(&vault, "h1"), vec!["prod"]);
+        assert!(tags_of(&vault, "h2").is_empty());
+        let left: Vec<String> = list_categories(&vault)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(left, vec!["prod"]);
+
+        // A category is only ever deleted through its own id.
+        assert!(delete_category(&vault, "h1").is_err());
     }
 
     #[test]

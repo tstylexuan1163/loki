@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { api, errorMessage, type HostView, type VaultStatus } from "@/lib/api";
+import { api, errorMessage, type CategoryView, type HostView, type VaultStatus } from "@/lib/api";
 import { useTerminals } from "@/features/terminal/terminals";
 
 export type Phase = "boot" | "onboarding" | "locked" | "unlocked";
@@ -31,6 +31,8 @@ interface AppState {
   phase: Phase;
   vault: VaultStatus | null;
   hosts: HostView[];
+  /** Host categories in display order. */
+  categories: CategoryView[];
   page: Page;
   error: string | null;
   busy: boolean;
@@ -56,6 +58,7 @@ export const useApp = create<AppState>((set, get) => ({
   phase: "boot",
   vault: null,
   hosts: [],
+  categories: [],
   page: { kind: "hosts" },
   error: null,
   busy: false,
@@ -131,7 +134,10 @@ export const useApp = create<AppState>((set, get) => ({
 
   async refreshHosts() {
     try {
-      set({ hosts: await api.hostsList() });
+      // Categories carry host counts and renames touch hosts, so the two are
+      // always fetched together.
+      const [hosts, categories] = await Promise.all([api.hostsList(), api.categoriesList()]);
+      set({ hosts, categories });
     } catch (e) {
       set({ error: errorMessage(e) });
     }
@@ -181,13 +187,14 @@ async function lockNow(
       vault,
       phase: "locked",
       hosts: [],
+      categories: [],
       page: { kind: "hosts" },
       recoveryCode: null,
     });
   } catch {
     // Locking must always succeed from the user's point of view; if the backend
     // call fails the UI still hides what it holds.
-    set({ phase: "locked", hosts: [], page: { kind: "hosts" }, recoveryCode: null });
+    set({ phase: "locked", hosts: [], categories: [], page: { kind: "hosts" }, recoveryCode: null });
   }
 }
 

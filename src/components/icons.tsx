@@ -107,6 +107,13 @@ export const IconRefresh = make(
 );
 export const IconHome = make(<path d="m3 11 9-7 9 7M5 9.5V20h5v-6h4v6h5V9.5" />);
 export const IconArrowUp = make(<path d="M12 19V5M5 12l7-7 7 7" />);
+export const IconArrowDown = make(<path d="M12 5v14M19 12l-7 7-7-7" />);
+export const IconTag = make(
+  <>
+    <path d="M3 12V4a1 1 0 0 1 1-1h8l9 9-9 9Z" />
+    <circle cx="7.5" cy="7.5" r="1.5" />
+  </>,
+);
 export const IconSparkle = make(
   <path d="M12 3c.4 3.6 2.4 5.6 6 6-3.6.4-5.6 2.4-6 6-.4-3.6-2.4-5.6-6-6 3.6-.4 5.6-2.4 6-6ZM19 15c.2 1.6 1 2.4 2.5 2.5-1.5.2-2.3 1-2.5 2.5-.2-1.5-1-2.3-2.5-2.5 1.5-.1 2.3-.9 2.5-2.5Z" />,
 );

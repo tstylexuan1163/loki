@@ -25,6 +25,8 @@ export interface Prefs {
   /** Poll CPU/memory/disk for the active SSH tab's status bar. */
   showStats: boolean;
   hostsView: HostsView;
+  /** Category sections folded on the hosts page, by category id ("" = 未分类). */
+  collapsedCategories: string[];
   /** Width of the side panel (files / assistant) in pixels. */
   panelWidth: number;
   /**
@@ -57,6 +59,7 @@ const DEFAULTS: Prefs = {
   copyOnSelect: false,
   showStats: true,
   hostsView: "cards",
+  collapsedCategories: [],
   panelWidth: 420,
   recentTargets: [],
   quickProtocol: "ssh",

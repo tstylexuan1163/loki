@@ -4,7 +4,7 @@ import {
   directApi,
   errorMessage,
   keyApi,
-  tagColor,
+  categoryColor,
   type KeyView,
   type Protocol,
   type SerialPortInfo,
@@ -13,13 +13,13 @@ import { useApp, type HostPrefill } from "@/app/store";
 import { Switch, confirmDialog, toast } from "@/components/ui";
 import {
   IconArrowUp,
+  IconCheck,
   IconGlobe,
   IconKey,
   IconRefresh,
   IconServer,
   IconTrash,
   IconUsb,
-  IconX,
 } from "@/components/icons";
 
 const BAUD_RATES = [300, 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400];
@@ -39,6 +39,7 @@ export function HostEditor({
   prefill?: HostPrefill;
 }) {
   const hosts = useApp((s) => s.hosts);
+  const categories = useApp((s) => s.categories);
   const backToHosts = useApp((s) => s.backToHosts);
   const refreshHosts = useApp((s) => s.refreshHosts);
   const existing = useMemo(() => hosts.find((h) => h.id === hostId) ?? null, [hosts, hostId]);
@@ -108,9 +109,26 @@ export function HostEditor({
   // A login name is optional: the connection asks for it when it is missing.
   const canSave = name.trim().length > 0 && address.trim().length > 0;
 
+  // Every known category, plus names picked here that are not saved yet.
+  const choices = useMemo(() => {
+    const names = categories.map((c) => c.name);
+    for (const t of tags) if (!names.some((n) => n.toLowerCase() === t.toLowerCase())) names.push(t);
+    return names;
+  }, [categories, tags]);
+
+  function toggleTag(t: string) {
+    setTags((cur) =>
+      cur.some((x) => x.toLowerCase() === t.toLowerCase())
+        ? cur.filter((x) => x.toLowerCase() !== t.toLowerCase())
+        : [...cur, t],
+    );
+  }
+
   function commitTag() {
     const t = tagDraft.trim().replace(/,$/, "");
-    if (t && !tags.includes(t)) setTags([...tags, t]);
+    // Typing an existing name selects it rather than creating a twin.
+    const known = choices.find((c) => c.toLowerCase() === t.toLowerCase());
+    if (t && !tags.some((x) => x.toLowerCase() === t.toLowerCase())) setTags([...tags, known ?? t]);
     setTagDraft("");
   }
 
@@ -477,19 +495,29 @@ export function HostEditor({
           )}
 
           <section className="card">
-            <div className="card__title">标签</div>
-            <div className="taginput">
-              {tags.map((t) => (
-                <span key={t} className="tag">
-                  <i className="tag__dot" style={{ background: tagColor(t) }} />
-                  {t}
-                  <button type="button" className="tag__x" onClick={() => setTags(tags.filter((x) => x !== t))}>
-                    <IconX size={11} />
+            <div className="card__title">分类</div>
+            <div className="card__hint">可以选多个；都不选就放在「未分类」。</div>
+            <div className="catpick">
+              {choices.map((t) => {
+                const on = tags.some((x) => x.toLowerCase() === t.toLowerCase());
+                return (
+                  <button
+                    key={t}
+                    type="button"
+                    className={`chip ${on ? "chip--on" : ""}`}
+                    aria-pressed={on}
+                    onClick={() => toggleTag(t)}
+                  >
+                    <i className="tag__dot" style={{ background: categoryColor(t, categories) }} />
+                    {t}
+                    {on && <IconCheck size={11} />}
                   </button>
-                </span>
-              ))}
+                );
+              })}
               <input
-                placeholder={tags.length ? "" : "prod、k8s… 回车添加"}
+                className="catpick__new"
+                placeholder="新建分类，回车添加"
+                maxLength={32}
                 value={tagDraft}
                 onChange={(e) => setTagDraft(e.target.value)}
                 onBlur={commitTag}
@@ -498,7 +526,6 @@ export function HostEditor({
                     e.preventDefault();
                     commitTag();
                   }
-                  if (e.key === "Backspace" && !tagDraft && tags.length) setTags(tags.slice(0, -1));
                 }}
               />
             </div>

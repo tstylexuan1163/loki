@@ -3,7 +3,7 @@ import { useApp } from "@/app/store";
 import { usePrefs, type QuickProtocol } from "@/app/prefs";
 import { Modal, Segmented } from "@/components/ui";
 import { IconClock, IconGlobe, IconRefresh, IconServer, IconTerminal, IconUsb } from "@/components/icons";
-import { directApi, parseTarget, type SerialPortInfo } from "@/lib/api";
+import { categoryColor, directApi, parseTarget, type SerialPortInfo } from "@/lib/api";
 import { useTerminals } from "@/features/terminal/terminals";
 
 const BAUD_RATES = [300, 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400];
@@ -38,6 +38,7 @@ function parseTelnet(text: string): { host: string; port: number } | null {
  */
 export function QuickConnect({ onClose }: { onClose: () => void }) {
   const hosts = useApp((s) => s.hosts);
+  const categories = useApp((s) => s.categories);
   const recent = usePrefs((s) => s.recentTargets);
   const addRecent = usePrefs((s) => s.addRecent);
   const savedProtocol = usePrefs((s) => s.quickProtocol);
@@ -52,6 +53,8 @@ export function QuickConnect({ onClose }: { onClose: () => void }) {
   const [protocol, setProtocol] = useState<QuickProtocol>(savedProtocol);
   const [text, setText] = useState("");
   const [cursor, setCursor] = useState(0);
+  // Show only the saved hosts of one category; null shows everything.
+  const [category, setCategory] = useState<string | null>(null);
 
   // Serial form.
   const [ports, setPorts] = useState<SerialPortInfo[]>([]);
@@ -86,13 +89,23 @@ export function QuickConnect({ onClose }: { onClose: () => void }) {
   const matches = useMemo(
     () =>
       hosts
+        .filter((h) => !category || h.tags.some((t) => t.toLowerCase() === category.toLowerCase()))
         .filter(
           (h) =>
             !q ||
             [h.name, h.address, h.username, ...h.tags].some((f) => f.toLowerCase().includes(q)),
         )
-        .slice(0, 8),
-    [hosts, q],
+        // A picked category is a short list worth showing whole.
+        .slice(0, category ? 50 : 8),
+    [hosts, q, category],
+  );
+  // Categories that have hosts for this protocol tab.
+  const chips = categories.filter((c) =>
+    hosts.some(
+      (h) =>
+        (protocol !== "telnet" || h.protocol === "telnet") &&
+        h.tags.some((t) => t.toLowerCase() === c.name.toLowerCase()),
+    ),
   );
 
   const sshTarget = parseTarget(text, "root");
@@ -151,13 +164,14 @@ export function QuickConnect({ onClose }: { onClose: () => void }) {
         sub:
           h.protocol === "serial"
             ? h.address
-            : `${h.username}@${h.address}:${h.port}`,
+            : `${h.username ? `${h.username}@` : ""}${h.address}:${h.port}`,
         icon: <IconServer size={15} />,
         run: () => go(() => openHost(h)),
       });
     }
     // Bare SSH recents. Anything with a scheme belongs to another protocol.
-    for (const r of recent.filter((r) => !r.includes("://"))) {
+    // They have no category, so a category filter hides them.
+    for (const r of category ? [] : recent.filter((r) => !r.includes("://"))) {
       if (q && !r.toLowerCase().includes(q)) continue;
       const t = parseTarget(r, "root");
       if (t)
@@ -169,7 +183,7 @@ export function QuickConnect({ onClose }: { onClose: () => void }) {
         });
     }
     // Unchanged from before: the local shell is reachable by typing "local".
-    if (!q || "local 本地".includes(q)) {
+    if (!category && (!q || "local 本地".includes(q))) {
       rows.push({
         label: "本地终端",
         sub: "在这台电脑上打开 shell",
@@ -196,7 +210,7 @@ export function QuickConnect({ onClose }: { onClose: () => void }) {
         run: () => go(() => openHost(h)),
       });
     }
-    for (const r of recent.filter((r) => r.startsWith(TELNET_SCHEME))) {
+    for (const r of category ? [] : recent.filter((r) => r.startsWith(TELNET_SCHEME))) {
       const label = r.slice(TELNET_SCHEME.length);
       if (q && !label.toLowerCase().includes(q)) continue;
       const t = parseTelnet(label);
@@ -393,6 +407,33 @@ export function QuickConnect({ onClose }: { onClose: () => void }) {
             }}
             onKeyDown={onKeyDown}
           />
+          {chips.length > 0 && (
+            // Keep the caret in the search field so ↑↓ and Enter still work.
+            <div className="palette__cats" onMouseDown={(e) => e.preventDefault()}>
+              <button
+                className={`chip ${category === null ? "chip--on" : ""}`}
+                onClick={() => {
+                  setCategory(null);
+                  setCursor(0);
+                }}
+              >
+                全部
+              </button>
+              {chips.map((c) => (
+                <button
+                  key={c.id}
+                  className={`chip ${category === c.name ? "chip--on" : ""}`}
+                  onClick={() => {
+                    setCategory(category === c.name ? null : c.name);
+                    setCursor(0);
+                  }}
+                >
+                  <i className="tag__dot" style={{ background: categoryColor(c.name, categories) }} />
+                  {c.name}
+                </button>
+              ))}
+            </div>
+          )}
           <div className="palette__list">
             {rows.length === 0 && (
               <div className="palette__empty">
