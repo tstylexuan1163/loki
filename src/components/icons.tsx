@@ -108,6 +108,12 @@ export const IconRefresh = make(
 export const IconHome = make(<path d="m3 11 9-7 9 7M5 9.5V20h5v-6h4v6h5V9.5" />);
 export const IconArrowUp = make(<path d="M12 19V5M5 12l7-7 7 7" />);
 export const IconArrowDown = make(<path d="M12 5v14M19 12l-7 7-7-7" />);
+export const IconSidebar = make(
+  <>
+    <rect x="3" y="4" width="18" height="16" rx="2" />
+    <path d="M9 4v16" />
+  </>,
+);
 export const IconTag = make(
   <>
     <path d="M3 12V4a1 1 0 0 1 1-1h8l9 9-9 9Z" />

@@ -2,6 +2,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import { listen } from "@tauri-apps/api/event";
 import logoUrl from "@/assets/logo.png";
 import { useApp } from "@/app/store";
+import { usePrefs } from "@/app/prefs";
 import { Gate } from "@/features/gate/Gate";
 import { HostEditor } from "@/features/hosts/HostEditor";
 import { HostsPage } from "@/features/hosts/HostsPage";
@@ -27,6 +28,7 @@ import {
   IconSearch,
   IconServer,
   IconSettings,
+  IconSidebar,
   IconTerminal,
   IconUsb,
 } from "@/components/icons";
@@ -103,6 +105,9 @@ export function App() {
       } else if (key === ",") {
         e.preventDefault();
         setSettingsOpen(true);
+      } else if (key === "b") {
+        e.preventDefault();
+        toggleSidebarRail();
       } else if (key === "l" && (!isMac || !e.shiftKey)) {
         e.preventDefault();
         void lock();
@@ -207,6 +212,17 @@ function groupTabs(
   return groups;
 }
 
+/**
+ * Folds or unfolds the sidebar for the page being shown: on the terminal page
+ * it starts folded so the terminal gets the width, elsewhere it starts open.
+ */
+function toggleSidebarRail() {
+  const inTerminal = useApp.getState().page.kind === "terminal";
+  const prefs = usePrefs.getState();
+  const key = inTerminal ? "railInTerminal" : "railElsewhere";
+  prefs.set(key, !prefs[key]);
+}
+
 const TAB_ICON = {
   ssh: <IconServer size={14} />,
   telnet: <IconGlobe size={14} />,
@@ -232,11 +248,15 @@ function Sidebar({
   const activate = useTerminals((s) => s.activate);
   const closeTab = useTerminals((s) => s.closeTab);
   const go = (p: typeof page) => useApp.setState({ page: p });
+  const railInTerminal = usePrefs((s) => s.railInTerminal);
+  const railElsewhere = usePrefs((s) => s.railElsewhere);
+  const rail = page.kind === "terminal" ? railInTerminal : railElsewhere;
+  const toggleRail = toggleSidebarRail;
 
   const isHosts = page.kind === "hosts" || page.kind === "host-edit";
 
   return (
-    <nav className="sidebar">
+    <nav className={`sidebar ${rail ? "sidebar--rail" : ""}`}>
       <div className="sidebar__section">
         <NavItem
           icon={<IconServer size={16} />}
@@ -270,7 +290,7 @@ function Sidebar({
         {groupTabs(tabs, hosts, categories).map((g) => (
           <div key={g.name ?? ""} className="sidebar__group">
             {g.name !== null && (
-              <div className="sidebar__grouphead">
+              <div className="sidebar__grouphead" title={g.name}>
                 <i className="tag__dot" style={{ background: g.color }} />
                 {g.name}
               </div>
@@ -309,6 +329,13 @@ function Sidebar({
       <div className="sidebar__section sidebar__section--bottom">
         <NavItem icon={<IconSettings size={16} />} label="设置" hint={keyLabel(",")} active={false} onClick={onSettings} />
         <NavItem icon={<IconLock size={16} />} label="锁定" hint={keyLabel("L")} active={false} onClick={onLock} />
+        <NavItem
+          icon={<IconSidebar size={16} />}
+          label={rail ? "展开侧栏" : "收起侧栏"}
+          hint={keyLabel("B")}
+          active={false}
+          onClick={toggleRail}
+        />
       </div>
     </nav>
   );
@@ -330,7 +357,8 @@ function NavItem({
   onClick: () => void;
 }) {
   return (
-    <button className={`nav ${active ? "nav--active" : ""}`} onClick={onClick}>
+    // The title is the label's stand-in when the sidebar is folded to icons.
+    <button className={`nav ${active ? "nav--active" : ""}`} onClick={onClick} title={label}>
       <span className="nav__icon">{icon}</span>
       <span className="nav__label">{label}</span>
       {count != null && <span className="nav__count">{count}</span>}

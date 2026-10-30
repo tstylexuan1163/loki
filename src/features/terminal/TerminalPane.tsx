@@ -144,7 +144,7 @@ export function TerminalPane({ tabId, sessionId, active, onInput, onResize }: Te
         return false;
       }
       // Let app-level shortcuts (tabs, find, ...) through to the window.
-      return !["t", "w", "f", "d", "l", "1", "2", "3", "4", "5", "6", "7", "8", "9", "[", "]", ","].includes(
+      return !["t", "w", "f", "d", "l", "b", "1", "2", "3", "4", "5", "6", "7", "8", "9", "[", "]", ","].includes(
         key,
       );
     });

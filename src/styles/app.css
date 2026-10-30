@@ -356,6 +356,67 @@ kbd,
   padding: 6px 10px;
 }
 
+/*
+ * Folded sidebar: an icon rail. Labels become tooltips (`title`), a session
+ * keeps its icon with the status dot on its corner, and a category heading
+ * shrinks to a short coloured bar. No width transition: every frame of it
+ * would refit the terminals beside it.
+ */
+.sidebar--rail {
+  width: 56px;
+  padding: 10px 6px;
+}
+
+.sidebar--rail .nav {
+  justify-content: center;
+  padding: 0;
+}
+
+.sidebar--rail .nav__label,
+.sidebar--rail .nav__count,
+.sidebar--rail .nav__hint,
+.sidebar--rail .sidebar__head > span,
+.sidebar--rail .sidebar__hint,
+.sidebar--rail .session__title,
+.sidebar--rail .session__close {
+  display: none;
+}
+
+.sidebar--rail .sidebar__head {
+  justify-content: center;
+  margin: 14px 0 4px;
+}
+
+.sidebar--rail .session {
+  position: relative;
+  justify-content: center;
+  padding: 0;
+  height: 34px;
+}
+
+.sidebar--rail .session__icon {
+  color: inherit;
+}
+
+.sidebar--rail .session__dot {
+  position: absolute;
+  right: 9px;
+  bottom: 7px;
+  box-shadow: 0 0 0 2px var(--bg-elevated);
+}
+
+.sidebar--rail .sidebar__grouphead {
+  justify-content: center;
+  padding: 6px 0 2px;
+  font-size: 0;
+}
+
+.sidebar--rail .sidebar__grouphead .tag__dot {
+  width: 18px;
+  height: 3px;
+  border-radius: 2px;
+}
+
 /* Open sessions, grouped by their host's category. */
 .sidebar__group {
   display: flex;
@@ -3936,6 +3997,19 @@ textarea.field__input {
   border-color: var(--border-strong);
 }
 
+/* Day/night is decided by the terminal scheme while the chrome follows it. */
+.theme-picker--locked .theme-card {
+  opacity: 0.45;
+}
+
+.theme-picker--locked .theme-card:hover {
+  border-color: var(--border);
+}
+
+.settings__row--spaced {
+  margin-top: 22px;
+}
+
 .theme-card--on {
   border-color: var(--accent);
   box-shadow: 0 0 0 1px var(--accent) inset;
@@ -4170,8 +4244,8 @@ textarea.field__input {
 }
 
 .notice--ok {
-  background: rgba(46, 230, 168, 0.1);
-  border-color: rgba(46, 230, 168, 0.3);
+  background: var(--accent-soft);
+  border-color: var(--accent-dim);
   color: var(--text);
 }
 

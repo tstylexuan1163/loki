@@ -15,6 +15,8 @@ export interface Prefs {
   autoLockMinutes: number;
   /** Terminal colour scheme id, see `features/terminal/themes.ts`. */
   terminalScheme: string;
+  /** Colours of the app around the terminal, see `app/chrome.ts`. */
+  chromeStyle: import("@/app/chrome").ChromeStyle;
   fontSize: number;
   fontFamily: string;
   lineHeight: number;
@@ -25,6 +27,12 @@ export interface Prefs {
   /** Poll CPU/memory/disk for the active SSH tab's status bar. */
   showStats: boolean;
   hostsView: HostsView;
+  /**
+   * Whether the sidebar is folded to an icon rail. Remembered separately for
+   * the terminal page, where width goes to the terminal, and everywhere else.
+   */
+  railInTerminal: boolean;
+  railElsewhere: boolean;
   /** Category sections folded on the hosts page, by category id ("" = 未分类). */
   collapsedCategories: string[];
   /** Width of the side panel (files / assistant) in pixels. */
@@ -50,6 +58,7 @@ export const FONT_CHOICES = [
 const DEFAULTS: Prefs = {
   autoLockMinutes: 15,
   terminalScheme: "loki",
+  chromeStyle: "loki",
   fontSize: 13,
   fontFamily: FONT_CHOICES[0].value,
   lineHeight: 1.25,
@@ -60,6 +69,8 @@ const DEFAULTS: Prefs = {
   showStats: true,
   hostsView: "cards",
   collapsedCategories: [],
+  railInTerminal: true,
+  railElsewhere: false,
   panelWidth: 420,
   recentTargets: [],
   quickProtocol: "ssh",
