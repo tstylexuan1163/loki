@@ -56,7 +56,7 @@ The interface is currently in Simplified Chinese.
 | **Import** | Bring hosts in from `~/.ssh/config`, including identity files and ProxyJump |
 | **Vault** | Master password with a one-time recovery code you can copy or save to a file; auto-lock after inactivity |
 | **Sync (optional)** | To a Cloudflare Worker + D1 that *you* deploy; the server only ever sees ciphertext — see [`workers/sync`](workers/sync) |
-| **Look** | Dark and light themes (or follow the system); 10 terminal colour schemes (loki, One Dark, Dracula, Nord, Tokyo Night, Catppuccin Mocha, Gruvbox, Solarized dark/light, GitHub Light); font, size, cursor and scrollback settings |
+| **Look** | Dark and light themes (or follow the system); the app around the terminal in loki green, warm grey, or coloured from the terminal scheme; the sidebar folds to icons beside terminals; 10 terminal colour schemes (loki, One Dark, Dracula, Nord, Tokyo Night, Catppuccin Mocha, Gruvbox, Solarized dark/light, GitHub Light); font, size, cursor and scrollback settings |
 | **Updates** | Checks for new releases and installs them in place; every update package is signature-verified |
 
 <table>

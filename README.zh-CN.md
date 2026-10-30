@@ -54,7 +54,7 @@
 | **导入** | 从 `~/.ssh/config` 一键导入主机，私钥文件和跳板机一并带入 |
 | **保险库** | 主密码 + 一次性恢复码（可复制或保存为文件）；空闲自动锁定 |
 | **同步（可选）** | 同步到**你自己**部署的 Cloudflare Worker + D1，服务端只见到密文，见 [`workers/sync`](workers/sync) |
-| **外观** | 深色、浅色或跟随系统；10 套终端配色（loki、One Dark、Dracula、Nord、Tokyo Night、Catppuccin Mocha、Gruvbox、Solarized 深/浅、GitHub Light）；字体、字号、光标、回滚行数可调 |
+| **外观** | 深色、浅色或跟随系统；界面配色可选 loki 墨绿、暖灰或跟随终端配色；终端页侧栏自动收成图标栏；10 套终端配色（loki、One Dark、Dracula、Nord、Tokyo Night、Catppuccin Mocha、Gruvbox、Solarized 深/浅、GitHub Light）；字体、字号、光标、回滚行数可调 |
 | **更新** | 应用内检查并安装新版本，每个更新包都强制校验签名 |
 
 <table>

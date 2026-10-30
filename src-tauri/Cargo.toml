@@ -1,6 +1,6 @@
 [package]
 name = "loki"
-version = "0.11.2"
+version = "0.11.3"
 description = "loki — an SSH client with an AI assistant beside every terminal"
 authors = ["loki contributors"]
 edition = "2021"
