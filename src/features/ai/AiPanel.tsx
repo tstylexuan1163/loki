@@ -873,28 +873,48 @@ function ToolGroup({
   calls: ToolCallView[];
   onApprove: (id: string, approved: boolean) => void;
 }) {
-  const pending = calls.some((c) => !c.result);
   const failed = calls.filter((c) => c.result && !c.result.ok).length;
+  // Only the user opens or closes the list. Tying it to "a call is running"
+  // made it flap open and shut on every call while the model worked.
   const [open, setOpen] = useState(false);
-  const expanded = open || pending || calls.length === 1;
+  const running = calls.find((c) => !c.result && c.auto);
+  // A call waiting for approval is shown even when folded: it needs a click.
+  const asking = calls.filter((c) => !c.result && !c.auto);
+  const pending = !!running || asking.length > 0;
 
+  if (calls.length === 1) {
+    const c = calls[0];
+    return (
+      <div className={`steps ${failed ? "steps--warn" : ""}`}>
+        <div className="steps__list">
+          <ToolRow call={c} onApprove={(ok) => onApprove(c.id, ok)} />
+        </div>
+      </div>
+    );
+  }
+
+  const shown = open ? calls : asking;
   return (
     <div className={`steps ${failed ? "steps--warn" : ""}`}>
-      {calls.length > 1 && (
-        <button className="steps__head" onClick={() => setOpen(!open)} disabled={pending}>
-          <IconChevronRight size={12} className={`steps__chev ${expanded ? "steps__chev--open" : ""}`} />
-          <span>
-            {pending ? "正在执行" : "执行了"} {calls.length} 步
-            {failed > 0 && <span className="steps__failed"> · {failed} 步失败</span>}
-          </span>
-          <span className="steps__names">
-            {[...new Set(calls.map((c) => TOOL_LABEL[c.name] ?? c.name))].join("、")}
-          </span>
-        </button>
-      )}
-      {expanded && (
+      <button className="steps__head" onClick={() => setOpen(!open)}>
+        {running ? (
+          <span className="spinner spinner--xs" />
+        ) : (
+          <IconChevronRight size={12} className={`steps__chev ${open ? "steps__chev--open" : ""}`} />
+        )}
+        <span>
+          {pending ? "正在执行" : "执行了"} {calls.length} 步
+          {failed > 0 && <span className="steps__failed"> · {failed} 步失败</span>}
+        </span>
+        <span className="steps__names">
+          {running
+            ? `${TOOL_LABEL[running.name] ?? running.name} ${summarize(running.args)}`
+            : [...new Set(calls.map((c) => TOOL_LABEL[c.name] ?? c.name))].join("、")}
+        </span>
+      </button>
+      {shown.length > 0 && (
         <div className="steps__list">
-          {calls.map((c) => (
+          {shown.map((c) => (
             <ToolRow key={c.id} call={c} onApprove={(ok) => onApprove(c.id, ok)} />
           ))}
         </div>
