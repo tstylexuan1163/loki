@@ -74,6 +74,10 @@ pub async fn prepare_batch(
 
 /// Writes one file into `dir` and checks it on the server.
 ///
+/// `report(sent, total)` is called as chunks go out (at most ten times a
+/// second, and once at the end), so a large file shows real progress rather
+/// than sitting at 0% until it is done.
+///
 /// Returns the remote path and whether the hash matched. A server without
 /// `sha256sum` or `shasum` yields `false`, not an error: the copy may still be
 /// fine, we just could not prove it.
@@ -83,11 +87,33 @@ pub async fn upload_file(
     dir: &str,
     name: &str,
     bytes: &[u8],
+    report: impl FnMut(u64, u64),
 ) -> Result<(String, bool), String> {
+    use russh_sftp::protocol::OpenFlags;
+    use tokio::io::AsyncWriteExt;
+
     let remote_path = format!("{dir}/{name}");
     let part = format!("{remote_path}.part");
 
-    crate::sftp::write_file(sftp, &part, bytes).await?;
+    let mut progress = crate::transfer::Progress::new(bytes.len() as u64, report);
+    let mut dst = sftp
+        .open_with_flags(
+            &part,
+            OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE,
+        )
+        .await
+        .map_err(|e| format!("无法写入 {part}：{e}"))?;
+    for chunk in bytes.chunks(crate::transfer::CHUNK) {
+        dst.write_all(chunk)
+            .await
+            .map_err(|e| format!("写入 {part} 失败：{e}"))?;
+        progress.add(chunk.len() as u64);
+    }
+    dst.shutdown()
+        .await
+        .map_err(|e| format!("关闭 {part} 失败：{e}"))?;
+    progress.finish();
+
     crate::sftp::rename(sftp, &part, &remote_path).await?;
     let _ = set_mode(sftp, &remote_path, 0o600).await;
 

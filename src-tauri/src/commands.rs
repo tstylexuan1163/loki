@@ -1717,17 +1717,37 @@ pub fn ai_conversation_get(
     Ok(Some(item.payload))
 }
 
+/// The id comes from the panel; it must never replace a host or a key.
+fn conversation_id_free(vault: &crate::vault::Vault, id: &str) -> Result<(), String> {
+    match vault.store().get_item(id).map_err(|e| e.to_string())? {
+        Some(existing) if existing.kind != "ai_conversation" => {
+            Err("对话 id 与其他记录冲突".into())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Drops the oldest conversations once there are too many.
+///
+/// Runs on every save, so it works from the row metadata alone: decrypting
+/// every stored conversation each time would grow with the history and hold
+/// the vault lock while it did.
 fn prune_conversations(vault: &crate::vault::Vault) -> Result<(), String> {
-    let mut rows: Vec<(crate::store::ItemRow, serde_json::Value)> = all_conversations(vault)?;
+    let mut rows: Vec<crate::store::ItemRow> = vault
+        .store()
+        .list_items()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|r| r.kind == "ai_conversation")
+        .collect();
     let limit = crate::ai::conversation::MAX_CONVERSATIONS;
     if rows.len() <= limit {
         return Ok(());
     }
     // Oldest first, and remove the surplus from that end.
-    rows.sort_by_key(|r| r.0.updated_at);
+    rows.sort_by_key(|r| r.updated_at);
     let surplus = rows.len() - limit;
-    for (row, _) in rows.into_iter().take(surplus) {
+    for row in rows.into_iter().take(surplus) {
         vault
             .store()
             .delete_item(&row.id)
@@ -1752,6 +1772,7 @@ pub fn ai_conversation_save(
         .filter(|s| !s.is_empty())
         .ok_or("缺少对话 id")?
         .to_string();
+    conversation_id_free(&vault, &id)?;
 
     let mut payload = crate::ai::conversation::truncate(conversation);
     if let Some(obj) = payload.as_object_mut() {
@@ -2196,10 +2217,10 @@ pub async fn ai_send(
         _ => crate::ai::tools::PermissionMode::Manual,
     };
 
-    let session = match session_id {
+    let session = match &session_id {
         Some(id) => {
             let mgr = state.ssh.lock().map_err(|e| e.to_string())?;
-            mgr.get(&id)
+            mgr.get(id)
         }
         None => None,
     };
@@ -2213,21 +2234,29 @@ pub async fn ai_send(
     // Attachments are described here, not by the panel: the content must never
     // pass through the WebView. Marking them `sent` also makes detach keep the
     // uploaded copy, since the model has already been told the path.
-    let (block, secret_paths) = match attachments.filter(|list| !list.is_empty()) {
-        None => (String::new(), Vec::new()),
+    let block = match attachments.filter(|list| !list.is_empty()) {
+        None => String::new(),
         Some(list) => {
             let mut rows = Vec::new();
-            let mut secrets = Vec::new();
             {
                 let mut reg = state.attachments.lock().map_err(|e| e.to_string())?;
+                // A file staged on one server means nothing on another: refuse
+                // the whole message rather than hand the model a wrong path.
+                for want in &list {
+                    if let Some(item) = reg.items.get(&want.id) {
+                        if session_id.as_deref() != Some(item.session_id.as_str()) {
+                            return Err(format!(
+                                "{} 上传在另一个会话的服务器上，请在当前会话重新附加",
+                                item.name
+                            ));
+                        }
+                    }
+                }
                 for want in &list {
                     let Some(item) = reg.items.get_mut(&want.id) else {
                         continue;
                     };
                     item.sent = true;
-                    if item.secret {
-                        secrets.push(item.remote_path.clone());
-                    }
                     rows.push((
                         item.name.clone(),
                         item.size,
@@ -2255,8 +2284,19 @@ pub async fn ai_send(
                     content: r.5.as_deref(),
                 })
                 .collect();
-            (crate::ai::attach::describe(&descs), secrets)
+            crate::ai::attach::describe(&descs)
         }
+    };
+
+    // Every key staged for this session stays opaque for the rest of the
+    // conversation, not only in the turn that attached it.
+    let secret_paths = match &session_id {
+        None => Vec::new(),
+        Some(sid) => state
+            .attachments
+            .lock()
+            .map_err(|e| e.to_string())?
+            .secret_paths(sid),
     };
 
     let mut history = history;
@@ -2368,6 +2408,15 @@ impl AttachRegistry {
         self.items.clear();
         self.batches.clear();
     }
+
+    /// Remote paths of the private keys staged for one session.
+    pub fn secret_paths(&self, session_id: &str) -> Vec<String> {
+        self.items
+            .values()
+            .filter(|a| a.secret && a.session_id == session_id)
+            .map(|a| a.remote_path.clone())
+            .collect()
+    }
 }
 
 /// What the panel learns about an attachment: no content and no local path.
@@ -2455,25 +2504,23 @@ pub async fn ai_attach(
         let shareable = kind == "text" && !secret && (size as usize) <= attach::SHARE_LIMIT;
 
         let id = uuid::Uuid::new_v4().to_string();
-        let _ = app.emit(
-            "attach-progress",
-            serde_json::json!({ "id": id, "name": name, "percent": 0 }),
-        );
-
+        // Progress follows the bytes actually written. At 100% the hash check
+        // on the server is still running; `done` marks the end of both.
+        let emit = |percent: u64, done: bool| {
+            let _ = app.emit(
+                "attach-progress",
+                serde_json::json!({ "id": id, "name": name, "percent": percent, "done": done }),
+            );
+        };
+        emit(0, false);
         let (remote_path, verified) = {
             let guard = sftp.lock().await;
-            crate::ai::staging::upload_file(&session, &guard, &dir, &name, &bytes).await?
+            crate::ai::staging::upload_file(&session, &guard, &dir, &name, &bytes, |sent, total| {
+                emit((sent * 100).checked_div(total).unwrap_or(100), false)
+            })
+            .await?
         };
-
-        let _ = app.emit(
-            "attach-progress",
-            serde_json::json!({ "id": id, "name": name, "percent": 60 }),
-        );
-
-        let _ = app.emit(
-            "attach-progress",
-            serde_json::json!({ "id": id, "name": name, "percent": 100 }),
-        );
+        emit(100, true);
 
         let content = if shareable {
             Some(String::from_utf8_lossy(&bytes).to_string())
@@ -2497,10 +2544,10 @@ pub async fn ai_attach(
 
         {
             let mut reg = state.attachments.lock().map_err(|e| e.to_string())?;
-            reg.batches
-                .entry(session_id.clone())
-                .or_default()
-                .push(record.batch_dir.clone());
+            let dirs = reg.batches.entry(session_id.clone()).or_default();
+            if !dirs.contains(&record.batch_dir) {
+                dirs.push(record.batch_dir.clone());
+            }
             reg.items.insert(id.clone(), record);
         }
 
@@ -3299,6 +3346,72 @@ mod tests {
         let row = vault.encrypt_item(id, "provider", &payload).unwrap();
         vault.store().put_item(&row).unwrap();
         vault
+    }
+
+    #[test]
+    fn saving_a_conversation_cannot_replace_another_record() {
+        let vault = vault_with("h1", serde_json::json!({ "name": "prod" }));
+        assert!(conversation_id_free(&vault, "h1").is_err());
+        assert!(conversation_id_free(&vault, "new-id").is_ok());
+    }
+
+    #[test]
+    fn pruning_keeps_the_newest_conversations_and_nothing_else() {
+        let vault = vault_with("h1", serde_json::json!({ "name": "prod" }));
+        let limit = crate::ai::conversation::MAX_CONVERSATIONS;
+        for i in 0..limit + 3 {
+            let mut row = vault
+                .encrypt_item(&format!("c{i}"), "ai_conversation", &serde_json::json!({}))
+                .unwrap();
+            row.updated_at = 1_000 + i as i64;
+            vault.store().put_item(&row).unwrap();
+        }
+        prune_conversations(&vault).unwrap();
+
+        let rows = vault.store().list_items().unwrap();
+        let convs: Vec<&str> = rows
+            .iter()
+            .filter(|r| r.kind == "ai_conversation")
+            .map(|r| r.id.as_str())
+            .collect();
+        assert_eq!(convs.len(), limit);
+        for gone in ["c0", "c1", "c2"] {
+            assert!(!convs.contains(&gone), "{gone} should have been pruned");
+        }
+        // Other records are never counted or removed.
+        assert!(rows.iter().any(|r| r.id == "h1"));
+    }
+
+    #[test]
+    fn secret_paths_are_per_session() {
+        let mut reg = AttachRegistry::default();
+        for (id, session, secret) in [("a", "s1", true), ("b", "s1", false), ("c", "s2", true)] {
+            reg.items.insert(
+                id.into(),
+                Attachment {
+                    id: id.into(),
+                    session_id: session.into(),
+                    name: format!("{id}.key"),
+                    size: 1,
+                    sha256: String::new(),
+                    kind: "text".into(),
+                    secret,
+                    remote_path: format!("/home/u/.loki/uploads/x/{id}.key"),
+                    batch_dir: "/home/u/.loki/uploads/x".into(),
+                    content: None,
+                    sent: true,
+                },
+            );
+        }
+        assert_eq!(
+            reg.secret_paths("s1"),
+            vec!["/home/u/.loki/uploads/x/a.key"]
+        );
+        assert_eq!(
+            reg.secret_paths("s2"),
+            vec!["/home/u/.loki/uploads/x/c.key"]
+        );
+        assert!(reg.secret_paths("s3").is_empty());
     }
 
     #[test]

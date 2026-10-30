@@ -29,53 +29,47 @@ enum State {
     EscCharset,
 }
 
+/// Longest line kept before it is written out anyway: output with no newline
+/// at all (a binary dump) must not grow without bound.
+const MAX_LINE: usize = 16 * 1024;
+
 /// Turns terminal output into readable text.
 ///
-/// Stateful on purpose: escape sequences and a trailing `\r` may be split across
-/// reads, and a stateless filter would leak a fragment into the file.
+/// The current line is kept as a row of cells with a cursor, the way a
+/// terminal would draw it, and written out when a newline ends it. That is
+/// what makes pagers come out clean: a switch prints ` --More-- `, then on the
+/// next key sends `\r`, spaces and `\r` (Cisco) or `ESC [ 42 D` plus `ESC [ K`
+/// (Huawei, H3C) to wipe it, and the configuration line that follows simply
+/// overwrites those cells. Progress bars redrawn with `\r` keep only their last
+/// state, and a shell's `\b \b` erases a character.
+///
+/// Limits (plain text, not an emulator): cursor moves to another row are
+/// ignored, wide CJK characters count as one cell, and trailing spaces on a
+/// line are trimmed. Sequences may be split across reads; the state carries
+/// over.
 #[derive(Default)]
 pub struct PlainText {
     state: State,
-    /// A CR is held until we learn whether an LF follows: CRLF becomes LF, a
-    /// lone CR (progress redraw) is dropped.
-    pending_cr: bool,
-    /// Last byte written, so a backspace can erase it.
-    last: Option<u8>,
+    /// Parameter bytes of the CSI being read, e.g. `42` in `ESC [ 42 D`.
+    params: Vec<u8>,
+    /// The line being drawn, and where the cursor is in it.
+    line: Vec<char>,
+    col: usize,
+    /// Bytes of a UTF-8 character that has not fully arrived yet.
+    utf8: Vec<u8>,
 }
 
 impl PlainText {
     pub fn push(&mut self, input: &[u8], out: &mut Vec<u8>) {
         for &b in input {
             match self.state {
-                State::Ground => match b {
-                    0x1b => {
-                        self.flush_cr(out);
-                        self.state = State::Esc;
-                    }
-                    b'\r' => {
-                        // Wait for a possible LF.
-                        self.pending_cr = true;
-                    }
-                    b'\n' => {
-                        self.pending_cr = false;
-                        self.emit(b'\n', out);
-                    }
-                    0x08 => {
-                        self.pending_cr = false;
-                        self.backspace(out);
-                    }
-                    // Other C0 controls (BEL, NUL, …) carry nothing readable.
-                    0x00..=0x1f | 0x7f => {
-                        self.pending_cr = false;
-                    }
-                    _ => {
-                        self.flush_cr(out);
-                        self.emit(b, out);
-                    }
-                },
+                State::Ground => self.ground(b, out),
                 State::Esc => {
                     self.state = match b {
-                        b'[' => State::Csi,
+                        b'[' => {
+                            self.params.clear();
+                            State::Csi
+                        }
                         b']' => State::Osc,
                         // Charset designation: `ESC ( B` has one payload byte.
                         b'(' | b')' | b'*' | b'+' => State::EscCharset,
@@ -85,7 +79,10 @@ impl PlainText {
                 }
                 State::Csi => {
                     if (0x40..=0x7e).contains(&b) {
+                        self.csi(b);
                         self.state = State::Ground;
+                    } else if self.params.len() < 32 {
+                        self.params.push(b);
                     }
                 }
                 State::Osc => match b {
@@ -105,33 +102,139 @@ impl PlainText {
         }
     }
 
-    /// Ends the stream: any held CR is discarded, which is what a lone CR means.
-    pub fn finish(&mut self, _out: &mut Vec<u8>) {
-        self.pending_cr = false;
+    /// Ends the stream: an unfinished last line (a prompt) is written as is.
+    pub fn finish(&mut self, out: &mut Vec<u8>) {
         self.state = State::Ground;
+        self.utf8.clear();
+        if self.line.iter().any(|c| *c != ' ') {
+            self.emit_line(out, false);
+        }
+        self.line.clear();
+        self.col = 0;
     }
 
-    fn emit(&mut self, b: u8, out: &mut Vec<u8>) {
-        out.push(b);
-        self.last = Some(b);
-    }
-
-    /// A pending CR is a carriage return with no newline: dropped.
-    fn flush_cr(&mut self, _out: &mut Vec<u8>) {
-        self.pending_cr = false;
-    }
-
-    /// Erases the previous character, never crossing a line break.
-    ///
-    /// Only the byte this filter just produced can be erased; a backspace that
-    /// arrives after a flush cannot reach back into the file (documented).
-    fn backspace(&mut self, out: &mut Vec<u8>) {
-        if let Some(b) = self.last {
-            if b != b'\n' {
-                out.pop();
-                self.last = out.last().copied();
+    fn ground(&mut self, b: u8, out: &mut Vec<u8>) {
+        match b {
+            0x1b => {
+                self.utf8.clear();
+                self.state = State::Esc;
+            }
+            b'\r' => self.col = 0,
+            b'\n' => self.emit_line(out, true),
+            0x08 => self.col = self.col.saturating_sub(1),
+            b'\t' => self.put('\t', out),
+            // Other C0 controls (BEL, NUL, …) carry nothing readable.
+            0x00..=0x1f | 0x7f => {}
+            0x20..=0x7e => {
+                self.utf8.clear();
+                self.put(b as char, out);
+            }
+            _ => {
+                self.utf8.push(b);
+                match std::str::from_utf8(&self.utf8) {
+                    Ok(s) => {
+                        let ch = s.chars().next().unwrap_or('\u{fffd}');
+                        self.utf8.clear();
+                        self.put(ch, out);
+                    }
+                    // Invalid, or longer than any character: give up on it.
+                    Err(e) if e.error_len().is_some() || self.utf8.len() >= 4 => {
+                        self.utf8.clear();
+                        self.put('\u{fffd}', out);
+                    }
+                    // Incomplete: wait for the rest.
+                    Err(_) => {}
+                }
             }
         }
+    }
+
+    /// Writes one character at the cursor, overwriting what is there.
+    fn put(&mut self, ch: char, out: &mut Vec<u8>) {
+        if self.col >= MAX_LINE {
+            self.emit_line(out, true);
+        }
+        while self.line.len() < self.col {
+            self.line.push(' ');
+        }
+        if self.col < self.line.len() {
+            self.line[self.col] = ch;
+        } else {
+            self.line.push(ch);
+        }
+        self.col += 1;
+    }
+
+    /// Acts on the CSI sequences that change the current line; the rest
+    /// (colours, other rows, modes) are dropped.
+    fn csi(&mut self, final_byte: u8) {
+        // `ESC [ ? 25 l` and friends are private modes, never line edits.
+        if self
+            .params
+            .first()
+            .is_some_and(|b| matches!(b, b'?' | b'>' | b'='))
+        {
+            return;
+        }
+        let first: Option<usize> = std::str::from_utf8(&self.params)
+            .ok()
+            .and_then(|s| s.split(';').next())
+            .and_then(|s| s.parse().ok());
+        let n = first.unwrap_or(1).max(1);
+        match final_byte {
+            b'D' => self.col = self.col.saturating_sub(n),
+            b'C' => self.col = (self.col + n).min(MAX_LINE - 1),
+            b'G' => self.col = (n - 1).min(MAX_LINE - 1),
+            b'K' => match first.unwrap_or(0) {
+                0 => self.line.truncate(self.col),
+                1 => {
+                    for c in self.line.iter_mut().take(self.col + 1) {
+                        *c = ' ';
+                    }
+                }
+                _ => self.line.clear(),
+            },
+            // Delete characters at the cursor (readline editing).
+            b'P' => {
+                let end = (self.col + n).min(self.line.len());
+                if self.col < end {
+                    self.line.drain(self.col..end);
+                }
+            }
+            // Erase characters in place.
+            b'X' => {
+                for c in self.line.iter_mut().skip(self.col).take(n) {
+                    *c = ' ';
+                }
+            }
+            // Insert blanks at the cursor.
+            b'@' if self.col <= self.line.len() => {
+                let at = self.col;
+                self.line
+                    .splice(at..at, std::iter::repeat_n(' ', n.min(MAX_LINE)));
+                self.line.truncate(MAX_LINE);
+            }
+            _ => {}
+        }
+    }
+
+    /// Writes the line without its trailing blanks, and starts a new one.
+    fn emit_line(&mut self, out: &mut Vec<u8>, newline: bool) {
+        let end = self
+            .line
+            .iter()
+            .rposition(|c| *c != ' ')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let mut buf = [0u8; 4];
+        for ch in &self.line[..end] {
+            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+        }
+        if newline {
+            out.push(b'\n');
+        }
+        self.line.clear();
+        self.col = 0;
     }
 }
 
@@ -261,8 +364,8 @@ mod tests {
     }
 
     #[test]
-    fn cursor_movement_is_removed() {
-        assert_eq!(strip_ansi(b"a\x1b[2Kb\x1b[10;20Hc"), b"abc");
+    fn moves_to_other_rows_are_dropped() {
+        assert_eq!(strip_ansi(b"a\x1b[10;20Hb\x1b[?25lc"), b"abc");
     }
 
     #[test]
@@ -273,10 +376,46 @@ mod tests {
     }
 
     #[test]
-    fn crlf_becomes_lf_and_lone_cr_disappears() {
+    fn crlf_becomes_lf_and_a_lone_cr_redraws_the_line() {
         assert_eq!(strip_ansi(b"one\r\ntwo"), b"one\ntwo");
-        // A progress-bar style CR with no LF is dropped, not turned into a break.
-        assert_eq!(strip_ansi(b"10%\r20%"), b"10%20%");
+        // A progress bar redrawn with CR keeps only its last state.
+        assert_eq!(strip_ansi(b"10%\r20%\r100%\n"), b"100%\n");
+    }
+
+    #[test]
+    fn cisco_more_prompt_leaves_no_trace() {
+        // ` --More-- `, then CR + spaces + CR to wipe it, then the next line.
+        let out = strip_ansi(b"line one\r\n --More-- \r          \rinterface Gi0/1\r\n");
+        assert_eq!(out, b"line one\ninterface Gi0/1\n");
+    }
+
+    #[test]
+    fn huawei_more_prompt_leaves_no_trace() {
+        // `---- More ----` wiped with cursor-left and erase-to-end.
+        let out = strip_ansi(b"  ---- More ----\x1b[42D\x1b[K interface GE0/0/1\r\n");
+        assert_eq!(out, b" interface GE0/0/1\n");
+        let out = strip_ansi(b"  ---- More ----\x1b[16D                \x1b[16Dsysname core\r\n");
+        assert_eq!(out, b"sysname core\n");
+    }
+
+    #[test]
+    fn line_editing_sequences_apply() {
+        // Erase whole line, delete chars, cursor absolute.
+        assert_eq!(strip_ansi(b"junk\x1b[2K\rok\n"), b"ok\n");
+        assert_eq!(strip_ansi(b"abcdef\x1b[4D\x1b[2P\n"), b"abef\n");
+        assert_eq!(strip_ansi(b"abc\x1b[1GX\n"), b"Xbc\n");
+    }
+
+    #[test]
+    fn multibyte_text_survives_and_split_characters_join() {
+        assert_eq!(strip_ansi("配置 OK\r\n".as_bytes()), "配置 OK\n".as_bytes());
+        let bytes = "中".as_bytes();
+        let mut p = PlainText::default();
+        let mut out = Vec::new();
+        p.push(&bytes[..1], &mut out);
+        p.push(&bytes[1..], &mut out);
+        p.finish(&mut out);
+        assert_eq!(out, "中".as_bytes());
     }
 
     #[test]
@@ -310,9 +449,11 @@ mod tests {
     }
 
     #[test]
-    fn backspace_erases_within_the_chunk() {
+    fn backspace_moves_back_and_the_next_character_overwrites() {
         assert_eq!(strip_ansi(b"abc\x08d"), b"abd");
-        // Never eats a newline.
+        // A shell erases with `\b \b`.
+        assert_eq!(strip_ansi(b"abc\x08 \x08\n"), b"ab\n");
+        // Never crosses a line break.
         assert_eq!(strip_ansi(b"a\n\x08b"), b"a\nb");
     }
 

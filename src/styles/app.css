@@ -4383,6 +4383,27 @@ textarea.field__input {
   color: var(--text-faint);
   font-size: 10.5px;
   margin-left: 4px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.ai__attachCard--busy {
+  align-items: center;
+}
+
+.ai__attachBar {
+  height: 3px;
+  margin-top: 5px;
+  border-radius: 2px;
+  background: var(--border);
+  overflow: hidden;
+}
+
+.ai__attachBar > span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.12s linear;
 }
 
 .ai__attachPath {

@@ -60,6 +60,8 @@
     },
     "plugin:event|unlisten": () => null,
     "plugin:webview|get_all_webviews": () => [],
+    // The paperclip's file picker: pretend the user chose a certificate pair.
+    "plugin:dialog|open": () => ["/Users/mock/certs/example.com.crt", "/Users/mock/certs/example.com.key"],
     app_info: () => ({ name: "loki", version: "0.7.0" }),
     vault_status: () => ({ exists: state.exists, unlocked: state.unlocked, kdf: null }),
     vault_unlock: () => ((state.unlocked = true), handlers.vault_status()),
@@ -172,8 +174,20 @@ uci commit openclash && /etc/init.d/openclash restart
     ai_provider_models: () => ["claude-haiku-5-5", "claude-opus-5-5", "claude-sonnet-5-5"],
     ai_provider_test: () => "连接正常，模型回复：pong",
     ai_provider_save: ({ input }) => ({ ...input, hasKey: true }),
-    ai_attach: ({ paths }) =>
-      paths.map((p, i) => {
+    ai_attach: async ({ paths }) => {
+      // Walk each file through real-looking progress, then the hash check.
+      const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+      for (const [i, p] of paths.entries()) {
+        const id = `up-${i}`;
+        const name = p.split("/").pop() || `file${i}`;
+        for (let pct = 0; pct <= 100; pct += 20) {
+          emit("attach-progress", { id, name, percent: pct, done: false });
+          await wait(120);
+        }
+        await wait(300);
+        emit("attach-progress", { id, name, percent: 100, done: true });
+      }
+      return paths.map((p, i) => {
         const name = p.split("/").pop() || `file${i}`;
         const secret = /\.(key|pem|p12|pfx)$/i.test(name);
         const script = /\.sh$/i.test(name);
@@ -188,7 +202,8 @@ uci commit openclash && /etc/init.d/openclash restart
           verified: true,
           shareable: !secret,
         };
-      }),
+      });
+    },
     ai_detach: () => null,
     ai_attachments_cleanup: () => 3,
     ai_conversations_list: ({ hostId }) => {
@@ -197,7 +212,11 @@ uci commit openclash && /etc/init.d/openclash restart
         { id: "c1", title: "nginx 证书续期", hostLabel: "prod-api-tokyo", hostId: "h1", updatedAt: now - 600, turnCount: 6 },
         { id: "c2", title: "查一下磁盘占用", hostLabel: "prod-api-tokyo", hostId: "h1", updatedAt: now - 34_000, turnCount: 4 },
         { id: "c3", title: "上次重启为什么失败", hostLabel: "staging-web", hostId: "h2", updatedAt: now - 200_000, turnCount: 9 },
-      ];
+      ]
+        // Conversations saved in this page session come first, newest on top.
+        .filter((c) => !(state.conversations || []).some((s) => s.id === c.id))
+        .concat(state.conversations || [])
+        .sort((a, b) => b.updatedAt - a.updatedAt);
       return hostId ? all.filter((c) => c.hostId === hostId) : all;
     },
     ai_conversation_get: ({ id }) => ({

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-const CHUNK: usize = 256 * 1024;
+pub const CHUNK: usize = 256 * 1024;
 
 /// What the UI receives about a running transfer.
 #[derive(Debug, Clone, Serialize)]
@@ -56,7 +56,7 @@ impl<F: FnMut(u64, u64)> Progress<F> {
         }
     }
 
-    fn add(&mut self, n: u64) {
+    pub fn add(&mut self, n: u64) {
         self.bytes += n;
         if self.last.elapsed() >= Duration::from_millis(100) {
             self.last = Instant::now();
@@ -64,7 +64,7 @@ impl<F: FnMut(u64, u64)> Progress<F> {
         }
     }
 
-    fn finish(&mut self) {
+    pub fn finish(&mut self) {
         (self.report)(self.bytes, self.total);
     }
 }

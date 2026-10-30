@@ -66,6 +66,20 @@ interface Turn {
   attachments?: TurnAttachment[];
 }
 
+/**
+ * Reminds the model, in later turns, which files an earlier message carried.
+ * Paths only: the content (if it was shared) went once, built by Rust, and a
+ * key never goes at all.
+ */
+function attachmentNote(list: TurnAttachment[]): string {
+  const lines = list.map((a, i) =>
+    a.secret
+      ? `#${i + 1} ${a.name}，含私钥：内容不提供，只能用路径操作（${a.remotePath}）`
+      : `#${i + 1} ${a.name}，${formatSize(a.size)}，路径 ${a.remotePath}`,
+  );
+  return `\n\n附件（已上传到服务器）：\n${lines.join("\n")}`;
+}
+
 /** Applies one engine event to the parts of the turn that is running. */
 function applyEvent(parts: Part[], ev: AiEvent): Part[] {
   if (ev.type === "text") {
@@ -174,12 +188,38 @@ export function AiPanel({
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [conversationId, setConversationId] = useState(newConversationId);
-  // Files attached to the message being composed, and everything uploaded for
-  // this session (for the clean-up row).
+  // Files attached to the message being composed, and everything uploaded per
+  // session (for the clean-up row). The panel outlives tab switches, so both
+  // are tied to a session: a path staged on one server is wrong on another.
   const [pending, setPending] = useState<AttachmentView[]>([]);
   const [shareContent, setShareContent] = useState<Record<string, boolean>>({});
-  const [uploads, setUploads] = useState<{ name: string; percent: number }[]>([]);
-  const [sessionFiles, setSessionFiles] = useState<{ id: string; name: string }[]>([]);
+  const [uploads, setUploads] = useState<{ id: string; name: string; percent: number }[]>([]);
+  const [filesBySession, setFilesBySession] = useState<
+    Record<string, { id: string; name: string }[]>
+  >({});
+  const sessionFiles = (sessionId && filesBySession[sessionId]) || [];
+  const pendingRef = useRef(pending);
+  useEffect(() => {
+    pendingRef.current = pending;
+  }, [pending]);
+
+  // Switching to another tab drops what was about to be sent: those files sit
+  // on the previous server. They were never described to the model, so Rust
+  // deletes the uploaded copies too.
+  useEffect(() => {
+    const stale = pendingRef.current;
+    if (stale.length === 0) return;
+    setPending([]);
+    setShareContent({});
+    for (const a of stale) void attachmentApi.detach(a.id).catch(() => {});
+    setFilesBySession((prev) => {
+      const next: typeof prev = {};
+      const gone = new Set(stale.map((a) => a.id));
+      for (const [sid, list] of Object.entries(prev)) next[sid] = list.filter((f) => !gone.has(f.id));
+      return next;
+    });
+    toast("已切换会话，未发送的附件已移除", "info");
+  }, [sessionId]);
   const rootRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const pendingInsert = useAiComposer((s) => s.pendingInsert);
@@ -302,6 +342,11 @@ export function AiPanel({
     setTitle("");
     createdAt.current = Math.floor(Date.now() / 1000);
     setHistoryOpen(false);
+    // Rust forgot the attachments when the vault locked; cards left here would
+    // be dropped silently on the next send.
+    setPending([]);
+    setShareContent({});
+    setFilesBySession({});
   }, [phase]);
 
   /** Replaces the panel contents with a stored conversation. */
@@ -333,15 +378,16 @@ export function AiPanel({
   }
 
 
-  // Progress for an upload in flight, keyed by file name.
+  // Progress for an upload in flight. At 100% the server is still checking
+  // the hash; the card goes away once Rust says the file is done.
   useEffect(() => {
     let disposed = false;
     let un: (() => void) | undefined;
-    void listen<{ id: string; name: string; percent: number }>("attach-progress", (e) => {
+    void listen<{ id: string; name: string; percent: number; done: boolean }>("attach-progress", (e) => {
       const p = e.payload;
       setUploads((prev) => {
-        const rest = prev.filter((u) => u.name !== p.name);
-        return p.percent >= 100 ? rest : [...rest, { name: p.name, percent: p.percent }];
+        const rest = prev.filter((u) => u.id !== p.id);
+        return p.done ? rest : [...rest, { id: p.id, name: p.name, percent: p.percent }];
       });
     }).then((f) => {
       if (disposed) f();
@@ -369,7 +415,10 @@ export function AiPanel({
         for (const v of views) if (v.shareable) next[v.id] = true;
         return next;
       });
-      setSessionFiles((prev) => [...prev, ...views.map((v) => ({ id: v.id, name: v.name }))]);
+      setFilesBySession((prev) => ({
+        ...prev,
+        [sessionId]: [...(prev[sessionId] ?? []), ...views.map((v) => ({ id: v.id, name: v.name }))],
+      }));
     } catch (e) {
       toast(errorMessage(e), "error");
     } finally {
@@ -396,7 +445,12 @@ export function AiPanel({
 
   async function removePending(a: AttachmentView) {
     setPending((prev) => prev.filter((x) => x.id !== a.id));
-    setSessionFiles((prev) => prev.filter((x) => x.id !== a.id));
+    if (sessionId) {
+      setFilesBySession((prev) => ({
+        ...prev,
+        [sessionId]: (prev[sessionId] ?? []).filter((x) => x.id !== a.id),
+      }));
+    }
     try {
       await attachmentApi.detach(a.id);
     } catch {
@@ -415,7 +469,7 @@ export function AiPanel({
     if (!ok) return;
     try {
       const n = await attachmentApi.cleanup(sessionId);
-      setSessionFiles([]);
+      setFilesBySession((prev) => ({ ...prev, [sessionId]: [] }));
       setPending([]);
       toast(`已删除 ${n} 个文件`, "success");
     } catch (e) {
@@ -454,7 +508,10 @@ export function AiPanel({
   const history = useCallback((): ChatMessage[] => {
     const out: ChatMessage[] = [];
     for (const t of turns) {
-      if (t.role === "user") out.push({ role: "user", content: textOf(t) });
+      if (t.role === "user") {
+        const note = t.attachments?.length ? attachmentNote(t.attachments) : "";
+        out.push({ role: "user", content: textOf(t) + note });
+      }
       else out.push(...turnToMessages(t.parts));
     }
     return out;
@@ -669,10 +726,15 @@ export function AiPanel({
       {(uploads.length > 0 || pending.length > 0) && (
         <div className="ai__attach">
           {uploads.map((u) => (
-            <div key={u.name} className="ai__attachCard">
+            <div key={u.id} className="ai__attachCard ai__attachCard--busy">
               <IconFile size={13} />
-              <span className="ai__attachName">{u.name}</span>
-              <span className="ai__attachPct">{u.percent}%</span>
+              <div className="ai__attachMain">
+                <div className="ai__attachName">{u.name}</div>
+                <div className="ai__attachBar">
+                  <span style={{ width: `${u.percent}%` }} />
+                </div>
+              </div>
+              <span className="ai__attachPct">{u.percent >= 100 ? "校验中…" : `${u.percent}%`}</span>
             </div>
           ))}
           {pending.map((a) => (

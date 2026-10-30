@@ -225,7 +225,7 @@ pub async fn run(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcome {
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
             // A private key the user attached stays opaque even by path: the
             // model may install it, not read it.
-            if ctx.secret_paths.iter().any(|p| p == path) {
+            if ctx.secret_paths.iter().any(|p| same_remote_file(p, path)) {
                 return ToolOutcome::err("这是私钥文件，内容不提供。用路径操作即可。");
             }
             let session = match need_session(ctx) {
@@ -273,6 +273,33 @@ pub async fn run(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcome {
         }
 
         other => ToolOutcome::err(format!("未知工具：{other}")),
+    }
+}
+
+/// Whether `asked` names the staged file at `staged` (an absolute path).
+///
+/// The model is told the absolute path but may well write it as `~/…` or with
+/// a stray `./` or doubled slash; all of those still mean the key.
+fn same_remote_file(staged: &str, asked: &str) -> bool {
+    fn tidy(p: &str) -> String {
+        let mut out: Vec<&str> = Vec::new();
+        for seg in p.split('/') {
+            if !seg.is_empty() && seg != "." {
+                out.push(seg);
+            }
+        }
+        out.join("/")
+    }
+    let staged = tidy(staged);
+    let asked = asked.trim();
+    match asked.strip_prefix("~/") {
+        // `~/.loki/…` matches whatever the home is: the staged path ends in it.
+        // Anything else under `~` is a different file.
+        Some(rest) => {
+            let rest = tidy(rest);
+            rest.starts_with(".loki/") && staged.ends_with(&format!("/{rest}"))
+        }
+        None => tidy(asked) == staged,
     }
 }
 
@@ -350,6 +377,23 @@ mod tests {
         .await;
         assert!(!out.ok);
         assert!(out.content.contains("私钥"), "{}", out.content);
+    }
+
+    #[test]
+    fn a_staged_key_is_recognised_however_the_path_is_written() {
+        let staged = "/home/deploy/.loki/uploads/20261030-090000-ab12/server.key";
+        assert!(same_remote_file(staged, staged));
+        assert!(same_remote_file(
+            staged,
+            "~/.loki/uploads/20261030-090000-ab12/server.key"
+        ));
+        assert!(same_remote_file(
+            staged,
+            "/home/deploy//.loki/./uploads/20261030-090000-ab12/server.key"
+        ));
+        assert!(!same_remote_file(staged, "/etc/ssl/server.key"));
+        assert!(!same_remote_file(staged, "~/"));
+        assert!(!same_remote_file(staged, "~/server.key"));
     }
 
     #[tokio::test]
