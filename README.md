@@ -52,6 +52,7 @@ The interface is currently in Simplified Chinese.
 | **Port forwarding** | Local (`-L`) and SOCKS5 (`-D`) |
 | **AI assistant** | OpenAI Chat Completions–compatible APIs (OpenAI, OpenRouter, DeepSeek, Ollama, LM Studio, vLLM…), OpenAI Responses and Anthropic; replies **stream** in as they are written, with tool calls shown inline where they happen; it can read the terminal, run commands, list/read/write files and grep — with three permission modes, and changes to the server need your approval by default; **attach local files** (certificates, scripts): they are uploaded to a staging folder on the server for the assistant to use, and private key contents are never sent to the model; **conversation history** per host, encrypted on this machine and never synced |
 | **Keys** | Generate Ed25519 / RSA-4096, import OpenSSH or PEM keys (with passphrase) |
+| **Categories** | Group hosts as servers, switches or anything you name; a host can be in several. The host list, the open sessions in the sidebar and quick connect are all organised by category |
 | **Import** | Bring hosts in from `~/.ssh/config`, including identity files and ProxyJump |
 | **Vault** | Master password with a one-time recovery code you can copy or save to a file; auto-lock after inactivity |
 | **Sync (optional)** | To a Cloudflare Worker + D1 that *you* deploy; the server only ever sees ciphertext — see [`workers/sync`](workers/sync) |
