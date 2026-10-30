@@ -14,6 +14,8 @@ import { recordApi, formatBytes } from "@/lib/api";
 import { bufferToText, fileStamp, safeStem } from "@/features/terminal/exportText";
 import {
   IconAlert,
+  IconEye,
+  IconEyeOff,
   IconChevronDown,
   IconChevronRight,
   IconCopy,
@@ -619,6 +621,7 @@ function ConnectOverlay({ tab, onReconnect }: { tab: TermTab; onReconnect: () =>
   const hosts = useApp((s) => s.hosts);
   const acceptHostKey = useTerminals((s) => s.acceptHostKey);
   const submitPassword = useTerminals((s) => s.submitPassword);
+  const submitUsername = useTerminals((s) => s.submitUsername);
   const cancelPrompt = useTerminals((s) => s.cancelPrompt);
   const closeTab = useTerminals((s) => s.closeTab);
   const host = hosts.find((h) => h.id === tab.hostId);
@@ -694,12 +697,20 @@ function ConnectOverlay({ tab, onReconnect }: { tab: TermTab; onReconnect: () =>
             </button>
           </div>
         </div>
+      ) : prompt?.type === "username" ? (
+        <UsernamePrompt
+          host={prompt.host}
+          canRemember={!!tab.hostId}
+          onSubmit={(name, remember) => submitUsername(tab.id, name, remember)}
+          onCancel={() => cancelPrompt(tab.id)}
+        />
       ) : prompt?.type === "password" ? (
         <PasswordPrompt
           key={`${prompt.host}-${prompt.retry}`}
           host={prompt.host}
           username={prompt.username}
           retry={prompt.retry}
+          reason={prompt.reason}
           canRemember={!!tab.hostId}
           onSubmit={(pw, remember) => submitPassword(tab.id, pw, remember)}
           onCancel={() => cancelPrompt(tab.id)}
@@ -738,10 +749,69 @@ function ConnectOverlay({ tab, onReconnect }: { tab: TermTab; onReconnect: () =>
   );
 }
 
+/** Asks for the login name of a host saved without one. */
+function UsernamePrompt({
+  host,
+  canRemember,
+  onSubmit,
+  onCancel,
+}: {
+  host: string;
+  canRemember: boolean;
+  onSubmit: (name: string, remember: boolean) => void;
+  onCancel: () => void;
+}) {
+  const [name, setName] = useState("");
+  const [remember, setRemember] = useState(true);
+  return (
+    <form
+      className="overlay__card"
+      onSubmit={(e) => {
+        e.preventDefault();
+        if (name.trim()) onSubmit(name, remember);
+      }}
+    >
+      <div className="overlay__icon">
+        <IconShield size={22} />
+      </div>
+      <h3 className="overlay__title">输入用户名</h3>
+      <p className="overlay__text">
+        这台主机没有设置用户名，用什么账号登录 <strong>{host}</strong>？
+      </p>
+      <input
+        className="field__input"
+        autoFocus
+        autoComplete="off"
+        autoCapitalize="off"
+        autoCorrect="off"
+        spellCheck={false}
+        placeholder="例如 root"
+        value={name}
+        onChange={(e) => setName(e.target.value)}
+      />
+      {canRemember && (
+        <label className="check">
+          <input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} />
+          登录成功后保存到主机
+        </label>
+      )}
+      <div className="overlay__actions">
+        <button type="button" className="btn btn--ghost" onClick={onCancel}>
+          取消
+        </button>
+        <button type="submit" className="btn btn--primary" disabled={!name.trim()}>
+          继续
+        </button>
+      </div>
+    </form>
+  );
+}
+
 function PasswordPrompt({
   host,
   username,
   retry,
+  reason,
   canRemember,
   onSubmit,
   onCancel,
@@ -749,12 +819,21 @@ function PasswordPrompt({
   host: string;
   username: string;
   retry: boolean;
+  reason?: string;
   canRemember: boolean;
   onSubmit: (pw: string, remember: boolean) => void;
   onCancel: () => void;
 }) {
   const [pw, setPw] = useState("");
   const [remember, setRemember] = useState(false);
+  // What was typed is invisible; showing it, and warning about Caps Lock or a
+  // Chinese input method, are what end a "the password is right but it says
+  // wrong" loop.
+  const [reveal, setReveal] = useState(false);
+  const [capsLock, setCapsLock] = useState(false);
+  const watchCaps = (e: React.KeyboardEvent | React.MouseEvent) =>
+    setCapsLock(e.getModifierState("CapsLock"));
+  const nonAscii = /[^\x20-\x7e]/.test(pw);
   return (
     <form
       className="overlay__card"
@@ -768,21 +847,51 @@ function PasswordPrompt({
       </div>
       <h3 className="overlay__title">输入密码</h3>
       <p className="overlay__text">
-        {retry ? "密码不正确，请重试。" : "密钥和 ssh-agent 都没能登录，"}
+        {retry ? (reason ? `登录失败：${reason}。` : "密码不正确，请重试。") : "密钥和 ssh-agent 都没能登录，"}
         <strong>
           {username ? `${username}@` : ""}
           {host}
         </strong>{" "}
         需要密码。
       </p>
-      <input
-        className="field__input"
-        type="password"
-        autoFocus
-        placeholder="密码"
-        value={pw}
-        onChange={(e) => setPw(e.target.value)}
-      />
+      <div className="pwfield">
+        <input
+          className="field__input pwfield__input"
+          type={reveal ? "text" : "password"}
+          autoFocus
+          autoComplete="off"
+          autoCapitalize="off"
+          autoCorrect="off"
+          spellCheck={false}
+          placeholder="密码"
+          value={pw}
+          onChange={(e) => setPw(e.target.value)}
+          onKeyDown={watchCaps}
+          onKeyUp={watchCaps}
+          onMouseDown={watchCaps}
+        />
+        <button
+          type="button"
+          className="pwfield__eye"
+          title={reveal ? "隐藏密码" : "显示密码"}
+          // Keep the caret in the field so Enter still logs in.
+          tabIndex={-1}
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => setReveal((v) => !v)}
+        >
+          {reveal ? <IconEyeOff size={15} /> : <IconEye size={15} />}
+        </button>
+      </div>
+      {capsLock && (
+        <div className="pwfield__warn">
+          <IconAlert size={12} /> 大写锁定已开启
+        </div>
+      )}
+      {!capsLock && nonAscii && (
+        <div className="pwfield__warn">
+          <IconAlert size={12} /> 密码里有中文或全角字符，请确认输入法处于英文状态
+        </div>
+      )}
       {canRemember && (
         <label className="check">
           <input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} />

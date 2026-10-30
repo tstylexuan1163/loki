@@ -2266,6 +2266,49 @@ textarea.field__input {
   justify-content: center;
 }
 
+/* Password field with its own show/hide button. */
+.pwfield {
+  position: relative;
+}
+
+.overlay__card .pwfield__input {
+  padding-right: 38px;
+}
+
+/* Edge/WebView2 adds a reveal button of its own; one is enough. */
+.pwfield__input::-ms-reveal,
+.pwfield__input::-ms-clear {
+  display: none;
+}
+
+.pwfield__eye {
+  position: absolute;
+  top: 0;
+  right: 4px;
+  height: calc(100% - 10px);
+  display: grid;
+  place-items: center;
+  width: 30px;
+  border: 0;
+  background: none;
+  color: var(--text-faint);
+  cursor: pointer;
+}
+
+.pwfield__eye:hover {
+  color: var(--text);
+}
+
+.pwfield__warn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  margin: -4px 0 8px;
+  font-size: 12px;
+  color: var(--warn);
+}
+
 .overlay__actions {
   display: flex;
   justify-content: center;
@@ -4510,4 +4553,45 @@ textarea.field__input {
 
 .ai__sentSize {
   color: var(--text-faint);
+}
+
+/* ---- Windows (WebView2) compositing ------------------------------------- */
+
+/*
+ * WebView2 on Windows repaints a backdrop blur over the whole area behind it on
+ * every frame, and pop-ups that animate transform under a large shadow can
+ * leave ghost trails when they close. Clicks then feel sticky. Use a plainer
+ * scrim and opacity-only entrances there; macOS keeps the softer look.
+ */
+:root[data-platform="windows"] .modal-backdrop,
+:root[data-platform="windows"] .overlay {
+  backdrop-filter: none;
+}
+
+:root[data-platform="windows"] .overlay {
+  background: color-mix(in srgb, var(--bg-term) 96%, transparent);
+}
+
+:root[data-platform="windows"] .menu,
+:root[data-platform="windows"] .modal,
+:root[data-platform="windows"] .modal-backdrop,
+:root[data-platform="windows"] .overlay__card,
+:root[data-platform="windows"] .toast,
+:root[data-platform="windows"] .findbar,
+:root[data-platform="windows"] .pane-banner,
+:root[data-platform="windows"] .settings {
+  animation: fade 80ms ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .menu,
+  .modal,
+  .modal-backdrop,
+  .overlay__card,
+  .toast,
+  .findbar,
+  .pane-banner,
+  .settings {
+    animation: none;
+  }
 }

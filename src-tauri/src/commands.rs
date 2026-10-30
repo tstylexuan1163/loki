@@ -594,11 +594,15 @@ fn credentials_for(
     {
         out.push(ssh::Credential::Agent);
     }
-    let password = field("password");
+    // A password typed at the prompt is the user's answer to "the stored one
+    // did not work" and must win over it; trying the stale one first would
+    // also spend one of the server's MaxAuthTries.
+    let password = match one_time_password.filter(|p| !p.is_empty()) {
+        Some(pw) => pw.to_string(),
+        None => field("password"),
+    };
     if !password.is_empty() {
         out.push(ssh::Credential::Password(password));
-    } else if let Some(pw) = one_time_password.filter(|p| !p.is_empty()) {
-        out.push(ssh::Credential::Password(pw.to_string()));
     }
     Ok(out)
 }
@@ -731,6 +735,11 @@ pub struct OpenInput {
     /// Store the typed password on the saved host after a successful login.
     #[serde(default)]
     pub remember_password: bool,
+    /// A login name typed at the prompt, for a host saved without one.
+    pub username: Option<String>,
+    /// Store that name on the saved host after a successful login.
+    #[serde(default)]
+    pub remember_username: bool,
     pub cols: Option<u32>,
     pub rows: Option<u32>,
 }
@@ -754,6 +763,18 @@ pub struct ConnectResult {
     pub username: Option<String>,
 }
 
+/// The login name for this attempt: one typed at the prompt wins, then the
+/// saved one. `None` means the user has to be asked.
+fn login_name(saved: &str, typed: Option<&str>) -> Option<String> {
+    let typed = typed.map(str::trim).filter(|u| !u.is_empty());
+    let saved = saved.trim();
+    match typed {
+        Some(u) => Some(u.to_string()),
+        None if !saved.is_empty() => Some(saved.to_string()),
+        None => None,
+    }
+}
+
 /// Connects to a saved host or a quick-connect target.
 #[tauri::command]
 pub async fn session_open(
@@ -766,7 +787,7 @@ pub async fn session_open(
 
     // Gather everything from the vault first, then drop the lock before
     // touching the network.
-    let (host, payload) = match (&input.host_id, &input.target) {
+    let (mut host, payload) = match (&input.host_id, &input.target) {
         (Some(id), _) => load_host(&state, id)?,
         (None, Some(t)) => {
             let mut view = HostView::ssh("", "", &t.address, t.port, &t.username);
@@ -785,6 +806,19 @@ pub async fn session_open(
     }
     if host.protocol == "serial" {
         return open_serial_host(&app, host);
+    }
+
+    // A host may be saved without a login name; ask for it now rather than
+    // failing with a confusing authentication error.
+    match login_name(&host.username, input.username.as_deref()) {
+        Some(name) => host.username = name,
+        None => {
+            return Ok(ConnectResult {
+                kind: "needUsername".into(),
+                host: Some(host.address.clone()),
+                ..Default::default()
+            })
+        }
     }
 
     let pw_for = |address: &str| -> Option<&str> {
@@ -815,6 +849,16 @@ pub async fn session_open(
                     .ok_or_else(|| "跳板机已被删除，请在主机设置里重新选择".to_string())?;
                 let item = vault.decrypt_item(&row).map_err(|e| e.to_string())?;
                 let jv = to_host_view(&item);
+                if jv.username.trim().is_empty() {
+                    return Err(format!(
+                        "跳板机 {} 没有设置用户名，请先在主机设置里填写",
+                        if jv.name.is_empty() {
+                            &jv.address
+                        } else {
+                            &jv.name
+                        }
+                    ));
+                }
                 Some(ssh::Hop {
                     credentials: credentials_for(&vault, &item.payload, pw_for(&jv.address))?,
                     known: known_keys(&vault, &jv.address, jv.port)?,
@@ -887,9 +931,14 @@ pub async fn session_open(
             ..Default::default()
         }),
         ConnectOutcome::Live(session) => {
-            if input.remember_password {
-                if let (Some(id), Some(pw)) = (&input.host_id, &input.password) {
-                    remember_password(&state, id, pw)?;
+            if let Some(id) = &input.host_id {
+                if input.remember_password {
+                    if let Some(pw) = &input.password {
+                        remember_on_host(&state, id, "password", pw)?;
+                    }
+                }
+                if input.remember_username {
+                    remember_on_host(&state, id, "username", &host.username)?;
                 }
             }
             if let Some(cmd) = &host.startup_command {
@@ -907,14 +956,19 @@ pub async fn session_open(
     }
 }
 
-/// Saves a password typed at the prompt onto the host it was for.
-fn remember_password(state: &AppState, host_id: &str, password: &str) -> Result<(), String> {
+/// Saves something typed at a prompt (password, login name) onto the host.
+fn remember_on_host(
+    state: &AppState,
+    host_id: &str,
+    field: &str,
+    value: &str,
+) -> Result<(), String> {
     let vault = state.vault.lock().map_err(|e| e.to_string())?;
     let Some(row) = vault.store().get_item(host_id).map_err(|e| e.to_string())? else {
         return Ok(());
     };
     let mut item = vault.decrypt_item(&row).map_err(|e| e.to_string())?;
-    item.payload["password"] = serde_json::Value::String(password.to_string());
+    item.payload[field] = serde_json::Value::String(value.to_string());
     let row = vault
         .encrypt_item(host_id, "host", &item.payload)
         .map_err(|e| e.to_string())?;
@@ -3346,6 +3400,42 @@ mod tests {
         let row = vault.encrypt_item(id, "provider", &payload).unwrap();
         vault.store().put_item(&row).unwrap();
         vault
+    }
+
+    #[test]
+    fn a_typed_login_name_wins_and_a_blank_one_means_ask() {
+        assert_eq!(login_name("root", None).as_deref(), Some("root"));
+        assert_eq!(login_name("root", Some("admin")).as_deref(), Some("admin"));
+        assert_eq!(login_name("", Some("  admin ")).as_deref(), Some("admin"));
+        assert_eq!(login_name("  ", Some("")), None);
+        assert_eq!(login_name("", None), None);
+    }
+
+    #[test]
+    fn a_typed_password_replaces_the_stored_one() {
+        let vault = vault_with("p1", serde_json::json!({}));
+        let payload = serde_json::json!({ "password": "old-stale", "use_agent": false });
+        let passwords = |creds: Vec<ssh::Credential>| -> Vec<String> {
+            creds
+                .into_iter()
+                .filter_map(|c| match c {
+                    ssh::Credential::Password(p) => Some(p),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            passwords(credentials_for(&vault, &payload, Some("typed-new")).unwrap()),
+            vec!["typed-new"]
+        );
+        assert_eq!(
+            passwords(credentials_for(&vault, &payload, None).unwrap()),
+            vec!["old-stale"]
+        );
+        assert_eq!(
+            passwords(credentials_for(&vault, &payload, Some("")).unwrap()),
+            vec!["old-stale"]
+        );
     }
 
     #[test]

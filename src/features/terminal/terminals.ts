@@ -42,7 +42,9 @@ export type TabPrompt =
       /** Present when the key changed for a host we already knew. */
       previous: string | null;
     }
-  | { type: "password"; host: string; username: string; retry: boolean };
+  | { type: "password"; host: string; username: string; retry: boolean; reason?: string }
+  /** The host was saved without a login name. */
+  | { type: "username"; host: string };
 
 export interface TermTab {
   id: string;
@@ -61,6 +63,8 @@ export interface TermTab {
   connectedAt: number | null;
   /** Non-null while this session is being recorded to a file. */
   recording: import("@/lib/api").RecordInfo | null;
+  /** Login name answered at the prompt; reused for retries and reconnects. */
+  login: { username: string; remember: boolean } | null;
 }
 
 interface TermState {
@@ -74,6 +78,7 @@ interface TermState {
   openLocal(): string;
   acceptHostKey(tabId: string): void;
   submitPassword(tabId: string, password: string, remember: boolean): void;
+  submitUsername(tabId: string, username: string, remember: boolean): void;
   cancelPrompt(tabId: string): void;
   reconnect(tabId: string): void;
   sendInput(tabId: string, data: Uint8Array): void;
@@ -135,6 +140,8 @@ export const useTerminals = create<TermState>((set, get) => {
         target: tab.target,
         cols: lastSize.cols,
         rows: lastSize.rows,
+        username: tab.login?.username ?? null,
+        rememberUsername: tab.login?.remember ?? false,
         ...extra,
       });
       // The tab may have been closed while connecting.
@@ -154,6 +161,8 @@ export const useTerminals = create<TermState>((set, get) => {
             previous: res.previous,
           },
         });
+      } else if (res.kind === "needUsername") {
+        patch(tabId, { status: "connecting", prompt: { type: "username", host: res.host ?? "" } });
       } else if (res.kind === "needPassword") {
         patch(tabId, {
           status: "connecting",
@@ -169,6 +178,8 @@ export const useTerminals = create<TermState>((set, get) => {
           status: "connected",
           sessionId: res.session?.id ?? null,
           connectedAt: Date.now(),
+          // Saved once is enough; reconnects reuse the name without rewriting.
+          login: tab.login ? { ...tab.login, remember: false } : null,
         });
       }
     } catch (e) {
@@ -184,6 +195,9 @@ export const useTerminals = create<TermState>((set, get) => {
             username:
               prevPrompt?.type === "password" ? prevPrompt.username : (tab.target?.username ?? ""),
             retry: true,
+            // Say what the server said when it was more than "wrong password",
+            // e.g. too many attempts from the agent's keys first.
+            reason: /密码被拒绝/.test(message) ? undefined : message,
           },
         });
         return;
@@ -250,7 +264,7 @@ export const useTerminals = create<TermState>((set, get) => {
   function add(
     tab: Omit<
       TermTab,
-      "id" | "status" | "sessionId" | "error" | "prompt" | "connectedAt" | "recording"
+      "id" | "status" | "sessionId" | "error" | "prompt" | "connectedAt" | "recording" | "login"
     >,
   ) {
     const full: TermTab = {
@@ -262,6 +276,7 @@ export const useTerminals = create<TermState>((set, get) => {
       prompt: null,
       connectedAt: null,
       recording: null,
+      login: null,
     };
     set({ tabs: [...get().tabs, full], active: full.id });
     return full.id;
@@ -344,6 +359,14 @@ export const useTerminals = create<TermState>((set, get) => {
         passwordHost: tab.prompt.host || null,
         rememberPassword: remember && !!tab.hostId,
       });
+    },
+
+    submitUsername(tabId, username, remember) {
+      const tab = get().tabs.find((t) => t.id === tabId);
+      if (tab?.prompt?.type !== "username" || !username.trim()) return;
+      // `attempt` reads the login from the tab, so set it first.
+      patch(tabId, { login: { username: username.trim(), remember: remember && !!tab.hostId } });
+      void attempt(tabId);
     },
 
     cancelPrompt(tabId) {

@@ -21,6 +21,8 @@
       host("h4", "core-switch", "/dev/tty.usbserial-1420", "", ["network"], { protocol: "serial", baud: 9600 }),
       host("h5", "bastion", "bastion.example.com", "ops", ["prod"], { has_key: true }),
       host("h6", "lab-router", "192.168.1.1", "", ["lab"], { protocol: "telnet", port: 23 }),
+      // Saved without a login name: connecting asks for one, then a password.
+      host("h7", "nas", "192.168.88.89", "", ["lab"]),
     ],
     keys: [
       { id: "k1", name: "loki-2026-10-29", kind: "ed25519", fingerprint: "SHA256:QrhJScFAmN1bMZe5Yz7V8BGKQ00UtF5x8Iiual2NXfU", publicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKq0x7n0mock loki", createdAt: 0 },
@@ -284,6 +286,12 @@ uci commit openclash && /etc/init.d/openclash restart
       }
       if (h?.id === "h3" && !input.password) {
         return { kind: "needPassword", host: h.address, username: h.username };
+      }
+      if (h?.id === "h7") {
+        if (!input.username) return { kind: "needUsername", host: h.address };
+        if (!input.password) return { kind: "needPassword", host: h.address, username: input.username };
+        if (input.password !== "right") throw "认证失败：密码被拒绝";
+        if (input.rememberUsername) h.username = input.username;
       }
       const id = `s${++state.opened}`;
       sessions.set(id, name);

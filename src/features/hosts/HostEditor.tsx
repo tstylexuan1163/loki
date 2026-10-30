@@ -105,8 +105,8 @@ export function HostEditor({
   const isSsh = protocol === "ssh";
   const jumpCandidates = hosts.filter((h) => h.protocol === "ssh" && h.id !== hostId);
 
-  const canSave =
-    name.trim().length > 0 && address.trim().length > 0 && (!isSsh || username.trim().length > 0);
+  // A login name is optional: the connection asks for it when it is missing.
+  const canSave = name.trim().length > 0 && address.trim().length > 0;
 
   function commitTag() {
     const t = tagDraft.trim().replace(/,$/, "");
@@ -299,7 +299,7 @@ export function HostEditor({
                 <label className="field__label">用户名</label>
                 <input
                   className="field__input"
-                  placeholder="root"
+                  placeholder="留空则连接时询问"
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
                 />

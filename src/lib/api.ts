@@ -113,7 +113,7 @@ export function tagColor(tag: string): string {
 // ---- Terminal / sessions -------------------------------------------------
 
 export interface ConnectResult {
-  kind: "connected" | "hostKey" | "needPassword";
+  kind: "connected" | "hostKey" | "needPassword" | "needUsername";
   session: SessionView | null;
   fingerprint: string | null;
   keyType: string | null;
@@ -142,6 +142,9 @@ export interface OpenInput {
   password?: string | null;
   passwordHost?: string | null;
   rememberPassword?: boolean;
+  /** Login name typed at the prompt, for a host saved without one. */
+  username?: string | null;
+  rememberUsername?: boolean;
   cols?: number;
   rows?: number;
 }
