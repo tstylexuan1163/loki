@@ -30,6 +30,8 @@ pub struct AppState {
     /// One lazily-opened SFTP channel per session.
     pub sftp: Mutex<sftp::SftpMap>,
     pub forwards: Mutex<forward::ForwardManager>,
+    /// The running assistant turn: its id and the switch that stops it.
+    pub ai_turn: Mutex<Option<(String, tokio::sync::oneshot::Sender<()>)>>,
     /// Channel the running turn listens on for tool approvals.
     pub ai_approvals: Mutex<Option<tokio::sync::mpsc::UnboundedSender<ai::Approval>>>,
     /// Telnet, serial and local-shell sessions, which do not share SSH's types.
@@ -40,6 +42,9 @@ pub struct AppState {
     pub update_busy: Mutex<bool>,
     /// Files attached to assistant messages, and the staging folders to clean.
     pub attachments: Mutex<commands::AttachRegistry>,
+    /// Providers whose model list was already asked for context sizes in
+    /// this run, so a provider that states none is asked only once.
+    pub ai_limits_checked: Mutex<std::collections::HashSet<String>>,
     /// Kept so background tasks can emit events without a command in flight.
     pub app: tauri::AppHandle,
 }
@@ -81,6 +86,8 @@ pub fn run() {
                 ai_approvals: Mutex::new(None),
                 update_busy: Mutex::new(false),
                 attachments: Mutex::new(commands::AttachRegistry::default()),
+                ai_limits_checked: Mutex::new(std::collections::HashSet::new()),
+                ai_turn: Mutex::new(None),
                 direct: Mutex::new(direct::DirectManager::new()),
                 transfers: Mutex::new(transfer::TransferMap::new()),
                 app: app.handle().clone(),
@@ -147,6 +154,7 @@ pub fn run() {
             commands::ai_conversation_rename,
             commands::ai_conversation_delete,
             commands::ai_approve,
+            commands::ai_cancel,
             commands::forward_start,
             commands::forward_list,
             commands::forward_stop,

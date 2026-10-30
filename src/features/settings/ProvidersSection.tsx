@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { aiApi, errorMessage, type ProviderInput, type ProviderView } from "@/lib/api";
+import { aiApi, errorMessage, formatTokens, type ProviderInput, type ProviderView } from "@/lib/api";
 import { Modal } from "@/components/ui";
 import { IconEye, IconEyeOff, IconPlus, IconRefresh, IconTrash, IconPlug } from "@/components/icons";
 
@@ -128,6 +128,10 @@ function ProviderDialog({
   const [apiKey, setApiKey] = useState("");
   const [showKey, setShowKey] = useState(false);
   const [models, setModels] = useState<string[]>(initial?.models ?? []);
+  // Blank means automatic, which is what almost everyone wants.
+  const [limitDraft, setLimitDraft] = useState(initial?.contextLimit ? String(initial.contextLimit) : "");
+  const [advanced, setAdvanced] = useState(!!initial?.contextLimit);
+  const found = initial?.contextLimits ?? {};
   const [modelDraft, setModelDraft] = useState("");
   const [fetched, setFetched] = useState<string[]>([]);
   const [fetching, setFetching] = useState(false);
@@ -151,6 +155,7 @@ function ProviderDialog({
       models,
       // Blank means "keep the stored key" — for the same server only.
       apiKey: apiKey.trim() || undefined,
+      contextLimit: Number(limitDraft.replace(/[,\s_]/g, "")) || null,
     };
   }
 
@@ -326,6 +331,11 @@ function ProviderDialog({
               {models.map((m) => (
                 <div key={m} className="model-item">
                   <span className="model-item__name">{m}</span>
+                  {found[m] && (
+                    <span className="model-item__ctx" title="自动识别的上下文长度">
+                      上下文 {formatTokens(found[m])}
+                    </span>
+                  )}
                   <button
                     className="iconbtn"
                     onClick={() => setModels(models.filter((x) => x !== m))}
@@ -373,6 +383,34 @@ function ProviderDialog({
                 添加
               </button>
             </div>
+          </div>
+        </div>
+
+        <div className="pfield">
+          <label className="pfield__label">上下文长度</label>
+          <div className="pfield__body">
+            {!advanced ? (
+              <div className="pfield__hint" style={{ margin: 0 }}>
+                自动识别。{" "}
+                <button className="linkbtn" onClick={() => setAdvanced(true)}>
+                  手动设置
+                </button>
+              </div>
+            ) : (
+              <>
+                <input
+                  className="input"
+                  inputMode="numeric"
+                  placeholder="留空 = 自动识别，例如 128000"
+                  value={limitDraft}
+                  onChange={(e) => setLimitDraft(e.target.value)}
+                />
+                <div className="pfield__hint">
+                  一般不用填。能从服务商的模型列表读到时直接用；读不到时，对话第一次超长会从服务商的报错里得知上限并记住，
+                  然后自动精简重试。填写后对这个服务商的所有模型生效，适合想限制每次请求大小的情况。
+                </div>
+              </>
+            )}
           </div>
         </div>
 

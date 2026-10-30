@@ -81,7 +81,35 @@
     // A turn streamed token by token, with tool calls in between, the way the
     // engine emits it. The reply mirrors a real ops answer: headings, a
     // numbered list, inline code, a table and a code block.
-    ai_send: ({ attachments }) => {
+    ai_send: ({ attachments, history, turnId }) => {
+      // Events carry the turn id, and every timer is kept so ai_cancel can
+      // stop the script the way the engine drops a turn.
+      state.aiTurn = turnId;
+      state.aiTimers = [];
+      const later = (ev, ms) =>
+        state.aiTimers.push(setTimeout(() => emit("ai-event", { ...ev, turnId }), ms));
+      const last = (history || []).filter((m) => m.role === "user").at(-1)?.content || "";
+      // Asking to delete something plays a call that waits for approval.
+      if (/删除|清理/.test(last)) {
+        const id = "ask1";
+        later({ type: "text", text: "我先确认一下要删除的内容。" }, 100);
+        later({ type: "toolCall", id, name: "run_command", arguments: { command: "rm -rf /tmp/build-cache" }, auto: false }, 300);
+        state.aiPending = { id, turnId };
+        return null;
+      }
+      // From the third question on, the demo plays a provider rejecting the
+      // request as too long: the engine learns the limit, shortens, retries.
+      const rounds = (history || []).filter((m) => m.role === "user").length;
+      if (rounds >= 3) {
+        emit("ai-event", { type: "limitLearned", tokens: 65536, exact: true });
+        emit("ai-event", {
+          type: "context",
+          droppedRounds: rounds >= 4 ? rounds - 3 : 0,
+          shortenedOutputs: (rounds - 2) * 3,
+          tokens: 52000,
+          limit: 65536,
+        });
+      }
       const say = (text) => (text.match(/[\s\S]{1,4}/gu) ?? []).map((t) => ({ type: "text", text: t }));
       const tool = (id, command, content) => [
         { type: "toolCall", id, name: "run_command", arguments: { command }, auto: true },
@@ -111,7 +139,7 @@
 私钥文件我没有读取内容，只按路径安装。服务器上还留着暂存文件，确认没问题后可以用面板里的「清理」删掉。`),
           { type: "done", steps: 8 },
         ];
-        certScript.forEach((ev, i) => setTimeout(() => emit("ai-event", ev), 200 + i * 18));
+        certScript.forEach((ev, i) => later(ev, 200 + i * 18));
         return null;
       }
       const script = [
@@ -152,7 +180,7 @@ uci commit openclash && /etc/init.d/openclash restart
 需要我帮你收紧 ttyd / Clash 9090 的监听范围，或者清掉 Docker 和 tsup 省空间吗？`),
         { type: "done", steps: 8 },
       ];
-      script.forEach((ev, i) => setTimeout(() => emit("ai-event", ev), 200 + i * 18));
+      script.forEach((ev, i) => later(ev, 200 + i * 18));
       return null;
     },
     vault_lock: () => ((state.unlocked = false), handlers.vault_status()),
@@ -216,11 +244,30 @@ uci commit openclash && /etc/init.d/openclash restart
     known_hosts_list: () => state.known,
     known_host_delete: ({ id }) => ((state.known = state.known.filter((k) => k.id !== id)), null),
     ai_providers_list: () => [
-      { id: "p1", name: "Claude", protocol: "anthropic", baseUrl: "https://api.anthropic.com/v1", models: ["claude-sonnet-5-5"], hasKey: true },
+      { id: "p1", name: "Claude", protocol: "anthropic", baseUrl: "https://api.anthropic.com/v1", models: ["claude-sonnet-5-5"], hasKey: true, contextLimit: null, contextLimits: { "claude-sonnet-5-5": 200000 } },
     ],
     ai_provider_models: () => ["claude-haiku-5-5", "claude-opus-5-5", "claude-sonnet-5-5"],
     ai_provider_test: () => "连接正常，模型回复：pong",
     ai_provider_save: ({ input }) => ({ ...input, hasKey: true }),
+    ai_approve: ({ callId, approved }) => {
+      const p = state.aiPending;
+      if (!p || p.id !== callId) throw "当前没有进行中的对话";
+      state.aiPending = null;
+      const tag = (ev) => emit("ai-event", { ...ev, turnId: p.turnId });
+      tag({ type: "toolResult", id: callId, ok: approved, content: approved ? "" : "用户拒绝了这次调用" });
+      tag({ type: "text", text: approved ? "已删除。" : "好的，不删除。" });
+      tag({ type: "done", steps: 2 });
+      return null;
+    },
+    ai_cancel: ({ turnId }) => {
+      if (!state.aiTurn || (turnId && turnId !== state.aiTurn)) return null;
+      for (const t of state.aiTimers || []) clearTimeout(t);
+      state.aiTimers = [];
+      state.aiPending = null;
+      emit("ai-event", { type: "stopped", turnId: state.aiTurn });
+      state.aiTurn = null;
+      return null;
+    },
     ai_attach: async ({ paths }) => {
       // Walk each file through real-looking progress, then the hash check.
       const wait = (ms) => new Promise((r) => setTimeout(r, ms));

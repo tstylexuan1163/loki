@@ -249,6 +249,8 @@ pub async fn close_everything(state: &AppState) {
     if let Ok(mut a) = state.attachments.lock() {
         a.clear();
     }
+    // An assistant turn must not keep working on a server after the lock.
+    stop_turn(state, None);
     if let Ok(mut d) = state.direct.lock() {
         d.stop_all();
     }
@@ -2235,6 +2237,11 @@ pub struct ProviderView {
     /// Every model the user added, in their order.
     pub models: Vec<String>,
     pub has_key: bool,
+    /// Context size set by the user for every model; `None` means automatic.
+    pub context_limit: Option<usize>,
+    /// Context sizes found automatically, by model: from the provider's model
+    /// list, or from its error for an over-long request.
+    pub context_limits: std::collections::BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2248,6 +2255,9 @@ pub struct ProviderInput {
     pub models: Vec<String>,
     /// Blank keeps the stored key.
     pub api_key: Option<String>,
+    /// Optional context size for every model; empty means automatic.
+    #[serde(default)]
+    pub context_limit: Option<usize>,
 }
 
 fn provider_from_payload(p: &serde_json::Value) -> ProviderView {
@@ -2295,7 +2305,100 @@ fn provider_from_payload(p: &serde_json::Value) -> ProviderView {
             .and_then(|v| v.as_str())
             .map(|k| !k.is_empty())
             .unwrap_or(false),
+        context_limit: manual_limit(p),
+        context_limits: known_limits(p),
     }
+}
+
+/// The context size the user set on a provider, if any.
+fn manual_limit(p: &serde_json::Value) -> Option<usize> {
+    p.get("context_limit")
+        .and_then(|v| v.as_u64())
+        .filter(|&n| n > 0)
+        .map(|n| n as usize)
+}
+
+/// Context sizes found automatically for a provider's models.
+fn known_limits(p: &serde_json::Value) -> std::collections::BTreeMap<String, usize> {
+    p.get("context_limits")
+        .and_then(|v| v.as_object())
+        .map(|o| {
+            o.iter()
+                .filter_map(|(k, v)| v.as_u64().map(|n| (k.clone(), n as usize)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The context size to plan a turn with: the user's setting, else what was
+/// found for this model, else unknown.
+fn context_limit_for(
+    state: &AppState,
+    provider_id: &str,
+    model: &str,
+) -> Result<Option<usize>, String> {
+    let vault = state.vault.lock().map_err(|e| e.to_string())?;
+    limit_in_vault(&vault, provider_id, model)
+}
+
+fn limit_in_vault(
+    vault: &crate::vault::Vault,
+    provider_id: &str,
+    model: &str,
+) -> Result<Option<usize>, String> {
+    let Some(row) = vault
+        .store()
+        .get_item(provider_id)
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(None);
+    };
+    let p = vault.decrypt_item(&row).map_err(|e| e.to_string())?.payload;
+    Ok(manual_limit(&p).or_else(|| known_limits(&p).get(model).copied()))
+}
+
+/// Records context sizes found for a provider's models.
+fn remember_limits(
+    state: &AppState,
+    provider_id: &str,
+    found: &[(String, usize)],
+) -> Result<(), String> {
+    if found.is_empty() {
+        return Ok(());
+    }
+    let vault = state.vault.lock().map_err(|e| e.to_string())?;
+    remember_in_vault(&vault, provider_id, found)
+}
+
+fn remember_in_vault(
+    vault: &crate::vault::Vault,
+    provider_id: &str,
+    found: &[(String, usize)],
+) -> Result<(), String> {
+    let Some(row) = vault
+        .store()
+        .get_item(provider_id)
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(());
+    };
+    if row.kind != "provider" {
+        return Ok(());
+    }
+    let mut item = vault.decrypt_item(&row).map_err(|e| e.to_string())?;
+    let mut limits = known_limits(&item.payload);
+    let before = limits.clone();
+    for (model, tokens) in found {
+        limits.insert(model.clone(), *tokens);
+    }
+    if limits == before {
+        return Ok(());
+    }
+    item.payload["context_limits"] = serde_json::json!(limits);
+    let row = vault
+        .encrypt_item(provider_id, "provider", &item.payload)
+        .map_err(|e| e.to_string())?;
+    vault.store().put_item(&row).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2347,6 +2450,20 @@ pub fn ai_provider_save(
         }
     }
 
+    // Sizes found automatically survive an edit; a manual size is the user's.
+    let found = match &input.id {
+        Some(existing) => vault
+            .store()
+            .get_item(existing)
+            .map_err(|e| e.to_string())?
+            .filter(|row| row.kind == "provider")
+            .map(|row| vault.decrypt_item(&row).map(|i| known_limits(&i.payload)))
+            .transpose()
+            .map_err(|e| e.to_string())?
+            .unwrap_or_default(),
+        None => Default::default(),
+    };
+
     let payload = serde_json::json!({
         "id": id,
         "name": input.name,
@@ -2354,6 +2471,8 @@ pub fn ai_provider_save(
         "base_url": base_url,
         "models": models,
         "api_key": api_key,
+        "context_limit": input.context_limit.filter(|&n| n > 0),
+        "context_limits": found,
     });
 
     let row = vault
@@ -2488,9 +2607,17 @@ pub async fn ai_provider_models(
     input: ProviderInput,
 ) -> Result<Vec<String>, String> {
     let config = config_from_input(&state, &input)?;
-    crate::ai::provider::list_models(&config)
+    let listed = crate::ai::provider::list_models_detailed(&config)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    if let Some(id) = &input.id {
+        let found: Vec<(String, usize)> = listed
+            .iter()
+            .filter_map(|(m, n)| n.map(|n| (m.clone(), n)))
+            .collect();
+        remember_limits(&state, id, &found)?;
+    }
+    Ok(listed.into_iter().map(|(m, _)| m).collect())
 }
 
 /// Proves the URL and key work, returning a human-readable verdict.
@@ -2528,7 +2655,11 @@ pub async fn ai_send(
     mode: String,
     history: Vec<serde_json::Value>,
     attachments: Option<Vec<AiAttachSend>>,
+    turn_id: Option<String>,
 ) -> Result<(), String> {
+    // Every event of this turn carries its id, so the panel can tell it from
+    // a turn it has already stopped.
+    let turn_id = turn_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let mut config = load_provider(&state, &provider_id)?;
 
     // The panel picks one of the provider's models; fall back to the first.
@@ -2539,6 +2670,27 @@ pub async fn ai_send(
     }
     if config.model.trim().is_empty() {
         return Err("这个服务商还没有添加模型".into());
+    }
+
+    // The model's context size: set by the user, found earlier, or — once per
+    // run and provider — read from its model list. Unknown is fine: nothing
+    // is shortened until the provider says a request is too long.
+    let mut context_limit = context_limit_for(&state, &provider_id, &config.model)?;
+    let first_look = context_limit.is_none()
+        && state
+            .ai_limits_checked
+            .lock()
+            .map_err(|e| e.to_string())?
+            .insert(provider_id.clone());
+    if first_look {
+        if let Ok(listed) = crate::ai::provider::list_models_detailed(&config).await {
+            let found: Vec<(String, usize)> = listed
+                .into_iter()
+                .filter_map(|(m, n)| n.map(|n| (m, n)))
+                .collect();
+            remember_limits(&state, &provider_id, &found)?;
+            context_limit = context_limit_for(&state, &provider_id, &config.model)?;
+        }
     }
 
     let permission = match mode.as_str() {
@@ -2657,22 +2809,54 @@ pub async fn ai_send(
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::ai::AiEvent>();
     let (approval_tx, approval_rx) = tokio::sync::mpsc::unbounded_channel::<crate::ai::Approval>();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
 
     {
+        // One turn at a time: a turn still running (a stale one the panel
+        // lost track of) is stopped before this one starts.
+        let mut turn = state.ai_turn.lock().map_err(|e| e.to_string())?;
+        if let Some((_, old)) = turn.take() {
+            let _ = old.send(());
+        }
+        *turn = Some((turn_id.clone(), stop_tx));
         let mut slot = state.ai_approvals.lock().map_err(|e| e.to_string())?;
         *slot = Some(approval_tx);
     }
 
     let emitter = app.clone();
+    let (learn_provider, learn_model) = (provider_id.clone(), config.model.clone());
+    let event_turn = turn_id.clone();
     tokio::spawn(async move {
         while let Some(ev) = rx.recv().await {
-            if let Err(e) = emitter.emit("ai-event", &ev) {
+            // A size the provider stated in its error is remembered for this
+            // model, so the next conversation is shortened before it fails.
+            if let crate::ai::AiEvent::LimitLearned {
+                tokens,
+                exact: true,
+            } = &ev
+            {
+                let state = emitter.state::<AppState>();
+                if let Err(e) =
+                    remember_limits(&state, &learn_provider, &[(learn_model.clone(), *tokens)])
+                {
+                    tracing::warn!("remembering the context size failed: {e}");
+                }
+            }
+            let mut payload = match serde_json::to_value(&ev) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("serialising ai-event failed: {e}");
+                    continue;
+                }
+            };
+            payload["turnId"] = serde_json::Value::String(event_turn.clone());
+            if let Err(e) = emitter.emit("ai-event", &payload) {
                 tracing::warn!("emit ai-event failed: {e}");
             }
         }
     });
 
-    crate::ai::run_turn(
+    crate::ai::run_cancellable(
         crate::ai::TurnRequest {
             config,
             history,
@@ -2680,13 +2864,44 @@ pub async fn ai_send(
             session,
             terminal_tail,
             secret_paths,
+            context_limit,
         },
         tx,
         approval_rx,
+        stop_rx,
     )
     .await;
 
+    // Leave the slots to a newer turn if one has already taken them.
+    let mut turn = state.ai_turn.lock().map_err(|e| e.to_string())?;
+    if turn.as_ref().is_some_and(|(id, _)| id == &turn_id) {
+        *turn = None;
+        if let Ok(mut slot) = state.ai_approvals.lock() {
+            *slot = None;
+        }
+    }
     Ok(())
+}
+
+/// Stops the running assistant turn: the one named, or whichever is running.
+#[tauri::command]
+pub fn ai_cancel(state: State<'_, AppState>, turn_id: Option<String>) -> Result<(), String> {
+    stop_turn(&state, turn_id.as_deref());
+    Ok(())
+}
+
+/// Stops the running turn if it is `turn_id` (any turn when `None`).
+fn stop_turn(state: &AppState, turn_id: Option<&str>) {
+    if let Ok(mut turn) = state.ai_turn.lock() {
+        let matches = turn
+            .as_ref()
+            .is_some_and(|(id, _)| turn_id.is_none_or(|want| want == id));
+        if matches {
+            if let Some((_, stop)) = turn.take() {
+                let _ = stop.send(());
+            }
+        }
+    }
 }
 
 /// Answers a gated tool call.
@@ -3769,6 +3984,53 @@ mod tests {
 
         // A category is only ever deleted through its own id.
         assert!(delete_category(&vault, "h1").is_err());
+    }
+
+    #[test]
+    fn context_sizes_are_remembered_per_model_and_a_manual_one_wins() {
+        let vault = vault_with(
+            "p1",
+            serde_json::json!({ "id": "p1", "models": ["a", "b"] }),
+        );
+        assert_eq!(limit_in_vault(&vault, "p1", "a").unwrap(), None);
+
+        remember_in_vault(
+            &vault,
+            "p1",
+            &[("a".into(), 1_048_576), ("b".into(), 65_536)],
+        )
+        .unwrap();
+        assert_eq!(limit_in_vault(&vault, "p1", "a").unwrap(), Some(1_048_576));
+        assert_eq!(limit_in_vault(&vault, "p1", "b").unwrap(), Some(65_536));
+        assert_eq!(limit_in_vault(&vault, "p1", "c").unwrap(), None);
+
+        // A later finding for one model leaves the others alone.
+        remember_in_vault(&vault, "p1", &[("b".into(), 131_072)]).unwrap();
+        assert_eq!(limit_in_vault(&vault, "p1", "a").unwrap(), Some(1_048_576));
+        assert_eq!(limit_in_vault(&vault, "p1", "b").unwrap(), Some(131_072));
+
+        // The user's setting applies to every model of the provider.
+        let mut item = vault
+            .decrypt_item(&vault.store().get_item("p1").unwrap().unwrap())
+            .unwrap();
+        item.payload["context_limit"] = serde_json::json!(8_192);
+        vault
+            .store()
+            .put_item(&vault.encrypt_item("p1", "provider", &item.payload).unwrap())
+            .unwrap();
+        assert_eq!(limit_in_vault(&vault, "p1", "a").unwrap(), Some(8_192));
+        assert_eq!(manual_limit(&item.payload), Some(8_192));
+
+        // Never written onto a record that is not a provider.
+        put_host(&vault, "h1", &[]);
+        remember_in_vault(&vault, "h1", &[("a".into(), 1)]).unwrap();
+        assert!(known_limits(
+            &vault
+                .decrypt_item(&vault.store().get_item("h1").unwrap().unwrap())
+                .unwrap()
+                .payload
+        )
+        .is_empty());
     }
 
     #[test]

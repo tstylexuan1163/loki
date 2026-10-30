@@ -1,13 +1,12 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import {
   aiApi,
   attachmentApi,
-  conversationApi,
   errorMessage,
-  type AiEvent,
+  formatTokens,
   type ChatMessage,
   type AttachmentView,
   type PermissionMode,
@@ -15,7 +14,20 @@ import {
 } from "@/lib/api";
 import { confirmDialog, toast } from "@/components/ui";
 import { useApp } from "@/app/store";
+import { useTerminals } from "@/features/terminal/terminals";
 import { ConversationHistory } from "@/features/ai/ConversationHistory";
+import {
+  blankChat,
+  listenForTurns,
+  newConversationId,
+  saveChat,
+  useChats,
+  type Chat,
+  type Part,
+  type ToolCallView,
+  type Turn,
+  type TurnAttachment,
+} from "@/features/ai/chats";
 import { useAiComposer } from "@/features/ai/aiComposer";
 import {
   IconAlert,
@@ -28,43 +40,11 @@ import {
   IconPaperclip,
   IconPlus,
   IconSparkle,
+  IconStop,
   IconX,
   IconCopy,
 } from "@/components/icons";
 import { Markdown } from "@/features/ai/Markdown";
-
-interface ToolCallView {
-  id: string;
-  name: string;
-  args: unknown;
-  auto: boolean;
-  /** undefined while waiting for the user. */
-  result?: { ok: boolean; content: string };
-  /** Set when the model produced this call, so the history round-trips. */
-}
-
-/**
- * One block of a turn, kept in the order it happened: the model writes, calls
- * a tool, writes again. Rendering text first and every tool card after it (as
- * the first version did) put the answer above the work that produced it.
- */
-type Part = { kind: "text"; text: string } | { kind: "tool"; call: ToolCallView };
-
-/** Metadata of a file sent with a user message; no content, no local path. */
-interface TurnAttachment {
-  name: string;
-  size: number;
-  sha256: string;
-  remotePath: string;
-  secret: boolean;
-}
-
-interface Turn {
-  role: "user" | "assistant";
-  parts: Part[];
-  error?: string;
-  attachments?: TurnAttachment[];
-}
 
 /**
  * Reminds the model, in later turns, which files an earlier message carried.
@@ -78,33 +58,6 @@ function attachmentNote(list: TurnAttachment[]): string {
       : `#${i + 1} ${a.name}，${formatSize(a.size)}，路径 ${a.remotePath}`,
   );
   return `\n\n附件（已上传到服务器）：\n${lines.join("\n")}`;
-}
-
-/** Applies one engine event to the parts of the turn that is running. */
-function applyEvent(parts: Part[], ev: AiEvent): Part[] {
-  if (ev.type === "text") {
-    const last = parts[parts.length - 1];
-    // Consecutive pieces belong to the same paragraph; after a tool call the
-    // model is writing a new block.
-    if (last?.kind === "text") {
-      return [...parts.slice(0, -1), { kind: "text", text: last.text + ev.text }];
-    }
-    return [...parts, { kind: "text", text: ev.text }];
-  }
-  if (ev.type === "toolCall") {
-    return [
-      ...parts,
-      { kind: "tool", call: { id: ev.id, name: ev.name, args: ev.arguments, auto: ev.auto } },
-    ];
-  }
-  if (ev.type === "toolResult") {
-    return parts.map((p) =>
-      p.kind === "tool" && p.call.id === ev.id
-        ? { kind: "tool", call: { ...p.call, result: { ok: ev.ok, content: ev.content } } }
-        : p,
-    );
-  }
-  return parts;
 }
 
 /**
@@ -143,13 +96,6 @@ function turnToMessages(parts: Part[]): ChatMessage[] {
   return out;
 }
 
-/** A conversation id; the panel owns it, the store just keeps it. */
-function newConversationId(): string {
-  const c = globalThis.crypto as Crypto | undefined;
-  if (c && "randomUUID" in c) return c.randomUUID();
-  return `c-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-}
-
 /** `2.1 KB` in the bubble, matching the card. */
 function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -163,31 +109,56 @@ const textOf = (t: Turn) =>
 /**
  * The assistant panel beside the terminal.
  *
- * The conversation lives here; the turn runs in Rust and streams events. A
- * gated tool call blocks in the engine until this panel sends its approval, so
- * closing the panel mid-turn reads as a refusal rather than a silent execution.
+ * It shows the conversation of the tab in front (see `chats.ts`); the turn
+ * runs in Rust and streams events into the tab that asked. A gated tool call
+ * blocks in the engine until the user approves it in that tab's conversation.
  */
 export function AiPanel({
+  tabId,
   sessionId,
   hostId,
   hostLabel,
   onClose,
 }: {
+  /** The terminal tab whose conversation this is. */
+  tabId: string;
   sessionId: string | null;
   /** Host this tab is bound to, so a conversation can be listed per host. */
   hostId?: string | null;
   hostLabel?: string;
   onClose: () => void;
 }) {
-  const [turns, setTurns] = useState<Turn[]>([]);
-  const [draft, setDraft] = useState("");
+  const ensure = useChats((s) => s.ensure);
+  const update = useChats((s) => s.update);
+  const replace = useChats((s) => s.replace);
+  const setRunningTab = useChats((s) => s.setRunning);
+  const stopTurn = useChats((s) => s.stop);
+  const stored = useChats((s) => s.chats[tabId]);
+  const runningTab = useChats((s) => s.runningTab);
+  // Until `ensure` lands (one render), show an empty conversation.
+  const fallback = useMemo(() => blankChat(hostId ?? null, hostLabel ?? ""), [hostId, hostLabel]);
+  const chat: Chat = stored ?? fallback;
+  const turns = chat.turns;
+  const draft = chat.draft;
+  const error = chat.error;
+  const setDraft = (next: string | ((cur: string) => string)) =>
+    update(tabId, { draft: typeof next === "function" ? next(useChats.getState().chats[tabId]?.draft ?? "") : next });
+  const setError = (message: string | null) => update(tabId, { error: message });
+  // One turn at a time across all tabs; `runningHere` is this tab's.
+  const running = runningTab !== null;
+  const runningHere = runningTab === tabId;
+
+  useEffect(() => {
+    listenForTurns();
+  }, []);
+  useEffect(() => {
+    ensure(tabId, hostId ?? null, hostLabel ?? "");
+  }, [tabId, hostId, hostLabel, ensure]);
+
   const [mode, setMode] = useState<PermissionMode>("manual");
   const [providers, setProviders] = useState<ProviderView[]>([]);
   const [providerId, setProviderId] = useState<string | null>(null);
   const [model, setModel] = useState<string | null>(null);
-  const [running, setRunning] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [conversationId, setConversationId] = useState(newConversationId);
   // Files attached to the message being composed, and everything uploaded per
   // session (for the clean-up row). The panel outlives tab switches, so both
   // are tied to a session: a path staged on one server is wrong on another.
@@ -232,17 +203,8 @@ export function AiPanel({
     setPendingInsert(null);
     inputRef.current?.focus();
   }, [pendingInsert, setPendingInsert]);
-  const [title, setTitle] = useState("");
   const [historyOpen, setHistoryOpen] = useState(false);
-  const createdAt = useRef(Math.floor(Date.now() / 1000));
   const logRef = useRef<HTMLDivElement>(null);
-  // The host a conversation belongs to, captured when it is created: switching
-  // tabs mid-conversation must not silently rebind the transcript.
-  const boundHost = useRef({ id: hostId ?? null, label: hostLabel ?? "" });
-  const turnsRef = useRef<Turn[]>([]);
-  useEffect(() => {
-    turnsRef.current = turns;
-  }, [turns]);
 
   useEffect(() => {
     void (async () => {
@@ -268,79 +230,11 @@ export function AiPanel({
 
   const activeModelOptions = providers.find((p) => p.id === providerId)?.models ?? [];
 
-  // Stream the engine's events into the last assistant turn.
-  useEffect(() => {
-    let disposed = false;
-    let un: (() => void) | undefined;
-
-    void listen<AiEvent>("ai-event", (evt) => {
-      const ev = evt.payload;
-      setTurns((prev) => {
-        const last = prev[prev.length - 1];
-        if (!last || last.role !== "assistant") return prev;
-        const updated: Turn =
-          ev.type === "error" ? { ...last, error: ev.message } : { ...last, parts: applyEvent(last.parts, ev) };
-        return [...prev.slice(0, -1), updated];
-      });
-
-      if (ev.type === "done" || ev.type === "error") setRunning(false);
-    }).then((f) => {
-      if (disposed) f();
-      else un = f;
-    });
-
-    return () => {
-      disposed = true;
-      un?.();
-    };
-  }, []);
-
-  /** Saves the conversation as it stands. Failures stay quiet on purpose: a
-   *  full disk must not interrupt a chat, and the next save retries. */
-  const persist = useCallback(
-    async (snapshot?: Turn[]) => {
-      const list = snapshot ?? turnsRef.current;
-      if (list.length === 0) return;
-      const firstUser = list.find((t) => t.role === "user");
-      const fallback = firstUser ? textOf(firstUser).trim().slice(0, 30) : "";
-      try {
-        await conversationApi.save({
-          id: conversationId,
-          title: title || fallback || "未命名对话",
-          hostId: boundHost.current.id,
-          hostLabel: boundHost.current.label,
-          providerId,
-          model,
-          createdAt: createdAt.current,
-          updatedAt: Math.floor(Date.now() / 1000),
-          turns: list,
-        });
-      } catch {
-        /* ignored: see above */
-      }
-    },
-    [conversationId, title, providerId, model],
-  );
-  const persistRef = useRef(persist);
-  useEffect(() => {
-    persistRef.current = persist;
-  }, [persist]);
-
-  // A finished turn is saved once more, when the parts have all arrived.
-  const wasRunning = useRef(false);
-  useEffect(() => {
-    if (wasRunning.current && !running) void persistRef.current();
-    wasRunning.current = running;
-  }, [running]);
-
-  // Locking the vault clears the panel, like the terminals around it.
+  // Locking the vault clears the panel, like the terminals around it (the
+  // conversations themselves are dropped by chats.ts).
   const phase = useApp((s) => s.phase);
   useEffect(() => {
     if (phase === "unlocked") return;
-    setTurns([]);
-    setConversationId(newConversationId());
-    setTitle("");
-    createdAt.current = Math.floor(Date.now() / 1000);
     setHistoryOpen(false);
     // Rust forgot the attachments when the vault locked; cards left here would
     // be dropped silently on the next send.
@@ -349,18 +243,24 @@ export function AiPanel({
     setFilesBySession({});
   }, [phase]);
 
-  /** Replaces the panel contents with a stored conversation. */
+  /**
+   * Shows a stored conversation in this tab. One about another host is shown
+   * read-only: continuing it here would run its commands on this tab's server.
+   */
   function openConversation(conv: Record<string, unknown>) {
-    const next = Array.isArray(conv.turns) ? (conv.turns as Turn[]) : [];
-    setTurns(next);
-    setConversationId(String(conv.id));
-    setTitle(typeof conv.title === "string" ? conv.title : "");
-    boundHost.current = {
-      id: typeof conv.hostId === "string" ? conv.hostId : null,
-      label: typeof conv.hostLabel === "string" ? conv.hostLabel : "",
-    };
-    createdAt.current =
-      typeof conv.createdAt === "number" ? conv.createdAt : Math.floor(Date.now() / 1000);
+    const convHost = typeof conv.hostId === "string" ? conv.hostId : null;
+    const convLabel = typeof conv.hostLabel === "string" ? conv.hostLabel : "";
+    const sameHost = convHost ? convHost === (hostId ?? null) : !hostId && convLabel === (hostLabel ?? "");
+    replace(tabId, {
+      ...blankChat(convHost, convLabel),
+      id: String(conv.id),
+      title: typeof conv.title === "string" ? conv.title : "",
+      createdAt: typeof conv.createdAt === "number" ? conv.createdAt : Math.floor(Date.now() / 1000),
+      turns: Array.isArray(conv.turns) ? (conv.turns as Turn[]) : [],
+      providerId: typeof conv.providerId === "string" ? conv.providerId : null,
+      model: typeof conv.model === "string" ? conv.model : null,
+      foreign: sameHost ? null : { hostId: convHost, hostLabel: convLabel },
+    });
     if (typeof conv.providerId === "string") setProviderId(conv.providerId);
     if (typeof conv.model === "string") setModel(conv.model);
     setHistoryOpen(false);
@@ -368,13 +268,28 @@ export function AiPanel({
   }
 
   function newConversation() {
-    if (running) return;
-    setTurns([]);
-    setConversationId(newConversationId());
-    setTitle("");
-    createdAt.current = Math.floor(Date.now() / 1000);
-    boundHost.current = { id: hostId ?? null, label: hostLabel ?? "" };
-    setError(null);
+    if (runningHere) return;
+    replace(tabId, blankChat(hostId ?? null, hostLabel ?? ""));
+  }
+
+  /**
+   * Moves a conversation that belongs to another host over to a tab on that
+   * host: an open tab whose own conversation is still empty, else a new one.
+   */
+  function continueOnItsHost() {
+    const foreign = chat.foreign;
+    const host = useApp.getState().hosts.find((h) => h.id === foreign?.hostId);
+    if (!foreign || !host) {
+      toast("找不到这台主机，可能已被删除", "error");
+      return;
+    }
+    const terms = useTerminals.getState();
+    const chats = useChats.getState().chats;
+    const free = terms.tabs.find((t) => t.hostId === host.id && !(chats[t.id]?.turns.length));
+    const target = free ? free.id : terms.openHost(host);
+    if (free) terms.activate(free.id);
+    replace(target, { ...chat, foreign: null, draft: "", error: null });
+    replace(tabId, blankChat(hostId ?? null, hostLabel ?? ""));
   }
 
 
@@ -505,6 +420,10 @@ export function AiPanel({
     };
   }, [sessionId]);
 
+  // A report only comes when the conversation had to be shortened to fit the
+  // model: from then on, a fresh conversation would be faster and lose less.
+  const long = [...turns].reverse().find((t) => t.context)?.context ?? null;
+
   const history = useCallback((): ChatMessage[] => {
     const out: ChatMessage[] = [];
     for (const t of turns) {
@@ -519,7 +438,7 @@ export function AiPanel({
 
   async function send() {
     const text = draft.trim();
-    if (!text || running) return;
+    if (!text || running || chat.foreign) return;
     if (!providerId) {
       setError("先在设置里添加一个模型服务商");
       return;
@@ -546,17 +465,23 @@ export function AiPanel({
     const assistantTurn: Turn = { role: "assistant", parts: [] };
     // History must go to Rust *without* the placeholder assistant turn.
     const prior = history();
-    const nextTurns = [...turns, userTurn, assistantTurn];
-    setTurns(nextTurns);
-    setDraft("");
+    const next: Chat = {
+      ...chat,
+      turns: [...turns, userTurn, assistantTurn],
+      draft: "",
+      error: null,
+      providerId,
+      model,
+    };
+    replace(tabId, next);
     setPending([]);
     setShareContent({});
     pinned.current = true;
-    setRunning(true);
-    setError(null);
+    const turnId = newConversationId();
+    setRunningTab(tabId, turnId);
     // Save as soon as the question is asked, so closing the panel right after
     // sending still leaves the conversation in the history.
-    void persist(nextTurns);
+    void saveChat(next);
 
     try {
       await aiApi.send(
@@ -566,10 +491,11 @@ export function AiPanel({
         mode,
         [...prior, { role: "user", content: text }],
         sendList,
+        turnId,
       );
     } catch (e) {
       setError(errorMessage(e));
-      setRunning(false);
+      setRunningTab(null);
     }
   }
 
@@ -580,7 +506,7 @@ export function AiPanel({
           <IconSparkle size={14} /> 助手
         </span>
         <div className="spacer" />
-        <button className="iconbtn" title="新对话" disabled={running} onClick={newConversation}>
+        <button className="iconbtn" title="新对话" disabled={runningHere} onClick={newConversation}>
           <IconPlus size={14} />
         </button>
         <button
@@ -672,10 +598,31 @@ export function AiPanel({
         )}
 
         {turns.map((t, i) => {
-          const live = running && i === turns.length - 1;
+          const live = runningHere && i === turns.length - 1;
           return (
             <div key={i} className={`ai__turn ai__turn--${t.role}`}>
               {t.role === "assistant" && <div className="ai__who">助手</div>}
+              {t.learned && (
+                <div className="ai__trimmed">
+                  {t.learned.exact
+                    ? `这个模型的上下文上限是 ${formatTokens(t.learned.tokens)} token（服务商在报错中给出，已记住），已精简后自动重试。`
+                    : "请求超过了模型能接收的长度，已精简后自动重试。"}
+                </div>
+              )}
+              {t.context && (t.context.droppedRounds > 0 || t.context.shortenedOutputs > 0) && (
+                <div
+                  className="ai__trimmed"
+                  title={`本次发送约 ${formatTokens(t.context.tokens)} token，模型上限 ${formatTokens(t.context.limit)}`}
+                >
+                  为控制长度：
+                  {[
+                    t.context.shortenedOutputs > 0 && `${t.context.shortenedOutputs} 段命令输出已精简`,
+                    t.context.droppedRounds > 0 && `更早的 ${t.context.droppedRounds} 轮对话未发送`,
+                  ]
+                    .filter(Boolean)
+                    .join("，")}
+                </div>
+              )}
               {t.attachments && t.attachments.length > 0 && (
                 <div className="ai__sentFiles">
                   {t.attachments.map((a) => (
@@ -698,18 +645,20 @@ export function AiPanel({
                 ) : (
                   <ToolGroup
                     key={j}
+                    live={live}
                     calls={seg.calls}
                     onApprove={(id, approved) => void aiApi.approve(id, approved)}
                   />
                 ),
               )}
               {t.error && <div className="error">{t.error}</div>}
+              {t.stopped && <div className="ai__stopped">已停止</div>}
             </div>
           );
         })}
 
         {/* Only while nothing is being written: the caret already says "busy". */}
-        {running && turns[turns.length - 1]?.parts.at(-1)?.kind !== "text" && (
+        {runningHere && turns[turns.length - 1]?.parts.at(-1)?.kind !== "text" && (
           <div className="ai__thinking">
             <span className="dots">
               <i />
@@ -790,6 +739,40 @@ export function AiPanel({
         </div>
       )}
 
+      {chat.foreign && (
+        <div className="ai__foreign">
+          <div>
+            这段对话来自 <strong>{chat.foreign.hostLabel || "另一台主机"}</strong>，当前标签是{" "}
+            <strong>{hostLabel || "本地"}</strong>。在这里继续，命令会在当前标签的服务器上执行，所以只能查看。
+          </div>
+          <div className="ai__foreign-actions">
+            {chat.foreign.hostId && useApp.getState().hosts.some((h) => h.id === chat.foreign?.hostId) && (
+              <button className="btn btn--sm btn--primary" onClick={continueOnItsHost}>
+                到 {chat.foreign.hostLabel || "那台主机"} 继续
+              </button>
+            )}
+            <button className="btn btn--sm" onClick={newConversation}>
+              在这里开新对话
+            </button>
+          </div>
+        </div>
+      )}
+
+      {!chat.foreign && !runningHere && long && (
+        <div className="ai__long">
+          <span>
+            对话已接近模型上限（约 {formatTokens(long.tokens)} / {formatTokens(long.limit)} token），较早的内容会被精简或不再发送。开新对话会更快、更完整。
+          </span>
+          <button className="btn btn--sm" onClick={newConversation}>
+            开新对话
+          </button>
+        </div>
+      )}
+
+      {running && !runningHere && (
+        <div className="ai__note">另一个标签的助手正在执行，完成后才能在这里提问。</div>
+      )}
+
       <div className="ai__composer">
         <button
           className="ai__attachBtn"
@@ -802,7 +785,8 @@ export function AiPanel({
         <textarea
           ref={inputRef}
           className="ai__input"
-          placeholder="输入问题，Enter 发送，Shift+Enter 换行"
+          disabled={!!chat.foreign}
+          placeholder={chat.foreign ? "这段对话只能查看" : "输入问题，Enter 发送，Shift+Enter 换行"}
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
           onKeyDown={(e) => {
@@ -812,27 +796,31 @@ export function AiPanel({
             }
           }}
         />
-        <button
-          className="ai__send"
-          disabled={running || !draft.trim()}
-          onClick={() => void send()}
-          title="发送 (Enter)"
-        >
-          <IconSend size={15} />
-        </button>
+        {runningHere ? (
+          <button className="ai__send ai__send--stop" onClick={stopTurn} title="停止">
+            <IconStop size={13} />
+          </button>
+        ) : (
+          <button
+            className="ai__send"
+            disabled={running || !!chat.foreign || !draft.trim()}
+            onClick={() => void send()}
+            title="发送 (Enter)"
+          >
+            <IconSend size={15} />
+          </button>
+        )}
       </div>
 
       {historyOpen && (
         <ConversationHistory
           hostId={hostId ?? null}
           hostLabel={hostLabel ?? ""}
-          currentId={conversationId}
-          disabled={running}
+          currentId={chat.id}
+          disabled={runningHere}
           onClose={() => setHistoryOpen(false)}
           onOpen={openConversation}
-          onRenamed={(id, next) => {
-            if (id === conversationId) setTitle(next);
-          }}
+          onRenamed={(id, next) => useChats.getState().renamed(id, next)}
         />
       )}
     </div>
@@ -867,9 +855,13 @@ const TOOL_LABEL: Record<string, string> = {
  * 步") so the answer stays readable; a call waiting for approval always shows.
  */
 function ToolGroup({
+  live,
   calls,
   onApprove,
 }: {
+  /** Whether this is the turn that is running; otherwise an unfinished call
+   *  was cut off (stopped, or the app closed) and will never finish. */
+  live: boolean;
   calls: ToolCallView[];
   onApprove: (id: string, approved: boolean) => void;
 }) {
@@ -877,9 +869,9 @@ function ToolGroup({
   // Only the user opens or closes the list. Tying it to "a call is running"
   // made it flap open and shut on every call while the model worked.
   const [open, setOpen] = useState(false);
-  const running = calls.find((c) => !c.result && c.auto);
+  const running = live ? calls.find((c) => !c.result && c.auto) : undefined;
   // A call waiting for approval is shown even when folded: it needs a click.
-  const asking = calls.filter((c) => !c.result && !c.auto);
+  const asking = live ? calls.filter((c) => !c.result && !c.auto) : [];
   const pending = !!running || asking.length > 0;
 
   if (calls.length === 1) {
@@ -887,7 +879,7 @@ function ToolGroup({
     return (
       <div className={`steps ${failed ? "steps--warn" : ""}`}>
         <div className="steps__list">
-          <ToolRow call={c} onApprove={(ok) => onApprove(c.id, ok)} />
+          <ToolRow call={c} live={live} onApprove={(ok) => onApprove(c.id, ok)} />
         </div>
       </div>
     );
@@ -915,7 +907,7 @@ function ToolGroup({
       {shown.length > 0 && (
         <div className="steps__list">
           {shown.map((c) => (
-            <ToolRow key={c.id} call={c} onApprove={(ok) => onApprove(c.id, ok)} />
+            <ToolRow key={c.id} call={c} live={live} onApprove={(ok) => onApprove(c.id, ok)} />
           ))}
         </div>
       )}
@@ -923,11 +915,28 @@ function ToolGroup({
   );
 }
 
-function ToolRow({ call, onApprove }: { call: ToolCallView; onApprove: (approved: boolean) => void }) {
+function ToolRow({
+  call,
+  live,
+  onApprove,
+}: {
+  call: ToolCallView;
+  live: boolean;
+  onApprove: (approved: boolean) => void;
+}) {
   const [open, setOpen] = useState(false);
   const waiting = !call.result;
-  const needsHuman = waiting && !call.auto;
-  const state = call.result ? (call.result.ok ? "ok" : "err") : needsHuman ? "ask" : "run";
+  const cancelled = waiting && !live;
+  const needsHuman = waiting && !call.auto && !cancelled;
+  const state = call.result
+    ? call.result.ok
+      ? "ok"
+      : "err"
+    : cancelled
+      ? "skip"
+      : needsHuman
+        ? "ask"
+        : "run";
 
   return (
     <div className={`step step--${state}`}>
@@ -939,12 +948,15 @@ function ToolRow({ call, onApprove }: { call: ToolCallView; onApprove: (approved
             <IconAlert size={12} />
           ) : state === "ask" ? (
             <IconClock size={12} />
+          ) : state === "skip" ? (
+            <IconX size={12} />
           ) : (
             <span className="spinner spinner--xs" />
           )}
         </span>
         <span className="step__label">{TOOL_LABEL[call.name] ?? call.name}</span>
         <code className="step__summary">{summarize(call.args)}</code>
+        {cancelled && <span className="step__skipped">未执行</span>}
         {call.result && (
           <IconChevronRight size={12} className={`step__chev ${open ? "step__chev--open" : ""}`} />
         )}

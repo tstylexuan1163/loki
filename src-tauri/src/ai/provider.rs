@@ -717,6 +717,31 @@ pub fn validate_base_url(raw: &str) -> Result<String, AiError> {
 
 /// Lists the models the provider offers (`GET {base}/models`).
 pub async fn list_models(config: &ProviderConfig) -> Result<Vec<String>, AiError> {
+    Ok(list_models_detailed(config)
+        .await?
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect())
+}
+
+/// The context size a model-list entry states, if it states one. OpenAI and
+/// DeepSeek do not; OpenRouter (`context_length`, also under `top_provider`),
+/// vLLM (`max_model_len`), LM Studio (`max_context_length`) and others do.
+pub fn context_of(item: &Value) -> Option<usize> {
+    let n = |v: Option<&Value>| v.and_then(|v| v.as_u64()).filter(|&n| n >= 1_024);
+    n(item.get("context_length"))
+        .or_else(|| n(item.pointer("/top_provider/context_length")))
+        .or_else(|| n(item.get("max_model_len")))
+        .or_else(|| n(item.get("max_context_length")))
+        .or_else(|| n(item.get("context_window")))
+        .or_else(|| n(item.get("max_input_tokens")))
+        .map(|n| n as usize)
+}
+
+/// Model ids with the context size each entry states.
+pub async fn list_models_detailed(
+    config: &ProviderConfig,
+) -> Result<Vec<(String, Option<usize>)>, AiError> {
     let url = endpoint(&config.base_url, "models");
     let resp = with_auth(client()?.get(&url), config.protocol, &config.api_key)
         .send()
@@ -744,15 +769,15 @@ pub async fn list_models(config: &ProviderConfig) -> Result<Vec<String>, AiError
         .or_else(|| parsed.as_array())
         .ok_or_else(|| AiError::Parse("模型列表格式无法识别".into()))?;
 
-    let mut out: Vec<String> = Vec::new();
+    let mut out: Vec<(String, Option<usize>)> = Vec::new();
     for item in items {
         let id = item
             .get("id")
             .or_else(|| item.get("name"))
             .and_then(|v| v.as_str());
         if let Some(id) = id {
-            if !id.is_empty() && !out.iter().any(|m| m == id) {
-                out.push(id.to_string());
+            if !id.is_empty() && !out.iter().any(|(m, _)| m == id) {
+                out.push((id.to_string(), context_of(item)));
             }
         }
     }
@@ -1352,6 +1377,21 @@ mod tests {
             models: vec!["gpt-4o".into()],
             api_key: "k".into(),
         }
+    }
+
+    #[test]
+    fn model_lists_that_state_a_context_size_are_read() {
+        let openrouter = serde_json::json!({ "id": "x", "context_length": 1_048_576 });
+        assert_eq!(context_of(&openrouter), Some(1_048_576));
+        let nested =
+            serde_json::json!({ "id": "x", "top_provider": { "context_length": 131_072 } });
+        assert_eq!(context_of(&nested), Some(131_072));
+        let vllm = serde_json::json!({ "id": "x", "max_model_len": 32_768 });
+        assert_eq!(context_of(&vllm), Some(32_768));
+        // OpenAI and DeepSeek list ids only.
+        let openai =
+            serde_json::json!({ "id": "gpt-4o", "object": "model", "created": 1_715_367_049 });
+        assert_eq!(context_of(&openai), None);
     }
 
     #[test]

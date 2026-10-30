@@ -148,6 +148,12 @@ export function sortedCategories(tags: string[], categories: CategoryView[]): st
   return [...tags].sort((a, b) => rank(a) - rank(b));
 }
 
+/** Token counts for Chinese readers: `1.2 万`, `104.9 万`; plain below ten thousand. */
+export function formatTokens(n: number): string {
+  if (n >= 100_000_000) return `${+(n / 100_000_000).toFixed(1)} 亿`;
+  return n >= 10_000 ? `${+(n / 10_000).toFixed(1)} 万` : String(n);
+}
+
 export function tagColor(tag: string): string {
   let h = 0;
   for (let i = 0; i < tag.length; i++) h = (h * 31 + tag.charCodeAt(i)) % 360;
@@ -369,6 +375,10 @@ export interface ProviderView {
   /** Every model the user added, in their order. */
   models: string[];
   hasKey: boolean;
+  /** Context size the user set for every model; null means automatic. */
+  contextLimit: number | null;
+  /** Context sizes found automatically, by model id. */
+  contextLimits: Record<string, number>;
 }
 
 export interface ProviderInput {
@@ -378,6 +388,7 @@ export interface ProviderInput {
   baseUrl: string;
   models: string[];
   apiKey?: string;
+  contextLimit?: number | null;
 }
 
 export interface ChatMessage {
@@ -391,8 +402,14 @@ export type AiEvent =
   | { type: "text"; text: string }
   | { type: "toolCall"; id: string; name: string; arguments: unknown; auto: boolean }
   | { type: "toolResult"; id: string; ok: boolean; content: string }
+  | { type: "context"; droppedRounds: number; shortenedOutputs: number; tokens: number; limit: number }
+  | { type: "limitLearned"; tokens: number; exact: boolean }
   | { type: "done"; steps: number }
-  | { type: "error"; message: string };
+  | { type: "error"; message: string }
+  | { type: "stopped" };
+
+/** An event as emitted: tagged with the turn it belongs to. */
+export type AiEventPayload = AiEvent & { turnId?: string };
 
 export const aiApi = {
   providers: () => invoke<ProviderView[]>("ai_providers_list"),
@@ -409,9 +426,12 @@ export const aiApi = {
     mode: PermissionMode,
     history: ChatMessage[],
     attachments: { id: string; shareContent: boolean }[] = [],
-  ) => invoke<void>("ai_send", { providerId, model, sessionId, mode, history, attachments }),
+    turnId: string | null = null,
+  ) => invoke<void>("ai_send", { providerId, model, sessionId, mode, history, attachments, turnId }),
   approve: (callId: string, approved: boolean) =>
     invoke<void>("ai_approve", { callId, approved }),
+  /** Stops the running turn (the one named, or whichever runs). */
+  cancel: (turnId: string | null = null) => invoke<void>("ai_cancel", { turnId }),
 };
 
 // ---- Sync ----------------------------------------------------------------
