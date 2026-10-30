@@ -1,6 +1,6 @@
 # loki — 构建进度
 
-> **当前版本 v0.11.0**（见 [release-notes/v0.11.0.md](release-notes/v0.11.0.md)）。打包产物：`src-tauri/target/release/bundle/dmg/loki_0.11.0_aarch64.dmg`
+> **当前版本 v0.11.1**（见 [release-notes/v0.11.1.md](release-notes/v0.11.1.md)）。打包产物：`src-tauri/target/release/bundle/dmg/loki_0.11.1_aarch64.dmg`
 > 与 `.../macos/loki.app`（ad-hoc 签名，arm64）。v0.8.0 的新增内容见第 13 节；
 > AI 服务商改造的详细说明单独写在 [AI_PROVIDER_SETTINGS.md](AI_PROVIDER_SETTINGS.md)。
 
