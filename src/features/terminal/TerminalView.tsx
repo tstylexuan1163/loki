@@ -7,6 +7,7 @@ import { StatusBar } from "@/features/terminal/StatusBar";
 import { QuickConnect } from "@/features/terminal/QuickConnect";
 import { SftpPanel } from "@/features/sftp/SftpPanel";
 import { AiPanel } from "@/features/ai/AiPanel";
+import { useAiComposer } from "@/features/ai/aiComposer";
 import { Menu, confirmDialog, toast, useMenu } from "@/components/ui";
 import { isAppShortcut, keyLabel, shortcutKey } from "@/app/platform";
 import { recordApi, formatBytes } from "@/lib/api";
@@ -352,7 +353,14 @@ export function TerminalView({ visible }: { visible: boolean }) {
               <Splitter width={panelWidth} onChange={(w) => setPref("panelWidth", w)} />
               <div className="sidepanel" style={{ width: panelWidth }}>
                 {panel === "files" && current.sessionId && current.kind === "ssh" ? (
-                  <SftpPanel key={current.sessionId} sessionId={current.sessionId} />
+                  <SftpPanel
+                    key={current.sessionId}
+                    sessionId={current.sessionId}
+                    onSendToAi={(remotePath) => {
+                      setPanel("ai");
+                      useAiComposer.getState().setPendingInsert("`" + remotePath + "`");
+                    }}
+                  />
                 ) : panel === "ai" ? (
                   <AiPanel
                     sessionId={current.kind === "ssh" ? current.sessionId : null}

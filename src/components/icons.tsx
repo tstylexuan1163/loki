@@ -170,6 +170,9 @@ export const IconFilePlus = make(
     <path d="M14 3v5h5M12 12v6M9 15h6" />
   </>,
 );
+export const IconPaperclip = make(
+  <path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48" />,
+);
 export const IconCheck = make(<path d="M20 6 9 17l-5-5" />);
 export const IconAlert = make(<path d="M12 9v4M12 17h.01M10.3 3.9 2.4 18a2 2 0 0 0 1.7 3h15.8a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z" />);
 export const IconInfo = make(

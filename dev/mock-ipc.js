@@ -72,12 +72,39 @@
     // A turn streamed token by token, with tool calls in between, the way the
     // engine emits it. The reply mirrors a real ops answer: headings, a
     // numbered list, inline code, a table and a code block.
-    ai_send: () => {
+    ai_send: ({ attachments }) => {
       const say = (text) => (text.match(/[\s\S]{1,4}/gu) ?? []).map((t) => ({ type: "text", text: t }));
       const tool = (id, command, content) => [
         { type: "toolCall", id, name: "run_command", arguments: { command }, auto: true },
         { type: "toolResult", id, ok: true, content },
       ];
+      // With attachments the demo plays a certificate replacement, so the flow
+      // in the plan (backup, replace, test, reload) is visible end to end.
+      if (attachments && attachments.length) {
+        const certScript = [
+          ...say("收到证书和私钥。按惯例先备份现有的 nginx 配置，再替换、校验、重载。"),
+          ...tool("a1", "cp /etc/nginx/ssl/site.crt /etc/nginx/ssl/site.crt.20261030.bak && echo backed-up", "/etc/nginx/ssl/site.crt.20261030.bak"),
+          ...tool("a2", "install -m 644 ~/.loki/uploads/20261030-090000-ab12/site.crt /etc/nginx/ssl/site.crt && echo installed", "installed"),
+          ...tool("a3", "install -m 600 ~/.loki/uploads/20261030-090000-ab12/site.key /etc/nginx/ssl/site.key && echo installed", "installed"),
+          ...tool("a4", "openssl x509 -noout -subject -dates -in /etc/nginx/ssl/site.crt", "subject=CN = example.com\nnotAfter=Mar  1 00:00:00 2027 GMT"),
+          ...tool("a5", "openssl pkey -in /etc/nginx/ssl/site.key -pubout | sha256sum; openssl x509 -in /etc/nginx/ssl/site.crt -pubkey -noout | sha256sum", "9f2c…  -\\n9f2c…  -"),
+          ...tool("a6", "nginx -t", "nginx: configuration file /etc/nginx/nginx.conf test is successful"),
+          ...tool("a7", "systemctl reload nginx && echo reloaded", "reloaded"),
+          ...say(`## 完成
+
+证书已替换并生效：
+
+1. 旧证书备份为 \`site.crt.20261030.bak\`
+2. 新证书与私钥已安装（证书 644，私钥 600）
+3. \`openssl\` 校验：证书与私钥的公钥一致，有效期到 **2027-03-01**
+4. \`nginx -t\` 通过，已 reload
+
+私钥文件我没有读取内容，只按路径安装。服务器上还留着暂存文件，确认没问题后可以用面板里的「清理」删掉。`),
+          { type: "done", steps: 8 },
+        ];
+        certScript.forEach((ev, i) => setTimeout(() => emit("ai-event", ev), 200 + i * 18));
+        return null;
+      }
       const script = [
         ...say("我先收集一下这台机器的基本信息。"),
         ...tool("c1", 'uname -a; echo "=== hostname ==="; hostname', "Linux magpie 5.15.167 #0 SMP aarch64 GNU/Linux\n=== hostname ===\nmagpie"),
@@ -145,6 +172,25 @@ uci commit openclash && /etc/init.d/openclash restart
     ai_provider_models: () => ["claude-haiku-5-5", "claude-opus-5-5", "claude-sonnet-5-5"],
     ai_provider_test: () => "连接正常，模型回复：pong",
     ai_provider_save: ({ input }) => ({ ...input, hasKey: true }),
+    ai_attach: ({ paths }) =>
+      paths.map((p, i) => {
+        const name = p.split("/").pop() || `file${i}`;
+        const secret = /\.(key|pem|p12|pfx)$/i.test(name);
+        const script = /\.sh$/i.test(name);
+        return {
+          id: `att-${i}-${Math.random().toString(36).slice(2, 7)}`,
+          name,
+          size: 1024 * (i + 1),
+          sha256: "3fa9c1e2b7d0" + "0".repeat(52),
+          kind: secret || script ? "text" : "binary",
+          secret,
+          remotePath: `~/.loki/uploads/20261030-090000-ab12/${name}`,
+          verified: true,
+          shareable: !secret,
+        };
+      }),
+    ai_detach: () => null,
+    ai_attachments_cleanup: () => 3,
     ai_conversations_list: ({ hostId }) => {
       const now = Math.floor(Date.now() / 1000);
       const all = [

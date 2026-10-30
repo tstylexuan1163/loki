@@ -37,6 +37,8 @@ pub struct AppState {
     pub transfers: Mutex<transfer::TransferMap>,
     /// True while an update download/install is in flight.
     pub update_busy: Mutex<bool>,
+    /// Files attached to assistant messages, and the staging folders to clean.
+    pub attachments: Mutex<commands::AttachRegistry>,
     /// Kept so background tasks can emit events without a command in flight.
     pub app: tauri::AppHandle,
 }
@@ -77,6 +79,7 @@ pub fn run() {
                 forwards: Mutex::new(forward::ForwardManager::new()),
                 ai_approvals: Mutex::new(None),
                 update_busy: Mutex::new(false),
+                attachments: Mutex::new(commands::AttachRegistry::default()),
                 direct: Mutex::new(direct::DirectManager::new()),
                 transfers: Mutex::new(transfer::TransferMap::new()),
                 app: app.handle().clone(),
@@ -130,6 +133,9 @@ pub fn run() {
             commands::ai_provider_test,
             commands::ai_provider_delete,
             commands::ai_send,
+            commands::ai_attach,
+            commands::ai_detach,
+            commands::ai_attachments_cleanup,
             commands::ai_conversations_list,
             commands::ai_conversation_get,
             commands::ai_conversation_save,

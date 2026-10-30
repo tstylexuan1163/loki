@@ -246,6 +246,9 @@ pub async fn close_everything(state: &AppState) {
     if let Ok(mut m) = state.sftp.lock() {
         m.clear();
     }
+    if let Ok(mut a) = state.attachments.lock() {
+        a.clear();
+    }
     if let Ok(mut d) = state.direct.lock() {
         d.stop_all();
     }
@@ -2153,6 +2156,17 @@ pub async fn ai_provider_test(
 
 /// Starts a turn. Events stream on `ai-event`; gated calls wait for
 /// [`ai_approve`].
+/// One attachment the panel wants this message to carry.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiAttachSend {
+    pub id: String,
+    pub share_content: bool,
+}
+
+// Eight parameters is the price of a flat IPC call; grouping them into a struct
+// would only move the same fields into a wrapper.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn ai_send(
     app: tauri::AppHandle,
@@ -2162,6 +2176,7 @@ pub async fn ai_send(
     session_id: Option<String>,
     mode: String,
     history: Vec<serde_json::Value>,
+    attachments: Option<Vec<AiAttachSend>>,
 ) -> Result<(), String> {
     let mut config = load_provider(&state, &provider_id)?;
 
@@ -2195,6 +2210,76 @@ pub async fn ai_send(
         .map(|s| String::from_utf8_lossy(&s.peek_backlog()).to_string())
         .unwrap_or_default();
 
+    // Attachments are described here, not by the panel: the content must never
+    // pass through the WebView. Marking them `sent` also makes detach keep the
+    // uploaded copy, since the model has already been told the path.
+    let (block, secret_paths) = match attachments.filter(|list| !list.is_empty()) {
+        None => (String::new(), Vec::new()),
+        Some(list) => {
+            let mut rows = Vec::new();
+            let mut secrets = Vec::new();
+            {
+                let mut reg = state.attachments.lock().map_err(|e| e.to_string())?;
+                for want in &list {
+                    let Some(item) = reg.items.get_mut(&want.id) else {
+                        continue;
+                    };
+                    item.sent = true;
+                    if item.secret {
+                        secrets.push(item.remote_path.clone());
+                    }
+                    rows.push((
+                        item.name.clone(),
+                        item.size,
+                        item.sha256.clone(),
+                        item.secret,
+                        item.remote_path.clone(),
+                        if item.secret {
+                            None
+                        } else if want.share_content {
+                            item.content.clone()
+                        } else {
+                            None
+                        },
+                    ));
+                }
+            }
+            let descs: Vec<crate::ai::attach::AttachDesc> = rows
+                .iter()
+                .map(|r| crate::ai::attach::AttachDesc {
+                    name: &r.0,
+                    size: r.1,
+                    sha256: &r.2,
+                    secret: r.3,
+                    remote_path: &r.4,
+                    content: r.5.as_deref(),
+                })
+                .collect();
+            (crate::ai::attach::describe(&descs), secrets)
+        }
+    };
+
+    let mut history = history;
+    if !block.is_empty() {
+        if let Some(last) = history
+            .iter_mut()
+            .rev()
+            .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+        {
+            let current = last
+                .get("content")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string();
+            if let Some(obj) = last.as_object_mut() {
+                obj.insert(
+                    "content".into(),
+                    serde_json::Value::String(format!("{current}\n\n{block}")),
+                );
+            }
+        }
+    }
+
     let history: Vec<crate::ai::provider::ChatMessage> = history
         .iter()
         .filter_map(|v| serde_json::from_value(v.clone()).ok())
@@ -2224,6 +2309,7 @@ pub async fn ai_send(
             mode: permission,
             session,
             terminal_tail,
+            secret_paths,
         },
         tx,
         approval_rx,
@@ -2247,6 +2333,257 @@ pub fn ai_approve(
             .map_err(|_| "对话已结束".to_string()),
         None => Err("当前没有进行中的对话".into()),
     }
+}
+
+// ---- AI attachments ------------------------------------------------------
+
+/// One file the user attached, and what became of it.
+#[derive(Debug, Clone)]
+pub struct Attachment {
+    pub id: String,
+    pub session_id: String,
+    pub name: String,
+    pub size: u64,
+    pub sha256: String,
+    pub kind: String,
+    pub secret: bool,
+    pub remote_path: String,
+    pub batch_dir: String,
+    /// Cached only for shareable files; never set for a private key.
+    pub content: Option<String>,
+    /// Set once the attachment has been described to the model.
+    pub sent: bool,
+}
+
+/// Attachments of this run, plus the staging folders to clean up later.
+#[derive(Default)]
+pub struct AttachRegistry {
+    pub items: std::collections::HashMap<String, Attachment>,
+    /// Staging directory per session, so "clean up" can remove a whole batch.
+    pub batches: std::collections::HashMap<String, Vec<String>>,
+}
+
+impl AttachRegistry {
+    pub fn clear(&mut self) {
+        self.items.clear();
+        self.batches.clear();
+    }
+}
+
+/// What the panel learns about an attachment: no content and no local path.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentView {
+    pub id: String,
+    pub name: String,
+    pub size: u64,
+    pub sha256: String,
+    pub kind: String,
+    pub secret: bool,
+    pub remote_path: String,
+    pub verified: bool,
+    pub shareable: bool,
+}
+
+/// Uploads local files to a fresh staging folder and returns what the panel
+/// shows. The bytes never come back to the WebView.
+#[tauri::command]
+pub async fn ai_attach(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    session_id: String,
+    paths: Vec<String>,
+) -> Result<Vec<AttachmentView>, String> {
+    use crate::ai::attach;
+
+    if paths.is_empty() {
+        return Err("没有选择文件".into());
+    }
+    if paths.len() > attach::MAX_BATCH {
+        return Err(format!(
+            "一次最多附加 {} 个文件，这次选了 {} 个",
+            attach::MAX_BATCH,
+            paths.len()
+        ));
+    }
+
+    let session = {
+        let mgr = state.ssh.lock().map_err(|e| e.to_string())?;
+        mgr.get(&session_id)
+            .ok_or_else(|| "会话不存在".to_string())?
+    };
+    let (sftp, home) = sftp_for(&state, &session_id).await?;
+
+    // One staging folder per attach action.
+    let now = chrono::Local::now();
+    let rand = (uuid::Uuid::new_v4().as_u128() & 0xffff) as u16;
+    let batch_name = attach::staging_name(now.timestamp(), rand);
+    let dir = {
+        let guard = sftp.lock().await;
+        crate::ai::staging::prepare_batch(&guard, &home, &batch_name).await?
+    };
+
+    let mut views = Vec::with_capacity(paths.len());
+
+    for raw in &paths {
+        let path = std::path::Path::new(raw);
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|n| !n.is_empty() && !n.contains('/'))
+            .ok_or_else(|| format!("无效的文件名：{raw}"))?
+            .to_string();
+
+        let meta = std::fs::metadata(path).map_err(|e| format!("读取 {name} 失败：{e}"))?;
+        if !meta.is_file() {
+            return Err(format!("{name} 不是普通文件"));
+        }
+        let size = meta.len();
+        if size as usize > attach::MAX_FILE {
+            return Err(format!(
+                "{} 有 {}，超过单个文件上限 {}",
+                name,
+                attach::human_size(size),
+                attach::human_size(attach::MAX_FILE as u64)
+            ));
+        }
+
+        let bytes = std::fs::read(path).map_err(|e| format!("读取 {name} 失败：{e}"))?;
+        let sha256 = attach::sha256_hex(&bytes);
+        let kind = attach::sniff_kind(&bytes).to_string();
+        let secret = attach::is_secret(&name, &bytes);
+        let shareable = kind == "text" && !secret && (size as usize) <= attach::SHARE_LIMIT;
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let _ = app.emit(
+            "attach-progress",
+            serde_json::json!({ "id": id, "name": name, "percent": 0 }),
+        );
+
+        let (remote_path, verified) = {
+            let guard = sftp.lock().await;
+            crate::ai::staging::upload_file(&session, &guard, &dir, &name, &bytes).await?
+        };
+
+        let _ = app.emit(
+            "attach-progress",
+            serde_json::json!({ "id": id, "name": name, "percent": 60 }),
+        );
+
+        let _ = app.emit(
+            "attach-progress",
+            serde_json::json!({ "id": id, "name": name, "percent": 100 }),
+        );
+
+        let content = if shareable {
+            Some(String::from_utf8_lossy(&bytes).to_string())
+        } else {
+            None
+        };
+
+        let record = Attachment {
+            id: id.clone(),
+            session_id: session_id.clone(),
+            name: name.clone(),
+            size,
+            sha256: sha256.clone(),
+            kind: kind.clone(),
+            secret,
+            remote_path: remote_path.clone(),
+            batch_dir: dir.clone(),
+            content: content.clone(),
+            sent: false,
+        };
+
+        {
+            let mut reg = state.attachments.lock().map_err(|e| e.to_string())?;
+            reg.batches
+                .entry(session_id.clone())
+                .or_default()
+                .push(record.batch_dir.clone());
+            reg.items.insert(id.clone(), record);
+        }
+
+        views.push(AttachmentView {
+            id,
+            name,
+            size,
+            sha256,
+            kind,
+            secret,
+            remote_path,
+            verified,
+            shareable,
+        });
+    }
+
+    Ok(views)
+}
+
+/// Forgets an attachment, deleting the uploaded copy if it was never used.
+#[tauri::command]
+pub async fn ai_detach(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let record = {
+        let mut reg = state.attachments.lock().map_err(|e| e.to_string())?;
+        reg.items.remove(&id)
+    };
+    let Some(record) = record else {
+        return Ok(());
+    };
+    if record.sent {
+        // The model may have been told about the path; leave it alone.
+        return Ok(());
+    }
+
+    let sftp = {
+        let map = state.sftp.lock().map_err(|e| e.to_string())?;
+        map.get(&record.session_id).cloned()
+    };
+    if let Some(sftp) = sftp {
+        let guard = sftp.lock().await;
+        let _ = guard.remove_file(&record.remote_path).await;
+    }
+    Ok(())
+}
+
+/// Removes every staging folder this run created for a session.
+#[tauri::command]
+pub async fn ai_attachments_cleanup(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<u64, String> {
+    let (dirs, ids) = {
+        let mut reg = state.attachments.lock().map_err(|e| e.to_string())?;
+        let dirs = reg.batches.remove(&session_id).unwrap_or_default();
+        let ids: Vec<String> = reg
+            .items
+            .values()
+            .filter(|a| a.session_id == session_id)
+            .map(|a| a.id.clone())
+            .collect();
+        for id in &ids {
+            reg.items.remove(id);
+        }
+        (dirs, ids)
+    };
+    let _ = ids;
+
+    if dirs.is_empty() {
+        return Ok(0);
+    }
+    let sftp = {
+        let map = state.sftp.lock().map_err(|e| e.to_string())?;
+        map.get(&session_id).cloned()
+    };
+    let Some(sftp) = sftp else {
+        return Ok(0);
+    };
+    let guard = sftp.lock().await;
+    let mut removed = 0u64;
+    for dir in dirs {
+        removed += crate::ai::staging::remove_tree(&guard, &dir).await;
+    }
+    Ok(removed)
 }
 
 // ---- Port forwarding -----------------------------------------------------

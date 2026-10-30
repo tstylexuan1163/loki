@@ -125,6 +125,8 @@ pub struct ToolContext {
     pub session: Option<Arc<LiveSession>>,
     /// Recent terminal output, for `read_terminal`.
     pub terminal_tail: String,
+    /// Remote paths of attached private keys: never read into the model.
+    pub secret_paths: Vec<String>,
 }
 
 /// The outcome of running a tool, as the model sees it.
@@ -221,6 +223,11 @@ pub async fn run(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcome {
 
         "read_file" => {
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            // A private key the user attached stays opaque even by path: the
+            // model may install it, not read it.
+            if ctx.secret_paths.iter().any(|p| p == path) {
+                return ToolOutcome::err("这是私钥文件，内容不提供。用路径操作即可。");
+            }
             let session = match need_session(ctx) {
                 Ok(s) => s,
                 Err(e) => return e,
@@ -310,6 +317,7 @@ mod tests {
         let ctx = ToolContext {
             session: None,
             terminal_tail: String::new(),
+            secret_paths: Vec::new(),
         };
         let out = run("does_not_exist", &json!({}), &ctx).await;
         assert!(!out.ok);
@@ -320,6 +328,7 @@ mod tests {
         let ctx = ToolContext {
             session: None,
             terminal_tail: "one\ntwo\nthree".into(),
+            secret_paths: Vec::new(),
         };
         let out = run("read_terminal", &json!({"lines": 2}), &ctx).await;
         assert!(out.ok);
@@ -327,10 +336,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_secret_attachment_is_refused_by_path() {
+        let ctx = ToolContext {
+            session: None,
+            terminal_tail: String::new(),
+            secret_paths: vec!["~/.loki/uploads/x/server.key".into()],
+        };
+        let out = run(
+            "read_file",
+            &json!({ "path": "~/.loki/uploads/x/server.key" }),
+            &ctx,
+        )
+        .await;
+        assert!(!out.ok);
+        assert!(out.content.contains("私钥"), "{}", out.content);
+    }
+
+    #[tokio::test]
     async fn tools_needing_a_session_say_so() {
         let ctx = ToolContext {
             session: None,
             terminal_tail: String::new(),
+            secret_paths: Vec::new(),
         };
         let out = run("read_file", &json!({"path": "/etc/hosts"}), &ctx).await;
         assert!(!out.ok);

@@ -361,7 +361,8 @@ export const aiApi = {
     sessionId: string | null,
     mode: PermissionMode,
     history: ChatMessage[],
-  ) => invoke<void>("ai_send", { providerId, model, sessionId, mode, history }),
+    attachments: { id: string; shareContent: boolean }[] = [],
+  ) => invoke<void>("ai_send", { providerId, model, sessionId, mode, history, attachments }),
   approve: (callId: string, approved: boolean) =>
     invoke<void>("ai_approve", { callId, approved }),
 };
@@ -504,4 +505,27 @@ export const conversationApi = {
   rename: (id: string, title: string) =>
     invoke<void>("ai_conversation_rename", { id, title }),
   remove: (id: string) => invoke<void>("ai_conversation_delete", { id }),
+};
+
+// ---- AI attachments ------------------------------------------------------
+
+/** What the panel is told about an uploaded file: no content, no local path. */
+export interface AttachmentView {
+  id: string;
+  name: string;
+  size: number;
+  sha256: string;
+  kind: "text" | "binary";
+  secret: boolean;
+  remotePath: string;
+  verified: boolean;
+  /** Text, not secret, and small enough to show the model verbatim. */
+  shareable: boolean;
+}
+
+export const attachmentApi = {
+  attach: (sessionId: string, paths: string[]) =>
+    invoke<AttachmentView[]>("ai_attach", { sessionId, paths }),
+  detach: (id: string) => invoke<void>("ai_detach", { id }),
+  cleanup: (sessionId: string) => invoke<number>("ai_attachments_cleanup", { sessionId }),
 };

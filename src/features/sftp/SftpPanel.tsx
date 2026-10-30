@@ -26,6 +26,7 @@ import {
   IconCopy,
   IconEye,
   IconEyeOff,
+  IconSparkle,
 } from "@/components/icons";
 import { startTransferListener, useTransfers } from "@/features/sftp/transfers";
 import { isMac } from "@/app/platform";
@@ -37,7 +38,14 @@ import { isMac } from "@/app/platform";
  * costs no extra login. Transfers run on their own SFTP channel in the backend
  * and report progress as events, so a large copy never freezes the listing.
  */
-export function SftpPanel({ sessionId }: { sessionId: string }) {
+export function SftpPanel({
+  sessionId,
+  onSendToAi,
+}: {
+  sessionId: string;
+  /** Hands a remote path to the assistant's composer. */
+  onSendToAi?: (remotePath: string) => void;
+}) {
   const [listing, setListing] = useState<DirListing | null>(null);
   const [path, setPath] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -409,6 +417,15 @@ export function SftpPanel({ sessionId }: { sessionId: string }) {
                   toast("已复制路径");
                 },
               },
+              ...(e.kind === "dir" || !onSendToAi
+                ? []
+                : [
+                    {
+                      label: "发给 AI",
+                      icon: <IconSparkle size={14} />,
+                      onSelect: () => onSendToAi(e.path),
+                    },
+                  ]),
               "sep" as const,
               {
                 label: "删除",

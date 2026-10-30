@@ -1,25 +1,35 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import {
   aiApi,
+  attachmentApi,
   conversationApi,
   errorMessage,
   type AiEvent,
   type ChatMessage,
+  type AttachmentView,
   type PermissionMode,
   type ProviderView,
 } from "@/lib/api";
+import { confirmDialog, toast } from "@/components/ui";
 import { useApp } from "@/app/store";
 import { ConversationHistory } from "@/features/ai/ConversationHistory";
+import { useAiComposer } from "@/features/ai/aiComposer";
 import {
   IconAlert,
   IconCheck,
   IconChevronRight,
   IconClock,
   IconSend,
+  IconFile,
+  IconLock,
+  IconPaperclip,
   IconPlus,
   IconSparkle,
   IconX,
+  IconCopy,
 } from "@/components/icons";
 import { Markdown } from "@/features/ai/Markdown";
 
@@ -40,10 +50,20 @@ interface ToolCallView {
  */
 type Part = { kind: "text"; text: string } | { kind: "tool"; call: ToolCallView };
 
+/** Metadata of a file sent with a user message; no content, no local path. */
+interface TurnAttachment {
+  name: string;
+  size: number;
+  sha256: string;
+  remotePath: string;
+  secret: boolean;
+}
+
 interface Turn {
   role: "user" | "assistant";
   parts: Part[];
   error?: string;
+  attachments?: TurnAttachment[];
 }
 
 /** Applies one engine event to the parts of the turn that is running. */
@@ -116,6 +136,13 @@ function newConversationId(): string {
   return `c-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+/** `2.1 KB` in the bubble, matching the card. */
+function formatSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
 const textOf = (t: Turn) =>
   t.parts.map((p) => (p.kind === "text" ? p.text : "")).join("");
 
@@ -147,6 +174,24 @@ export function AiPanel({
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [conversationId, setConversationId] = useState(newConversationId);
+  // Files attached to the message being composed, and everything uploaded for
+  // this session (for the clean-up row).
+  const [pending, setPending] = useState<AttachmentView[]>([]);
+  const [shareContent, setShareContent] = useState<Record<string, boolean>>({});
+  const [uploads, setUploads] = useState<{ name: string; percent: number }[]>([]);
+  const [sessionFiles, setSessionFiles] = useState<{ id: string; name: string }[]>([]);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const pendingInsert = useAiComposer((s) => s.pendingInsert);
+  const setPendingInsert = useAiComposer((s) => s.setPendingInsert);
+
+  // Text handed over by the files panel ("send to assistant").
+  useEffect(() => {
+    if (!pendingInsert) return;
+    setDraft((cur) => (cur ? `${cur} ${pendingInsert}` : pendingInsert));
+    setPendingInsert(null);
+    inputRef.current?.focus();
+  }, [pendingInsert, setPendingInsert]);
   const [title, setTitle] = useState("");
   const [historyOpen, setHistoryOpen] = useState(false);
   const createdAt = useRef(Math.floor(Date.now() / 1000));
@@ -287,6 +332,125 @@ export function AiPanel({
     setError(null);
   }
 
+
+  // Progress for an upload in flight, keyed by file name.
+  useEffect(() => {
+    let disposed = false;
+    let un: (() => void) | undefined;
+    void listen<{ id: string; name: string; percent: number }>("attach-progress", (e) => {
+      const p = e.payload;
+      setUploads((prev) => {
+        const rest = prev.filter((u) => u.name !== p.name);
+        return p.percent >= 100 ? rest : [...rest, { name: p.name, percent: p.percent }];
+      });
+    }).then((f) => {
+      if (disposed) f();
+      else un = f;
+    });
+    return () => {
+      disposed = true;
+      un?.();
+    };
+  }, []);
+
+  /** Uploads the chosen files to this session's staging folder. */
+  async function attach(paths: string[]) {
+    if (!sessionId) {
+      toast("仅 SSH 连接支持附件", "info");
+      return;
+    }
+    if (paths.length === 0) return;
+    try {
+      const views = await attachmentApi.attach(sessionId, paths);
+      setPending((prev) => [...prev, ...views]);
+      setShareContent((prev) => {
+        const next = { ...prev };
+        // Text files default to "let the model see it"; a key never does.
+        for (const v of views) if (v.shareable) next[v.id] = true;
+        return next;
+      });
+      setSessionFiles((prev) => [...prev, ...views.map((v) => ({ id: v.id, name: v.name }))]);
+    } catch (e) {
+      toast(errorMessage(e), "error");
+    } finally {
+      setUploads([]);
+    }
+  }
+
+  async function pickFiles() {
+    if (!sessionId) {
+      toast("仅 SSH 连接支持附件", "info");
+      return;
+    }
+    try {
+      const picked = await openFileDialog({
+        multiple: true,
+        title: "选择要上传到服务器的文件",
+      });
+      const list = Array.isArray(picked) ? picked : picked ? [picked] : [];
+      if (list.length) void attach(list as string[]);
+    } catch (e) {
+      toast(errorMessage(e), "error");
+    }
+  }
+
+  async function removePending(a: AttachmentView) {
+    setPending((prev) => prev.filter((x) => x.id !== a.id));
+    setSessionFiles((prev) => prev.filter((x) => x.id !== a.id));
+    try {
+      await attachmentApi.detach(a.id);
+    } catch {
+      /* the file is staging-only; a failed delete is not worth an error box */
+    }
+  }
+
+  async function cleanupStaging() {
+    if (!sessionId || sessionFiles.length === 0) return;
+    const ok = await confirmDialog({
+      title: "清理暂存文件",
+      body: `将从服务器删除本会话上传的 ${sessionFiles.length} 个暂存文件。已经用过的文件也会删除，模型之后无法再引用它们的路径。`,
+      confirmLabel: "删除",
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      const n = await attachmentApi.cleanup(sessionId);
+      setSessionFiles([]);
+      setPending([]);
+      toast(`已删除 ${n} 个文件`, "success");
+    } catch (e) {
+      toast(errorMessage(e), "error");
+    }
+  }
+
+  // Files dragged from Finder onto the panel are attached. The files panel has
+  // its own handler; only one of the two is mounted at a time.
+  useEffect(() => {
+    let un: (() => void) | undefined;
+    let disposed = false;
+    const inside = (pos: { x: number; y: number }) => {
+      const r = rootRef.current?.getBoundingClientRect();
+      if (!r) return false;
+      const x = pos.x / window.devicePixelRatio;
+      const y = pos.y / window.devicePixelRatio;
+      return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+    };
+    void getCurrentWebview()
+      .onDragDropEvent((evt) => {
+        const p = evt.payload;
+        if (p.type === "drop" && inside(p.position) && p.paths.length) void attach(p.paths);
+      })
+      .then((f) => {
+        if (disposed) f();
+        else un = f;
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      un?.();
+    };
+  }, [sessionId]);
+
   const history = useCallback((): ChatMessage[] => {
     const out: ChatMessage[] = [];
     for (const t of turns) {
@@ -304,13 +468,32 @@ export function AiPanel({
       return;
     }
 
-    const userTurn: Turn = { role: "user", parts: [{ kind: "text", text }] };
+    // Attachments travel as ids; Rust owns the bytes and builds the block it
+    // shows the model. The bubble keeps only metadata.
+    const sendList = pending.map((a) => ({
+      id: a.id,
+      shareContent: a.shareable ? (shareContent[a.id] ?? true) : false,
+    }));
+    const meta: TurnAttachment[] = pending.map((a) => ({
+      name: a.name,
+      size: a.size,
+      sha256: a.sha256,
+      remotePath: a.remotePath,
+      secret: a.secret,
+    }));
+    const userTurn: Turn = {
+      role: "user",
+      parts: [{ kind: "text", text }],
+      attachments: meta.length ? meta : undefined,
+    };
     const assistantTurn: Turn = { role: "assistant", parts: [] };
     // History must go to Rust *without* the placeholder assistant turn.
     const prior = history();
     const nextTurns = [...turns, userTurn, assistantTurn];
     setTurns(nextTurns);
     setDraft("");
+    setPending([]);
+    setShareContent({});
     pinned.current = true;
     setRunning(true);
     setError(null);
@@ -319,10 +502,14 @@ export function AiPanel({
     void persist(nextTurns);
 
     try {
-      await aiApi.send(providerId, model, sessionId, mode, [
-        ...prior,
-        { role: "user", content: text },
-      ]);
+      await aiApi.send(
+        providerId,
+        model,
+        sessionId,
+        mode,
+        [...prior, { role: "user", content: text }],
+        sendList,
+      );
     } catch (e) {
       setError(errorMessage(e));
       setRunning(false);
@@ -432,6 +619,17 @@ export function AiPanel({
           return (
             <div key={i} className={`ai__turn ai__turn--${t.role}`}>
               {t.role === "assistant" && <div className="ai__who">助手</div>}
+              {t.attachments && t.attachments.length > 0 && (
+                <div className="ai__sentFiles">
+                  {t.attachments.map((a) => (
+                    <span key={a.remotePath} className="ai__sentFile" title={a.remotePath}>
+                      {a.secret ? <IconLock size={11} /> : <IconFile size={11} />}
+                      {a.name}
+                      <span className="ai__sentSize">{formatSize(a.size)}</span>
+                    </span>
+                  ))}
+                </div>
+              )}
               {segments(t.parts).map((seg, j, all) =>
                 seg.kind === "text" ? (
                   <div
@@ -468,8 +666,79 @@ export function AiPanel({
 
       {error && <div className="error" style={{ margin: "0 10px 8px" }}>{error}</div>}
 
+      {(uploads.length > 0 || pending.length > 0) && (
+        <div className="ai__attach">
+          {uploads.map((u) => (
+            <div key={u.name} className="ai__attachCard">
+              <IconFile size={13} />
+              <span className="ai__attachName">{u.name}</span>
+              <span className="ai__attachPct">{u.percent}%</span>
+            </div>
+          ))}
+          {pending.map((a) => (
+            <div key={a.id} className={`ai__attachCard ${a.secret ? "ai__attachCard--secret" : ""}`}>
+              {a.secret ? <IconLock size={13} /> : <IconFile size={13} />}
+              <div className="ai__attachMain">
+                <div className="ai__attachName">
+                  {a.name} <span className="ai__attachSize">{formatSize(a.size)}</span>
+                </div>
+                <button
+                  className="ai__attachPath"
+                  title="复制远端路径"
+                  onClick={() => {
+                    void navigator.clipboard?.writeText(a.remotePath);
+                    toast("已复制路径", "success");
+                  }}
+                >
+                  <IconCopy size={10} /> {a.remotePath}
+                </button>
+                {a.secret && <div className="ai__attachNote">私钥内容不会发给 AI</div>}
+                {!a.verified && (
+                  <div className="ai__attachWarn">
+                    <IconAlert size={10} /> 服务器校验未通过
+                  </div>
+                )}
+                {a.shareable && (
+                  <label className="ai__attachShare">
+                    <input
+                      type="checkbox"
+                      checked={shareContent[a.id] ?? true}
+                      onChange={(e) =>
+                        setShareContent((prev) => ({ ...prev, [a.id]: e.target.checked }))
+                      }
+                    />
+                    让 AI 看到内容
+                  </label>
+                )}
+              </div>
+              <button className="iconbtn" title="移除" onClick={() => void removePending(a)}>
+                <IconX size={12} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {sessionFiles.length > 0 && (
+        <div className="ai__staging">
+          服务器上有 {sessionFiles.length} 个暂存文件 ·{" "}
+          <button className="linkbtn" onClick={() => void cleanupStaging()}>
+            清理
+          </button>
+        </div>
+      )}
+
       <div className="ai__composer">
+        <button
+          className="ai__attachBtn"
+          title={sessionId ? "附加文件（上传到服务器）" : "仅 SSH 连接支持附件"}
+          disabled={!sessionId || running}
+          onClick={() => void pickFiles()}
+        >
+          <IconPaperclip size={15} />
+        </button>
         <textarea
+          ref={inputRef}
           className="ai__input"
           placeholder="输入问题，Enter 发送，Shift+Enter 换行"
           value={draft}
