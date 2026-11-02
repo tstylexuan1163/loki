@@ -54,7 +54,9 @@ async fn first_contact_reports_host_key() {
             println!("unknown host key, as expected: {fingerprint}");
         }
         ConnectOutcome::Live(_) => panic!("must not trust an unknown host key"),
-        ConnectOutcome::NeedPassword { .. } => panic!("host key check comes before auth"),
+        ConnectOutcome::NeedPassword { .. } | ConnectOutcome::AuthFailed(_) => {
+            panic!("host key check comes before auth")
+        }
     }
 }
 
@@ -85,6 +87,7 @@ async fn connects_and_runs_a_shell_with_a_pinned_key() {
             panic!("pin was rejected; server presented {fingerprint}")
         }
         ConnectOutcome::NeedPassword { .. } => panic!("the key should have been accepted"),
+        ConnectOutcome::AuthFailed(reason) => panic!("the key should have been accepted: {reason}"),
     };
     assert_eq!(session.info.status, "connected");
 

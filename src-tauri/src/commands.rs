@@ -1208,6 +1208,7 @@ pub async fn session_open(
             username: Some(username),
             ..Default::default()
         }),
+        ConnectOutcome::AuthFailed(reason) => Err(reason),
         ConnectOutcome::Live(session) => {
             if let Some(id) = &input.host_id {
                 if input.remember_password {

@@ -257,6 +257,8 @@ pub enum ConnectOutcome {
     /// Nothing in the credential list worked and no password was available;
     /// the UI should ask for one.
     NeedPassword { host: String, username: String },
+    /// The server turned every credential down, password included.
+    AuthFailed(String),
 }
 
 pub struct SshManager {
@@ -312,10 +314,15 @@ fn client_config() -> Arc<client::Config> {
 }
 
 /// What a single handshake produced.
+///
+/// Every variant past the handshake carries the server's key: when the user
+/// has just accepted it, it must be saved even though login did not finish,
+/// or the next attempt (the one with the password) asks about it again.
 enum HopResult {
     Authed(Handle<ClientHandler>, SeenKey),
     HostKey(SeenKey),
-    NeedPassword,
+    NeedPassword(SeenKey),
+    Rejected(SeenKey, String),
 }
 
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -384,8 +391,8 @@ async fn open_hop(
 
     match authenticate(&mut handle, &hop.username, &hop.credentials).await? {
         AuthOutcome::Success => Ok(HopResult::Authed(handle, key)),
-        AuthOutcome::NeedPassword => Ok(HopResult::NeedPassword),
-        AuthOutcome::Failed(reason) => Err(reason),
+        AuthOutcome::NeedPassword => Ok(HopResult::NeedPassword(key)),
+        AuthOutcome::Failed(reason) => Ok(HopResult::Rejected(key, reason)),
     }
 }
 
@@ -651,14 +658,26 @@ pub async fn connect_chain(
         None => None,
         Some(j) => match open_hop(j, accept, None).await? {
             HopResult::HostKey(key) => return Ok(host_key_outcome(j, key)),
-            HopResult::NeedPassword => {
+            HopResult::NeedPassword(key) => {
+                if is_new(j, &key) {
+                    accepted.push(key);
+                }
                 return Ok(Connected {
                     outcome: ConnectOutcome::NeedPassword {
                         host: j.address.clone(),
                         username: j.username.clone(),
                     },
                     accepted,
-                })
+                });
+            }
+            HopResult::Rejected(key, reason) => {
+                if is_new(j, &key) {
+                    accepted.push(key);
+                }
+                return Ok(Connected {
+                    outcome: ConnectOutcome::AuthFailed(reason),
+                    accepted,
+                });
             }
             HopResult::Authed(h, key) => {
                 if is_new(j, &key) {
@@ -675,14 +694,26 @@ pub async fn connect_chain(
             out.accepted = accepted;
             return Ok(out);
         }
-        HopResult::NeedPassword => {
+        HopResult::NeedPassword(key) => {
+            if is_new(target, &key) {
+                accepted.push(key);
+            }
             return Ok(Connected {
                 outcome: ConnectOutcome::NeedPassword {
                     host: target.address.clone(),
                     username: target.username.clone(),
                 },
                 accepted,
-            })
+            });
+        }
+        HopResult::Rejected(key, reason) => {
+            if is_new(target, &key) {
+                accepted.push(key);
+            }
+            return Ok(Connected {
+                outcome: ConnectOutcome::AuthFailed(reason),
+                accepted,
+            });
         }
         HopResult::Authed(h, key) => (h, key),
     };
@@ -1052,5 +1083,100 @@ mod tests {
         let tail = buf.tail();
         assert_eq!(tail.len(), TAIL_LIMIT);
         assert!(tail.ends_with(b"end"));
+    }
+
+    /// An in-process sshd that only takes the password `pw` for user `u`, so
+    /// the prompt flow can be exercised without the live test server.
+    struct PasswordOnly;
+
+    impl russh::server::Handler for PasswordOnly {
+        type Error = russh::Error;
+
+        async fn auth_password(
+            &mut self,
+            user: &str,
+            password: &str,
+        ) -> Result<russh::server::Auth, Self::Error> {
+            Ok(if user == "u" && password == "pw" {
+                russh::server::Auth::Accept
+            } else {
+                russh::server::Auth::reject()
+            })
+        }
+    }
+
+    async fn password_only_server() -> u16 {
+        use russh::keys::ssh_key::private::Ed25519Keypair;
+
+        let config = Arc::new(russh::server::Config {
+            keys: vec![russh::keys::PrivateKey::from(Ed25519Keypair::from_seed(
+                &[7; 32],
+            ))],
+            auth_rejection_time: std::time::Duration::from_millis(1),
+            auth_rejection_time_initial: Some(std::time::Duration::ZERO),
+            ..Default::default()
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                let config = config.clone();
+                tokio::spawn(async move {
+                    if let Ok(session) =
+                        russh::server::run_stream(config, socket, PasswordOnly).await
+                    {
+                        let _ = session.await;
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn a_host_key_accepted_before_the_password_prompt_is_kept() {
+        let port = password_only_server().await;
+        let hop = |credentials: Vec<Credential>| Hop {
+            address: "127.0.0.1".into(),
+            port,
+            username: "u".into(),
+            credentials,
+            known: Vec::new(),
+        };
+        let (tx, _rx) = mpsc::unbounded_channel::<TermEvent>();
+        let chain = |hop: Hop, accept: Option<String>| {
+            let tx = tx.clone();
+            async move {
+                connect_chain(None, &hop, "", "t", accept.as_deref(), 80, 24, tx)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let first = chain(hop(vec![]), None).await;
+        let ConnectOutcome::UnknownHostKey { fingerprint, .. } = first.outcome else {
+            panic!("a first contact must ask about the key");
+        };
+
+        // Quick connect has no password yet: accepting the key leads straight
+        // to the password prompt. The key has to come back for saving here,
+        // or the attempt that carries the password asks about it again, and
+        // accepting that one drops the password: a loop the user cannot leave.
+        let second = chain(hop(vec![]), Some(fingerprint.clone())).await;
+        assert!(matches!(
+            second.outcome,
+            ConnectOutcome::NeedPassword { .. }
+        ));
+        assert_eq!(second.accepted.len(), 1);
+        assert_eq!(second.accepted[0].fingerprint, fingerprint);
+
+        // A saved host whose stored password is wrong: same story.
+        let third = chain(
+            hop(vec![Credential::Password("nope".into())]),
+            Some(fingerprint.clone()),
+        )
+        .await;
+        assert!(matches!(third.outcome, ConnectOutcome::AuthFailed(_)));
+        assert_eq!(third.accepted.len(), 1);
     }
 }
