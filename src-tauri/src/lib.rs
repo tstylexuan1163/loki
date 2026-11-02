@@ -7,6 +7,7 @@ pub mod crypto;
 pub mod direct;
 pub mod forward;
 pub mod local;
+pub mod netscan;
 pub mod recorder;
 pub mod serial;
 pub mod sftp;
@@ -45,6 +46,8 @@ pub struct AppState {
     /// Providers whose model list was already asked for context sizes in
     /// this run, so a provider that states none is asked only once.
     pub ai_limits_checked: Mutex<std::collections::HashSet<String>>,
+    /// Stop switch of the running subnet scan, if any.
+    pub net_scan: Mutex<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
     /// Kept so background tasks can emit events without a command in flight.
     pub app: tauri::AppHandle,
 }
@@ -87,6 +90,7 @@ pub fn run() {
                 update_busy: Mutex::new(false),
                 attachments: Mutex::new(commands::AttachRegistry::default()),
                 ai_limits_checked: Mutex::new(std::collections::HashSet::new()),
+                net_scan: Mutex::new(None),
                 ai_turn: Mutex::new(None),
                 direct: Mutex::new(direct::DirectManager::new()),
                 transfers: Mutex::new(transfer::TransferMap::new()),
@@ -119,6 +123,9 @@ pub fn run() {
             commands::key_rename,
             commands::ssh_config_scan,
             commands::ssh_config_import,
+            commands::net_scan,
+            commands::net_scan_cancel,
+            commands::net_scan_import,
             commands::sftp_download,
             commands::sftp_download_to_downloads,
             commands::sftp_upload,

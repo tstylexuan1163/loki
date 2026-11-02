@@ -5,6 +5,7 @@ import { usePrefs } from "@/app/prefs";
 import { useTerminals } from "@/features/terminal/terminals";
 import { QuickConnect } from "@/features/terminal/QuickConnect";
 import { ImportDialog } from "@/features/hosts/ImportDialog";
+import { ScanDialog } from "@/features/hosts/ScanDialog";
 import { CategoryManager } from "@/features/hosts/CategoryManager";
 import { Menu, confirmDialog, toast, useMenu } from "@/components/ui";
 import {
@@ -21,6 +22,7 @@ import {
   IconMore,
   IconPlug,
   IconPlus,
+  IconRadar,
   IconSearch,
   IconTag,
   IconTerminal,
@@ -100,6 +102,7 @@ export function HostsPage() {
   const [query, setQuery] = useState("");
   const [quick, setQuick] = useState(false);
   const [importing, setImporting] = useState(false);
+  const [scanning, setScanning] = useState(false);
   const [managing, setManaging] = useState(false);
   const menu = useMenu<HostView>();
 
@@ -266,6 +269,9 @@ export function HostsPage() {
         {hosts.length > 0 && <span className="pagehead__count">{hosts.length}</span>}
       </div>
       <div className="spacer" />
+      <button className="btn btn--ghost" onClick={() => setScanning(true)} title="扫描网段，批量添加 SSH / Telnet 设备">
+        <IconRadar size={14} /> 扫描网段
+      </button>
       <button className="btn btn--ghost" onClick={() => setImporting(true)} title="从 ~/.ssh/config 导入">
         <IconImport size={14} /> 导入
       </button>
@@ -282,6 +288,7 @@ export function HostsPage() {
     <>
       {quick && <QuickConnect onClose={() => setQuick(false)} />}
       {importing && <ImportDialog onClose={() => setImporting(false)} />}
+      {scanning && <ScanDialog onClose={() => setScanning(false)} />}
       {managing && <CategoryManager onClose={() => setManaging(false)} />}
       {menu.menu && (
         <Menu
@@ -317,7 +324,7 @@ export function HostsPage() {
             <img className="empty__mark" src={logoUrl} alt="" />
             <div className="empty__title">还没有主机</div>
             <div className="empty__hint">
-              添加第一台服务器，或者从 <code>~/.ssh/config</code> 一键导入。地址、用户名和密码都会在本机加密后才落盘。
+              添加第一台服务器，从 <code>~/.ssh/config</code> 一键导入，或者扫描网段批量添加交换机。地址、用户名和密码都会在本机加密后才落盘。
             </div>
             <div className="empty__actions">
               <button className="btn btn--primary" onClick={openNewHost}>
@@ -325,6 +332,9 @@ export function HostsPage() {
               </button>
               <button className="btn" onClick={() => setImporting(true)}>
                 <IconImport size={14} /> 从 ssh config 导入
+              </button>
+              <button className="btn" onClick={() => setScanning(true)}>
+                <IconRadar size={14} /> 扫描网段
               </button>
               <button className="btn btn--ghost" onClick={() => {
                 openLocal();

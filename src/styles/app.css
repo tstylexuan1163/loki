@@ -3857,6 +3857,118 @@ textarea.field__input {
   gap: 4px;
 }
 
+/* ---- Subnet scan --------------------------------------------------------- */
+
+.scanform {
+  display: flex;
+  gap: 8px;
+}
+
+.scanform .btn {
+  height: 36px;
+  flex-shrink: 0;
+}
+
+.scanopts {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 10px;
+  margin: 10px 0 4px;
+}
+
+.scanopts__port {
+  width: 64px;
+  height: 28px;
+  padding: 0 8px;
+  font-size: 12px;
+}
+
+.scanopts__port:disabled {
+  opacity: 0.45;
+}
+
+.scanopts__hint {
+  margin-left: auto;
+  font-size: 11.5px;
+  color: var(--text-faint);
+}
+
+.scanstatus {
+  margin: 14px 0 12px;
+}
+
+.scanstatus__text {
+  margin-top: 7px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.scanrow {
+  display: grid;
+  grid-template-columns: 150px 128px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 12px;
+  border-top: 1px solid var(--border);
+  font-size: 12.5px;
+}
+
+.scanrow:first-child {
+  border-top: none;
+}
+
+.scanrow:hover {
+  background: var(--bg-raised);
+}
+
+.scanrow__pick {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+}
+
+.scanrow__pick input {
+  accent-color: var(--accent);
+}
+
+.scanrow .segmented__btn {
+  height: 20px;
+  padding: 0 7px;
+  font-size: 11px;
+}
+
+.scanrow__banner {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
+.scanrow__banner .mono {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pill--accent {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+}
+
+.scanadd {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+
+.scanadd__hint {
+  margin: -6px 0 14px;
+}
+
 /* ---- Settings window ----------------------------------------------------- */
 
 .settings {

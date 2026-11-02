@@ -3703,6 +3703,166 @@ pub fn ssh_config_import(
     Ok(report)
 }
 
+// ---- Subnet scan -----------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetScanInput {
+    /// Lets the UI ignore events from a scan it has since replaced.
+    pub scan_id: String,
+    pub targets: String,
+    pub ssh_port: Option<u16>,
+    pub telnet_port: Option<u16>,
+    pub timeout_ms: Option<u64>,
+}
+
+/// Scans the given addresses for SSH and telnet. Hits also arrive one by one
+/// on `netscan-event` while it runs; the return value is the full, sorted
+/// list, or what was found before a cancel.
+#[tauri::command]
+pub async fn net_scan(
+    state: State<'_, AppState>,
+    input: NetScanInput,
+) -> Result<Vec<crate::netscan::ScanHit>, String> {
+    let targets = crate::netscan::parse_targets(&input.targets)?;
+    if input.ssh_port.is_none() && input.telnet_port.is_none() {
+        return Err("至少选择 SSH 或 Telnet 中的一种".into());
+    }
+    let opts = crate::netscan::ScanOptions {
+        ssh_port: input.ssh_port,
+        telnet_port: input.telnet_port,
+        timeout: std::time::Duration::from_millis(input.timeout_ms.unwrap_or(800).clamp(200, 5000)),
+    };
+
+    // One scan at a time: starting another stops the one still running.
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if let Some(old) = state
+        .net_scan
+        .lock()
+        .map_err(|e| e.to_string())?
+        .replace(cancel.clone())
+    {
+        old.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    let app = state.app.clone();
+    let hits = crate::netscan::scan(&input.scan_id, targets, opts, cancel.clone(), |ev| {
+        if let Err(e) = app.emit("netscan-event", &ev) {
+            tracing::warn!("emit netscan-event failed: {e}");
+        }
+    })
+    .await;
+
+    let mut slot = state.net_scan.lock().map_err(|e| e.to_string())?;
+    if slot
+        .as_ref()
+        .is_some_and(|c| std::sync::Arc::ptr_eq(c, &cancel))
+    {
+        *slot = None;
+    }
+    Ok(hits)
+}
+
+#[tauri::command]
+pub fn net_scan_cancel(state: State<'_, AppState>) -> Result<(), String> {
+    if let Some(flag) = state.net_scan.lock().map_err(|e| e.to_string())?.take() {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetImportDevice {
+    pub address: String,
+    /// `ssh` or `telnet`.
+    pub protocol: String,
+    pub port: u16,
+    pub vendor: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetImportInput {
+    pub devices: Vec<NetImportDevice>,
+    pub username: String,
+    pub password: Option<String>,
+    pub tags: Vec<String>,
+    /// See `netscan::render_name` for the placeholders.
+    pub name_template: String,
+}
+
+/// Saves the chosen scan hits as hosts, all with the same login and
+/// categories. An address already saved with the same protocol and port is
+/// skipped, so running the same scan twice adds nothing.
+#[tauri::command]
+pub fn net_scan_import(
+    state: State<'_, AppState>,
+    input: NetImportInput,
+) -> Result<ImportReport, String> {
+    let vault = state.vault.lock().map_err(|e| e.to_string())?;
+    import_scan_hits(&vault, input)
+}
+
+fn import_scan_hits(
+    vault: &crate::vault::Vault,
+    input: NetImportInput,
+) -> Result<ImportReport, String> {
+    if input.devices.len() > crate::netscan::MAX_TARGETS {
+        return Err("一次添加的设备太多".into());
+    }
+    let mut existing: Vec<(String, String, u16)> = decrypted_hosts(vault)?
+        .iter()
+        .map(to_host_view)
+        .map(|h| (h.address.to_lowercase(), h.protocol, h.port))
+        .collect();
+    let tags = crate::categories::normalize(&input.tags);
+    let password = input.password.filter(|p| !p.is_empty());
+    let mut report = ImportReport::default();
+    let mut skipped = 0;
+
+    for d in &input.devices {
+        if d.protocol != "ssh" && d.protocol != "telnet" {
+            return Err(format!("不支持的协议：{}", d.protocol));
+        }
+        if d.address.parse::<std::net::Ipv4Addr>().is_err() {
+            return Err(format!("地址无效：{}", d.address));
+        }
+        let key = (d.address.to_lowercase(), d.protocol.clone(), d.port);
+        if existing.contains(&key) {
+            skipped += 1;
+            continue;
+        }
+        let ssh = d.protocol == "ssh";
+        let payload = serde_json::json!({
+            "name": crate::netscan::render_name(&input.name_template, &d.address, d.vendor.as_deref()),
+            "protocol": d.protocol,
+            "address": d.address,
+            "port": d.port,
+            // Telnet logs in on the device's own prompt and the editor shows
+            // no credential fields for it, so a telnet host keeps none.
+            "username": if ssh { input.username.trim() } else { "" },
+            "tags": tags,
+            "password": if ssh { password.clone() } else { None },
+            "use_agent": true,
+        });
+        let id = uuid::Uuid::new_v4().to_string();
+        let row = vault
+            .encrypt_item(&id, "host", &payload)
+            .map_err(|e| e.to_string())?;
+        vault.store().put_item(&row).map_err(|e| e.to_string())?;
+        existing.push(key);
+        report.hosts += 1;
+    }
+    if skipped > 0 {
+        report
+            .notes
+            .push(format!("已跳过 {skipped} 台已保存过的设备"));
+    }
+    ensure_categories(vault)?;
+    Ok(report)
+}
+
 // ---- Transfers ---------------------------------------------------------------
 
 /// Starts a download in the background and returns its id at once. Progress
@@ -4133,6 +4293,85 @@ mod tests {
             vec!["/home/u/.loki/uploads/x/c.key"]
         );
         assert!(reg.secret_paths("s3").is_empty());
+    }
+
+    #[test]
+    fn scan_hits_become_hosts_once() {
+        let mut vault = Vault::new(Store::open_in_memory().unwrap()).unwrap();
+        vault.create("test-password", KdfParams::default()).unwrap();
+        let device =
+            |address: &str, protocol: &str, port: u16, vendor: Option<&str>| NetImportDevice {
+                address: address.into(),
+                protocol: protocol.into(),
+                port,
+                vendor: vendor.map(String::from),
+            };
+        let input = NetImportInput {
+            devices: vec![
+                device("10.1.100.2", "ssh", 22, Some("H3C")),
+                device("10.1.100.3", "telnet", 23, None),
+            ],
+            username: " admin ".into(),
+            password: Some("s3cret".into()),
+            tags: vec!["接入交换机".into()],
+            name_template: "{vendor}-{last}".into(),
+        };
+
+        let report = import_scan_hits(&vault, input.clone()).unwrap();
+        assert_eq!(report.hosts, 2);
+        assert!(report.notes.is_empty());
+
+        let hosts: Vec<_> = decrypted_hosts(&vault).unwrap();
+        let ssh = hosts
+            .iter()
+            .find(|h| h.payload["address"] == "10.1.100.2")
+            .unwrap();
+        assert_eq!(ssh.payload["name"], "H3C-2");
+        assert_eq!(ssh.payload["username"], "admin");
+        assert_eq!(ssh.payload["password"], "s3cret");
+        assert_eq!(ssh.payload["tags"], serde_json::json!(["接入交换机"]));
+        // Telnet logs in on the device prompt; no credential is kept for it.
+        let telnet = hosts
+            .iter()
+            .find(|h| h.payload["address"] == "10.1.100.3")
+            .unwrap();
+        assert_eq!(telnet.payload["name"], "3");
+        assert_eq!(telnet.payload["port"], 23);
+        assert!(telnet.payload["password"].is_null());
+        // The category exists as a record, not only as a name on the hosts.
+        let cats: Vec<String> = load_categories(&vault)
+            .unwrap()
+            .iter()
+            .map(category_name)
+            .collect();
+        assert_eq!(cats, ["接入交换机"]);
+
+        // The same scan again adds nothing.
+        let again = import_scan_hits(&vault, input).unwrap();
+        assert_eq!(again.hosts, 0);
+        assert_eq!(again.notes, ["已跳过 2 台已保存过的设备"]);
+        assert_eq!(decrypted_hosts(&vault).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn scan_import_refuses_odd_devices() {
+        let mut vault = Vault::new(Store::open_in_memory().unwrap()).unwrap();
+        vault.create("test-password", KdfParams::default()).unwrap();
+        let input = |address: &str, protocol: &str| NetImportInput {
+            devices: vec![NetImportDevice {
+                address: address.into(),
+                protocol: protocol.into(),
+                port: 22,
+                vendor: None,
+            }],
+            username: String::new(),
+            password: None,
+            tags: vec![],
+            name_template: "{ip}".into(),
+        };
+        assert!(import_scan_hits(&vault, input("10.0.0.1", "serial")).is_err());
+        assert!(import_scan_hits(&vault, input("example.com", "ssh")).is_err());
+        assert!(decrypted_hosts(&vault).unwrap().is_empty());
     }
 
     #[test]

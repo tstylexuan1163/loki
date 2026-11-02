@@ -369,6 +369,86 @@ uci commit openclash && /etc/init.d/openclash restart
       { alias: "prod", hostname: "10.0.0.5", user: "deploy", port: 2200, identityFile: "~/.ssh/id_ed25519", proxyJump: "bastion", exists: false },
       { alias: "bastion", hostname: "bastion.example.com", user: "ops", port: 22, identityFile: null, proxyJump: null, exists: true },
     ],
+    // A pretend switch VLAN: whatever /24 is typed, the same devices answer,
+    // trickling in like the real scan. 192.168.1.x overlaps "lab-router".
+    net_scan: ({ input }) =>
+      new Promise((resolve, reject) => {
+        const m = input.targets.trim().match(/^(\d+\.\d+\.\d+)\.\d+/);
+        if (!input.targets.trim()) return reject("请填写要扫描的网段，例如 192.168.1.0/24");
+        if (!m) return reject(`无法识别「${input.targets.trim()}」，示例：192.168.1.0/24、10.1.100.1-254`);
+        const devices = [
+          [1, true, true, "SSH-2.0-Comware-7.1.064", "H3C"],
+          [2, true, false, "SSH-2.0-Comware-7.1.064", "H3C"],
+          [3, true, false, "SSH-2.0-Comware-7.1.045", "H3C"],
+          [4, true, true, "SSH-2.0-Comware-7.1.064", "H3C"],
+          [11, true, false, "SSH-2.0-HUAWEI-1.5", "华为"],
+          [12, true, false, "SSH-2.0-HUAWEI-1.5", "华为"],
+          [20, false, true, "User Access Verification", "思科"],
+          [31, false, true, "Login authentication", null],
+          [50, true, false, "SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13", "OpenSSH"],
+        ]
+          .map(([n, ssh, telnet, banner, vendor]) => ({
+            address: `${m[1]}.${n}`,
+            ssh: ssh && input.sshPort != null,
+            telnet: telnet && input.telnetPort != null,
+            banner,
+            vendor,
+          }))
+          .filter((h) => h.ssh || h.telnet);
+        const total = 254;
+        const found = [];
+        let done = 0;
+        state.scanCancelled = false;
+        const tick = setInterval(() => {
+          if (state.scanCancelled) {
+            clearInterval(tick);
+            return resolve(found);
+          }
+          done = Math.min(total, done + 16);
+          for (const h of devices) {
+            const n = Number(h.address.split(".").pop());
+            if (n <= done && !found.includes(h)) {
+              found.push(h);
+              emit("netscan-event", { type: "found", scanId: input.scanId, hit: h });
+            }
+          }
+          emit("netscan-event", { type: "progress", scanId: input.scanId, done, total });
+          if (done === total) {
+            clearInterval(tick);
+            resolve(found);
+          }
+        }, 120);
+      }),
+    net_scan_cancel: () => ((state.scanCancelled = true), null),
+    net_scan_import: ({ input }) => {
+      let hosts = 0;
+      let skipped = 0;
+      for (const d of input.devices) {
+        if (state.hosts.some((h) => h.address === d.address && h.protocol === d.protocol && h.port === d.port)) {
+          skipped++;
+          continue;
+        }
+        const last = d.address.split(".").pop();
+        const name =
+          input.nameTemplate
+            .replaceAll("{ip}", d.address)
+            .replaceAll("{last}", last)
+            .replaceAll("{vendor}", d.vendor ?? "")
+            .replace(/^[\s_-]+|[\s_-]+$/g, "") || d.address;
+        const ssh = d.protocol === "ssh";
+        // A new array, like host_save: the page memoises on the list itself.
+        state.hosts = [
+          ...state.hosts,
+          host(`h${Date.now()}${hosts}`, name, d.address, ssh ? input.username.trim() : "", [...input.tags], {
+            protocol: d.protocol,
+            port: d.port,
+            has_password: ssh && !!input.password,
+          }),
+        ];
+        hosts++;
+      }
+      return { hosts, keys: 0, notes: skipped ? [`已跳过 ${skipped} 台已保存过的设备`] : [] };
+    },
     session_open: ({ input }) => {
       const h = state.hosts.find((x) => x.id === input.hostId);
       const name = h ? h.name : input.target?.address;

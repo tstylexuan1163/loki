@@ -256,6 +256,42 @@ export const importApi = {
   run: (aliases: string[]) => invoke<ImportReport>("ssh_config_import", { aliases }),
 };
 
+// ---- Subnet scan -----------------------------------------------------------
+
+export interface ScanHit {
+  address: string;
+  ssh: boolean;
+  telnet: boolean;
+  banner: string | null;
+  vendor: string | null;
+}
+
+export type ScanEvent =
+  | { type: "progress"; scanId: string; done: number; total: number }
+  | { type: "found"; scanId: string; hit: ScanHit };
+
+export interface NetScanInput {
+  scanId: string;
+  targets: string;
+  sshPort: number | null;
+  telnetPort: number | null;
+  timeoutMs?: number;
+}
+
+export interface NetImportInput {
+  devices: { address: string; protocol: "ssh" | "telnet"; port: number; vendor: string | null }[];
+  username: string;
+  password: string | null;
+  tags: string[];
+  nameTemplate: string;
+}
+
+export const scanApi = {
+  run: (input: NetScanInput) => invoke<ScanHit[]>("net_scan", { input }),
+  cancel: () => invoke<void>("net_scan_cancel"),
+  import: (input: NetImportInput) => invoke<ImportReport>("net_scan_import", { input }),
+};
+
 export const termApi = {
   resize: (sessionId: string, cols: number, rows: number) =>
     invoke<void>("term_resize", { sessionId, cols, rows }),

@@ -143,6 +143,7 @@ export const IconCopy = make(
 export const IconPlug = make(<path d="M9 2v5M15 2v5M6 7h12v4a6 6 0 0 1-12 0Zm6 10v5" />);
 export const IconShield = make(<path d="M12 3 4 6v6c0 5 3.5 8 8 9 4.5-1 8-4 8-9V6Z" />);
 export const IconImport = make(<path d="M12 3v12M7 10l5 5 5-5M5 21h14" />);
+export const IconRadar = make(<path d="M12 12 18.5 5.5M20.5 12A8.5 8.5 0 1 1 12 3.5M16.5 12A4.5 4.5 0 1 1 12 7.5M12 12h.01" />);
 export const IconEye = make(
   <>
     <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z" />

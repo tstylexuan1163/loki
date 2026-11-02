@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Merged into the bundle's Info.plist by tauri-build. macOS shows this
+	     when the app first reaches a device on the local network: connecting
+	     to a LAN host or scanning a subnet. -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>loki 需要访问局域网，才能连接和扫描你网络中的服务器与交换机。</string>
+</dict>
+</plist>

@@ -4,16 +4,15 @@ import {
   directApi,
   errorMessage,
   keyApi,
-  categoryColor,
   type KeyView,
   type Protocol,
   type SerialPortInfo,
 } from "@/lib/api";
 import { useApp, type HostPrefill } from "@/app/store";
+import { CategoryPicker } from "@/features/hosts/CategoryPicker";
 import { Switch, confirmDialog, toast } from "@/components/ui";
 import {
   IconArrowUp,
-  IconCheck,
   IconGlobe,
   IconKey,
   IconRefresh,
@@ -39,7 +38,6 @@ export function HostEditor({
   prefill?: HostPrefill;
 }) {
   const hosts = useApp((s) => s.hosts);
-  const categories = useApp((s) => s.categories);
   const backToHosts = useApp((s) => s.backToHosts);
   const refreshHosts = useApp((s) => s.refreshHosts);
   const existing = useMemo(() => hosts.find((h) => h.id === hostId) ?? null, [hosts, hostId]);
@@ -74,7 +72,6 @@ export function HostEditor({
   const [stopBits, setStopBits] = useState(String(seed?.stopBits ?? 1));
   const [ports, setPorts] = useState<SerialPortInfo[]>([]);
   const [tags, setTags] = useState<string[]>(existing?.tags ?? []);
-  const [tagDraft, setTagDraft] = useState("");
   const [password, setPassword] = useState("");
   const [clearPassword, setClearPassword] = useState(false);
   const [privateKey, setPrivateKey] = useState("");
@@ -108,29 +105,6 @@ export function HostEditor({
 
   // A login name is optional: the connection asks for it when it is missing.
   const canSave = name.trim().length > 0 && address.trim().length > 0;
-
-  // Every known category, plus names picked here that are not saved yet.
-  const choices = useMemo(() => {
-    const names = categories.map((c) => c.name);
-    for (const t of tags) if (!names.some((n) => n.toLowerCase() === t.toLowerCase())) names.push(t);
-    return names;
-  }, [categories, tags]);
-
-  function toggleTag(t: string) {
-    setTags((cur) =>
-      cur.some((x) => x.toLowerCase() === t.toLowerCase())
-        ? cur.filter((x) => x.toLowerCase() !== t.toLowerCase())
-        : [...cur, t],
-    );
-  }
-
-  function commitTag() {
-    const t = tagDraft.trim().replace(/,$/, "");
-    // Typing an existing name selects it rather than creating a twin.
-    const known = choices.find((c) => c.toLowerCase() === t.toLowerCase());
-    if (t && !tags.some((x) => x.toLowerCase() === t.toLowerCase())) setTags([...tags, known ?? t]);
-    setTagDraft("");
-  }
 
   async function save() {
     if (!canSave || saving) return;
@@ -497,38 +471,7 @@ export function HostEditor({
           <section className="card">
             <div className="card__title">分类</div>
             <div className="card__hint">可以选多个；都不选就放在「未分类」。</div>
-            <div className="catpick">
-              {choices.map((t) => {
-                const on = tags.some((x) => x.toLowerCase() === t.toLowerCase());
-                return (
-                  <button
-                    key={t}
-                    type="button"
-                    className={`chip ${on ? "chip--on" : ""}`}
-                    aria-pressed={on}
-                    onClick={() => toggleTag(t)}
-                  >
-                    <i className="tag__dot" style={{ background: categoryColor(t, categories) }} />
-                    {t}
-                    {on && <IconCheck size={11} />}
-                  </button>
-                );
-              })}
-              <input
-                className="catpick__new"
-                placeholder="新建分类，回车添加"
-                maxLength={32}
-                value={tagDraft}
-                onChange={(e) => setTagDraft(e.target.value)}
-                onBlur={commitTag}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" || e.key === ",") {
-                    e.preventDefault();
-                    commitTag();
-                  }
-                }}
-              />
-            </div>
+            <CategoryPicker value={tags} onChange={setTags} />
           </section>
           <button type="submit" hidden />
         </form>
