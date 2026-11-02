@@ -116,6 +116,7 @@ const textOf = (t: Turn) =>
 export function AiPanel({
   tabId,
   sessionId,
+  ssh,
   hostId,
   hostLabel,
   onClose,
@@ -123,6 +124,8 @@ export function AiPanel({
   /** The terminal tab whose conversation this is. */
   tabId: string;
   sessionId: string | null;
+  /** Telnet, serial and local sessions have no SFTP: no files, no attachments. */
+  ssh: boolean;
   /** Host this tab is bound to, so a conversation can be listed per host. */
   hostId?: string | null;
   hostLabel?: string;
@@ -316,7 +319,7 @@ export function AiPanel({
 
   /** Uploads the chosen files to this session's staging folder. */
   async function attach(paths: string[]) {
-    if (!sessionId) {
+    if (!sessionId || !ssh) {
       toast("仅 SSH 连接支持附件", "info");
       return;
     }
@@ -342,7 +345,7 @@ export function AiPanel({
   }
 
   async function pickFiles() {
-    if (!sessionId) {
+    if (!sessionId || !ssh) {
       toast("仅 SSH 连接支持附件", "info");
       return;
     }
@@ -564,8 +567,10 @@ export function AiPanel({
           <option value="bypass">完全放开</option>
         </select>
       </div>
-      {!sessionId && (
-        <div className="ai__note">当前标签不是 SSH 会话，助手只能聊天，不能操作服务器。</div>
+      {!sessionId ? (
+        <div className="ai__note">当前标签没有连接，助手只能聊天，不能操作设备。</div>
+      ) : (
+        !ssh && <div className="ai__note">非 SSH 会话：助手只能在终端里输入命令，不能读写文件。</div>
       )}
 
       <div
@@ -582,12 +587,19 @@ export function AiPanel({
               <IconSparkle size={20} />
             </div>
             <div className="ai__welcome-title">问点什么</div>
-            <div className="ai__welcome-hint">模型可以读终端、列目录、读文件；改动服务器的操作需要你确认。</div>
+            <div className="ai__welcome-hint">
+              {sessionId && !ssh
+                ? "模型可以读终端，也可以在终端里输入命令；输入命令需要你确认。"
+                : "模型可以读终端、列目录、读文件；改动服务器的操作需要你确认。"}
+            </div>
             {providers.length === 0 ? (
               <div className="ai__welcome-hint">先到「设置 → AI」添加一个模型服务商。</div>
             ) : (
               <div className="ai__suggest">
-                {["看看这台机器的磁盘占用", "最近有哪些服务报错？", "解释一下终端里最后的输出"].map((q) => (
+                {(sessionId && !ssh
+                  ? ["看看这台设备的接口状态", "查一下设备型号和版本", "解释一下终端里最后的输出"]
+                  : ["看看这台机器的磁盘占用", "最近有哪些服务报错？", "解释一下终端里最后的输出"]
+                ).map((q) => (
                   <button key={q} className="chip" onClick={() => setDraft(q)}>
                     {q}
                   </button>
@@ -776,8 +788,8 @@ export function AiPanel({
       <div className="ai__composer">
         <button
           className="ai__attachBtn"
-          title={sessionId ? "附加文件（上传到服务器）" : "仅 SSH 连接支持附件"}
-          disabled={!sessionId || running}
+          title={sessionId && ssh ? "附加文件（上传到服务器）" : "仅 SSH 连接支持附件"}
+          disabled={!sessionId || !ssh || running}
           onClick={() => void pickFiles()}
         >
           <IconPaperclip size={15} />
@@ -844,6 +856,8 @@ function segments(parts: Part[]): Segment[] {
 const TOOL_LABEL: Record<string, string> = {
   read_terminal: "读取终端",
   run_command: "运行命令",
+  type_in_terminal: "在终端中输入",
+  terminal_key: "按键",
   list_directory: "列出目录",
   read_file: "读取文件",
   write_file: "写入文件",
@@ -869,9 +883,9 @@ function ToolGroup({
   // Only the user opens or closes the list. Tying it to "a call is running"
   // made it flap open and shut on every call while the model worked.
   const [open, setOpen] = useState(false);
-  const running = live ? calls.find((c) => !c.result && c.auto) : undefined;
+  const running = live ? calls.find((c) => !c.result && (c.auto || c.started)) : undefined;
   // A call waiting for approval is shown even when folded: it needs a click.
-  const asking = live ? calls.filter((c) => !c.result && !c.auto) : [];
+  const asking = live ? calls.filter((c) => !c.result && !c.auto && !c.started) : [];
   const pending = !!running || asking.length > 0;
 
   if (calls.length === 1) {
@@ -927,7 +941,7 @@ function ToolRow({
   const [open, setOpen] = useState(false);
   const waiting = !call.result;
   const cancelled = waiting && !live;
-  const needsHuman = waiting && !call.auto && !cancelled;
+  const needsHuman = waiting && !call.auto && !call.started && !cancelled;
   const state = call.result
     ? call.result.ok
       ? "ok"
@@ -964,9 +978,17 @@ function ToolRow({
 
       {needsHuman && (
         <div className="step__ask">
-          <pre className="step__args">{JSON.stringify(call.args, null, 2)}</pre>
+          <pre className={`step__args ${call.dangerous ? "step__args--danger" : ""}`}>
+            {JSON.stringify(call.args, null, 2)}
+          </pre>
           <div className="step__actions">
-            <span className="step__ask-text">需要你确认</span>
+            <span className={`step__ask-text ${call.dangerous ? "step__ask-text--danger" : ""}`}>
+              {call.dangerous
+                ? "高危命令：可能重启、清除配置或断开连接，请仔细确认"
+                : call.name === "type_in_terminal" || call.name === "terminal_key"
+                  ? "将在你的终端里输入，需要你确认"
+                  : "需要你确认"}
+            </span>
             <button className="btn btn--sm btn--ghost" onClick={() => onApprove(false)}>
               拒绝
             </button>
@@ -986,6 +1008,7 @@ function ToolRow({
 function summarize(args: unknown): string {
   if (!args || typeof args !== "object") return "";
   const a = args as Record<string, unknown>;
-  const v = a.command ?? a.path ?? a.pattern ?? (a.lines != null ? `最近 ${a.lines} 行` : null);
+  const v =
+    a.command ?? a.path ?? a.pattern ?? a.key ?? (a.lines != null ? `最近 ${a.lines} 行` : null);
   return v == null ? "" : String(v);
 }

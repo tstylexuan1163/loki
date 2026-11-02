@@ -81,7 +81,7 @@
     // A turn streamed token by token, with tool calls in between, the way the
     // engine emits it. The reply mirrors a real ops answer: headings, a
     // numbered list, inline code, a table and a code block.
-    ai_send: ({ attachments, history, turnId }) => {
+    ai_send: ({ attachments, history, turnId, sessionId }) => {
       // Events carry the turn id, and every timer is kept so ai_cancel can
       // stop the script the way the engine drops a turn.
       state.aiTurn = turnId;
@@ -89,6 +89,17 @@
       const later = (ev, ms) =>
         state.aiTimers.push(setTimeout(() => emit("ai-event", { ...ev, turnId }), ms));
       const last = (history || []).filter((m) => m.role === "user").at(-1)?.content || "";
+      // Asking about a switch plays typing into the terminal: approval, the
+      // banner over the pane, a paged output, then the summary.
+      if (/交换机|接口|重启/.test(last)) {
+        const id = "type1";
+        const risky = /重启/.test(last);
+        const command = risky ? "reboot" : "display interface brief";
+        later({ type: "text", text: risky ? "要重启这台交换机，需要你确认。" : "我在终端里查看一下接口状态。" }, 100);
+        later({ type: "toolCall", id, name: "type_in_terminal", arguments: { command }, auto: false, dangerous: risky }, 300);
+        state.aiPending = { id, turnId, sessionId, typing: command };
+        return null;
+      }
       // Asking to delete something plays a call that waits for approval.
       if (/删除|清理/.test(last)) {
         const id = "ask1";
@@ -254,6 +265,22 @@ uci commit openclash && /etc/init.d/openclash restart
       if (!p || p.id !== callId) throw "当前没有进行中的对话";
       state.aiPending = null;
       const tag = (ev) => emit("ai-event", { ...ev, turnId: p.turnId });
+      if (p.typing && approved) {
+        tag({ type: "toolStarted", id: callId });
+        const out = (text, ms) =>
+          state.aiTimers.push(setTimeout(() => emit("term-event", { type: "data", sessionId: p.sessionId, data: b64(text) }), ms));
+        out(`${p.typing}\r\n`, 300);
+        out("Interface            Link Speed   Duplex Type PVID Description\r\nGE1/0/1              UP   1G(a)   F(a)   A    1    uplink-core\r\n  ---- More ----", 900);
+        out("\x1b[16D                \x1b[16DGE1/0/2              DOWN auto    A      A    1\r\nGE1/0/3              UP   1G(a)   F(a)   A    10   ap-3f\r\n<sw-3f>", 1700);
+        state.aiTimers.push(
+          setTimeout(() => {
+            tag({ type: "toolResult", id: callId, ok: true, content: "Interface            Link Speed   Duplex Type PVID Description\nGE1/0/1              UP   1G(a)   F(a)   A    1    uplink-core\nGE1/0/2              DOWN auto    A      A    1\nGE1/0/3              UP   1G(a)   F(a)   A    10   ap-3f\n---\n已回到提示符：<sw-3f>\n（自动翻页 1 次）" });
+            tag({ type: "text", text: "3 个接口里 **GE1/0/2 是 DOWN**，其余正常。" });
+            tag({ type: "done", steps: 2 });
+          }, 2400),
+        );
+        return null;
+      }
       tag({ type: "toolResult", id: callId, ok: approved, content: approved ? "" : "用户拒绝了这次调用" });
       tag({ type: "text", text: approved ? "已删除。" : "好的，不删除。" });
       tag({ type: "done", steps: 2 });

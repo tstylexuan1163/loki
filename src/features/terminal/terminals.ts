@@ -65,6 +65,8 @@ export interface TermTab {
   recording: import("@/lib/api").RecordInfo | null;
   /** Login name answered at the prompt; reused for retries and reconnects. */
   login: { username: string; remember: boolean } | null;
+  /** What the assistant is typing into this terminal; keystrokes wait meanwhile. */
+  aiTyping?: string | null;
 }
 
 interface TermState {
@@ -90,6 +92,7 @@ interface TermState {
   cycle(delta: number): void;
   rename(tabId: string, title: string): void;
   setRecording(tabId: string, info: import("@/lib/api").RecordInfo | null): void;
+  setAiTyping(tabId: string, what: string | null): void;
   /** Drops every tab without talking to the backend (it already closed them). */
   reset(): void;
 }
@@ -387,6 +390,9 @@ export const useTerminals = create<TermState>((set, get) => {
     sendInput(tabId, data) {
       const tab = get().tabs.find((t) => t.id === tabId);
       if (!tab?.sessionId || tab.status !== "connected") return;
+      // The assistant is typing here: mixing in keystrokes would corrupt both
+      // its command and the user's. The banner says so and offers a stop.
+      if (tab.aiTyping != null) return;
       let binary = "";
       for (const b of data) binary += String.fromCharCode(b);
       const encoded = btoa(binary);
@@ -449,6 +455,10 @@ export const useTerminals = create<TermState>((set, get) => {
 
     setRecording(tabId, info) {
       patch(tabId, { recording: info });
+    },
+
+    setAiTyping(tabId, what) {
+      patch(tabId, { aiTyping: what });
     },
 
     reset() {

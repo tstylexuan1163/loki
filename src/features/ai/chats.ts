@@ -23,6 +23,10 @@ export interface ToolCallView {
   name: string;
   args: unknown;
   auto: boolean;
+  /** A command from the always-ask list (reboot, erase…). */
+  dangerous?: boolean;
+  /** Approved and running: no longer waiting for the user. */
+  started?: boolean;
   /** undefined while waiting for the user. */
   result?: { ok: boolean; content: string };
 }
@@ -149,8 +153,16 @@ export function applyEvent(parts: Part[], ev: AiEventPayload): Part[] {
   if (ev.type === "toolCall") {
     return [
       ...parts,
-      { kind: "tool", call: { id: ev.id, name: ev.name, args: ev.arguments, auto: ev.auto } },
+      {
+        kind: "tool",
+        call: { id: ev.id, name: ev.name, args: ev.arguments, auto: ev.auto, dangerous: ev.dangerous },
+      },
     ];
+  }
+  if (ev.type === "toolStarted") {
+    return parts.map((p) =>
+      p.kind === "tool" && p.call.id === ev.id ? { kind: "tool", call: { ...p.call, started: true } } : p,
+    );
   }
   if (ev.type === "toolResult") {
     return parts.map((p) =>
@@ -241,6 +253,7 @@ export function listenForTurns() {
     if (ev.turnId && runningTurn && ev.turnId !== runningTurn) return;
     const finished = ev.type === "done" || ev.type === "error" || ev.type === "stopped";
     const chat = chats[runningTab];
+    trackTyping(runningTab, chat, ev, finished);
     if (chat) {
       const last = chat.turns[chat.turns.length - 1];
       if (last?.role === "assistant") {
@@ -270,6 +283,27 @@ export function listenForTurns() {
     }
     if (finished) useChats.getState().setRunning(null);
   });
+}
+
+/** Tools that type into the terminal the user is looking at. */
+const TYPING_TOOLS = new Set(["type_in_terminal", "terminal_key"]);
+
+/**
+ * While the assistant types into a tab's terminal, that tab shows a banner
+ * and holds back the user's keystrokes, so the two never interleave.
+ */
+function trackTyping(tabId: string, chat: Chat | undefined, ev: AiEventPayload, finished: boolean) {
+  const { setAiTyping } = useTerminals.getState();
+  if (ev.type === "toolStarted") {
+    const last = chat?.turns[chat.turns.length - 1];
+    const call = last?.parts.find((p) => p.kind === "tool" && p.call.id === ev.id);
+    if (call?.kind === "tool" && TYPING_TOOLS.has(call.call.name)) {
+      const a = (call.call.args ?? {}) as { command?: string; key?: string };
+      setAiTyping(tabId, a.command ?? (a.key ? `按键 ${a.key}` : ""));
+    }
+  } else if (ev.type === "toolResult" || finished) {
+    setAiTyping(tabId, null);
+  }
 }
 
 // A closed tab takes its conversation with it (it is already in the history),

@@ -2615,6 +2615,25 @@ textarea.field__input {
   animation: rise 140ms ease-out;
 }
 
+/* The assistant typing into this terminal: at the top, clear of the prompt. */
+.pane-banner--top {
+  top: 12px;
+  bottom: auto;
+  max-width: calc(100% - 32px);
+}
+
+.pane-banner__text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pane-banner__text code {
+  color: var(--text);
+  font-family: var(--mono);
+}
+
 .statusbar {
   height: 26px;
   flex: none;
@@ -3558,6 +3577,17 @@ textarea.field__input {
   flex: 1;
   font-size: 11.5px;
   color: var(--warn);
+}
+
+.step__ask-text--danger {
+  color: var(--danger);
+  font-weight: 600;
+}
+
+/* Keep the terminal colours, which the text is drawn for; mark it with a
+   red edge instead. */
+.step__args--danger {
+  box-shadow: inset 3px 0 0 var(--danger), 0 0 0 1px var(--danger);
 }
 
 .spinner--xs {

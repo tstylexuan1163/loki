@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::ssh::LiveSession;
 
@@ -31,12 +32,25 @@ pub fn is_read_only(tool: &str) -> bool {
 }
 
 /// Decides whether a call may proceed.
-pub fn may_run_unattended(mode: PermissionMode, tool: &str) -> bool {
+///
+/// A command that reboots, erases or can cut the connection is asked about
+/// even when the user let everything run: one wrong guess there is not
+/// undone by reading the transcript afterwards.
+pub fn may_run_unattended(mode: PermissionMode, tool: &str, args: &Value) -> bool {
     match mode {
         PermissionMode::Manual => false,
         PermissionMode::Auto => is_read_only(tool),
-        PermissionMode::Bypass => true,
+        PermissionMode::Bypass => !is_dangerous_call(tool, args),
     }
+}
+
+/// Whether a call runs a command from the always-ask list.
+pub fn is_dangerous_call(tool: &str, args: &Value) -> bool {
+    matches!(tool, "run_command" | "type_in_terminal")
+        && args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .is_some_and(super::interactive::is_dangerous)
 }
 
 /// The tool catalogue, described to the model in JSON Schema.
@@ -69,6 +83,32 @@ pub fn catalogue() -> Vec<super::provider::ToolSpec> {
                     "command": { "type": "string", "description": "要执行的 shell 命令" }
                 },
                 "required": ["command"]
+            }),
+        ),
+        spec(
+            "type_in_terminal",
+            "把一行命令输入到用户正在看的终端里（和用户自己打字一样），等设备回到提示符后返回输出。\
+适合交换机、路由器等只有交互式命令行的设备，以及需要保持状态的操作（system-view、接口视图、su）。\
+分页（---- More ----）会自动翻页，不需要先关闭分页。遇到密码或 [Y/N] 这类提问会停下，交给用户。\
+会改变设备状态，请先确认。",
+            json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string", "description": "要输入的一行命令" },
+                    "timeout_secs": { "type": "integer", "description": "最多等待的秒数，默认 30，最大 300" }
+                },
+                "required": ["command"]
+            }),
+        ),
+        spec(
+            "terminal_key",
+            "在终端里按一个键：ctrl_c 中断命令，q 退出分页，y / n 回答确认提问，enter、space。只能按这几个键。",
+            json!({
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string", "enum": ["ctrl_c", "enter", "space", "q", "y", "n"] }
+                },
+                "required": ["key"]
             }),
         ),
         spec(
@@ -120,10 +160,35 @@ pub fn catalogue() -> Vec<super::provider::ToolSpec> {
     ]
 }
 
+/// Tools that need an SSH connection (an exec channel or SFTP). A telnet,
+/// serial or local session has neither.
+const SSH_ONLY: &[&str] = &[
+    "run_command",
+    "list_directory",
+    "read_file",
+    "write_file",
+    "grep",
+];
+/// Tools that type into the user's terminal.
+const TYPING: &[&str] = &["type_in_terminal", "terminal_key"];
+
+/// The catalogue, less what this session cannot do. Offering a tool that can
+/// only fail invites the model to keep trying it.
+pub fn offered(ssh: bool, typing: bool) -> Vec<super::provider::ToolSpec> {
+    catalogue()
+        .into_iter()
+        .filter(|t| ssh || !SSH_ONLY.contains(&t.name.as_str()))
+        .filter(|t| typing || !TYPING.contains(&t.name.as_str()))
+        .collect()
+}
+
 /// Everything a tool call might need.
 pub struct ToolContext {
     pub session: Option<Arc<LiveSession>>,
-    /// Recent terminal output, for `read_terminal`.
+    /// The terminal the assistant may type into and read live.
+    pub terminal: Option<super::interactive::Terminal>,
+    /// Recent terminal output when the turn began; `read_terminal` falls back
+    /// to it when there is no live terminal.
     pub terminal_tail: String,
     /// Remote paths of attached private keys: never read into the model.
     pub secret_paths: Vec<String>,
@@ -156,9 +221,13 @@ impl ToolOutcome {
 /// Runs one tool call.
 pub async fn run(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcome {
     let need_session = |ctx: &ToolContext| -> Result<Arc<LiveSession>, ToolOutcome> {
-        ctx.session
-            .clone()
-            .ok_or_else(|| ToolOutcome::err("还没有打开的 SSH 会话"))
+        ctx.session.clone().ok_or_else(|| {
+            ToolOutcome::err(if ctx.terminal.is_some() {
+                "这个工具只能在 SSH 会话里用，当前会话请改用 type_in_terminal"
+            } else {
+                "还没有打开的会话"
+            })
+        })
     };
 
     match name {
@@ -168,7 +237,15 @@ pub async fn run(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcome {
                 .and_then(|v| v.as_u64())
                 .unwrap_or(40)
                 .min(200) as usize;
-            let tail: Vec<&str> = ctx.terminal_tail.lines().rev().take(lines).collect();
+            // Read now, not when the turn began: after typing a command the
+            // screen has moved on. Key bodies are stripped like any output.
+            let screen = match &ctx.terminal {
+                Some(t) => crate::ai::attach::redact_private_keys(
+                    &super::interactive::render(&t.screen()).join("\n"),
+                ),
+                None => ctx.terminal_tail.clone(),
+            };
+            let tail: Vec<&str> = screen.lines().rev().take(lines).collect();
             let text = tail.into_iter().rev().collect::<Vec<_>>().join("\n");
             if text.is_empty() {
                 ToolOutcome::ok("(终端还没有输出)")
@@ -190,6 +267,36 @@ pub async fn run(name: &str, args: &Value, ctx: &ToolContext) -> ToolOutcome {
             };
             match crate::ssh::exec_command(&session, command).await {
                 Ok(out) => ToolOutcome::ok(out),
+                Err(e) => ToolOutcome::err(e),
+            }
+        }
+
+        "type_in_terminal" => {
+            let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            if command.trim().is_empty() {
+                return ToolOutcome::err("缺少 command");
+            }
+            let Some(term) = &ctx.terminal else {
+                return ToolOutcome::err("当前没有可以输入的终端");
+            };
+            let secs = args
+                .get("timeout_secs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(30)
+                .clamp(1, 300);
+            match super::interactive::type_line(term, command, Duration::from_secs(secs)).await {
+                Ok(out) => ToolOutcome::ok(out.report()),
+                Err(e) => ToolOutcome::err(e),
+            }
+        }
+
+        "terminal_key" => {
+            let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("");
+            let Some(term) = &ctx.terminal else {
+                return ToolOutcome::err("当前没有可以输入的终端");
+            };
+            match super::interactive::press(term, key, Duration::from_secs(10)).await {
+                Ok(out) => ToolOutcome::ok(out.report()),
                 Err(e) => ToolOutcome::err(e),
             }
         }
@@ -309,23 +416,91 @@ mod tests {
 
     #[test]
     fn auto_mode_only_allows_reads() {
-        assert!(may_run_unattended(PermissionMode::Auto, "read_file"));
-        assert!(may_run_unattended(PermissionMode::Auto, "list_directory"));
+        assert!(may_run_unattended(
+            PermissionMode::Auto,
+            "read_file",
+            &json!({})
+        ));
+        assert!(may_run_unattended(
+            PermissionMode::Auto,
+            "list_directory",
+            &json!({})
+        ));
         // Anything that can change the server must be confirmed.
-        assert!(!may_run_unattended(PermissionMode::Auto, "run_command"));
-        assert!(!may_run_unattended(PermissionMode::Auto, "write_file"));
+        assert!(!may_run_unattended(
+            PermissionMode::Auto,
+            "run_command",
+            &json!({})
+        ));
+        assert!(!may_run_unattended(
+            PermissionMode::Auto,
+            "write_file",
+            &json!({})
+        ));
     }
 
     #[test]
     fn manual_never_runs_unattended() {
         for tool in ["read_file", "run_command", "grep"] {
-            assert!(!may_run_unattended(PermissionMode::Manual, tool), "{tool}");
+            assert!(
+                !may_run_unattended(PermissionMode::Manual, tool, &json!({})),
+                "{tool}"
+            );
         }
     }
 
     #[test]
-    fn bypass_runs_everything() {
-        assert!(may_run_unattended(PermissionMode::Bypass, "run_command"));
+    fn bypass_runs_everything_but_the_always_ask_list() {
+        let ok = json!({ "command": "display version" });
+        assert!(may_run_unattended(
+            PermissionMode::Bypass,
+            "run_command",
+            &ok
+        ));
+        assert!(may_run_unattended(
+            PermissionMode::Bypass,
+            "type_in_terminal",
+            &ok
+        ));
+        let risky = json!({ "command": "reset saved-configuration" });
+        assert!(!may_run_unattended(
+            PermissionMode::Bypass,
+            "type_in_terminal",
+            &risky
+        ));
+        assert!(!may_run_unattended(
+            PermissionMode::Bypass,
+            "run_command",
+            &json!({ "command": "sudo reboot" })
+        ));
+    }
+
+    #[test]
+    fn typing_into_the_terminal_is_never_a_read() {
+        let args = json!({ "command": "display version" });
+        assert!(!may_run_unattended(
+            PermissionMode::Auto,
+            "type_in_terminal",
+            &args
+        ));
+        assert!(!may_run_unattended(
+            PermissionMode::Auto,
+            "terminal_key",
+            &json!({ "key": "y" })
+        ));
+    }
+
+    #[test]
+    fn a_session_without_ssh_is_offered_only_the_terminal() {
+        let names = |ssh, typing| -> Vec<String> {
+            offered(ssh, typing).into_iter().map(|t| t.name).collect()
+        };
+        assert_eq!(names(true, true).len(), catalogue().len());
+        assert_eq!(
+            names(false, true),
+            ["read_terminal", "type_in_terminal", "terminal_key"]
+        );
+        assert_eq!(names(false, false), ["read_terminal"]);
     }
 
     #[test]
@@ -343,6 +518,7 @@ mod tests {
     async fn unknown_tool_is_an_error_not_a_panic() {
         let ctx = ToolContext {
             session: None,
+            terminal: None,
             terminal_tail: String::new(),
             secret_paths: Vec::new(),
         };
@@ -354,6 +530,7 @@ mod tests {
     async fn read_terminal_returns_the_tail() {
         let ctx = ToolContext {
             session: None,
+            terminal: None,
             terminal_tail: "one\ntwo\nthree".into(),
             secret_paths: Vec::new(),
         };
@@ -366,6 +543,7 @@ mod tests {
     async fn a_secret_attachment_is_refused_by_path() {
         let ctx = ToolContext {
             session: None,
+            terminal: None,
             terminal_tail: String::new(),
             secret_paths: vec!["~/.loki/uploads/x/server.key".into()],
         };
@@ -400,6 +578,7 @@ mod tests {
     async fn tools_needing_a_session_say_so() {
         let ctx = ToolContext {
             session: None,
+            terminal: None,
             terminal_tail: String::new(),
             secret_paths: Vec::new(),
         };

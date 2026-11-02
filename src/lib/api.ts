@@ -436,7 +436,9 @@ export interface ChatMessage {
 
 export type AiEvent =
   | { type: "text"; text: string }
-  | { type: "toolCall"; id: string; name: string; arguments: unknown; auto: boolean }
+  | { type: "toolCall"; id: string; name: string; arguments: unknown; auto: boolean; dangerous?: boolean }
+  /** An approved call started running. */
+  | { type: "toolStarted"; id: string }
   | { type: "toolResult"; id: string; ok: boolean; content: string }
   | { type: "context"; droppedRounds: number; shortenedOutputs: number; tokens: number; limit: number }
   | { type: "limitLearned"; tokens: number; exact: boolean }

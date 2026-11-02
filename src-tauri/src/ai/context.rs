@@ -26,7 +26,7 @@ pub const RECENT_CAP: usize = 12_000;
 /// Longest tool output kept from older rounds once trimming starts.
 pub const OLD_CAP: usize = 1_200;
 /// What the system prompt and the tool schemas take, roughly.
-const OVERHEAD: usize = 3_000;
+pub const OVERHEAD: usize = 3_000;
 
 /// What was left out, for the panel to show.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

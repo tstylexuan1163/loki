@@ -2667,6 +2667,18 @@ pub struct AiAttachSend {
     pub share_content: bool,
 }
 
+/// How a non-SSH session is described to the assistant.
+fn direct_target(info: &crate::direct::DirectInfo) -> String {
+    match info.kind.as_str() {
+        "telnet" => format!(
+            "Telnet {}",
+            info.target.strip_prefix("telnet ").unwrap_or(&info.target)
+        ),
+        "serial" => format!("串口 {}", info.target),
+        _ => format!("本地终端（{}）", info.target),
+    }
+}
+
 // Eight parameters is the price of a flat IPC call; grouping them into a struct
 // would only move the same fields into a wrapper.
 #[allow(clippy::too_many_arguments)]
@@ -2732,10 +2744,30 @@ pub async fn ai_send(
         None => None,
     };
 
+    // Not SSH: a telnet, serial or local session the assistant can only type
+    // into.
+    let (terminal, target) = match (&session, &session_id) {
+        (Some(s), _) => (
+            Some(crate::ai::interactive::Terminal::Ssh(s.clone())),
+            Some(format!("SSH {}", s.info.title)),
+        ),
+        (None, Some(id)) => {
+            let mgr = state.direct.lock().map_err(|e| e.to_string())?;
+            match (mgr.get(id), mgr.output(id), mgr.info(id)) {
+                (Some(session), Some(output), Some(info)) => (
+                    Some(crate::ai::interactive::Terminal::Direct { session, output }),
+                    Some(direct_target(&info)),
+                ),
+                _ => (None, None),
+            }
+        }
+        (None, None) => (None, None),
+    };
+
     // The most recent terminal output, so `read_terminal` has something to read.
-    let terminal_tail = session
+    let terminal_tail = terminal
         .as_ref()
-        .map(|s| String::from_utf8_lossy(&s.peek_backlog()).to_string())
+        .map(|t| String::from_utf8_lossy(&t.screen()).to_string())
         .unwrap_or_default();
 
     // Attachments are described here, not by the panel: the content must never
@@ -2886,8 +2918,10 @@ pub async fn ai_send(
             config,
             history,
             mode: permission,
+            terminal,
             session,
             terminal_tail,
+            target,
             secret_paths,
             context_limit,
         },

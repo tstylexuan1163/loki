@@ -108,11 +108,14 @@ pub struct DirectInfo {
     pub negotiation: Option<Negotiation>,
 }
 
+/// The buffer SSH sessions use too: output before a pane attached (replayed
+/// once), the recent screen for the assistant, and its live tap.
+pub type Output = Arc<std::sync::Mutex<crate::ssh::OutputBuffer>>;
+
 struct Entry {
     info: DirectInfo,
     session: Arc<DirectSession>,
-    /// Output produced before a pane attached, replayed once on request.
-    backlog: Arc<std::sync::Mutex<Vec<u8>>>,
+    output: Output,
     /// Attached by `session_record_start`; the reader writes every chunk here.
     recorder: Arc<std::sync::Mutex<Option<crate::recorder::Recorder>>>,
 }
@@ -168,8 +171,13 @@ impl DirectManager {
     pub fn take_backlog(&self, id: &str) -> Vec<u8> {
         self.entries
             .get(id)
-            .and_then(|e| e.backlog.lock().ok().map(|mut b| std::mem::take(&mut *b)))
+            .and_then(|e| e.output.lock().ok().map(|mut b| b.take_pending()))
             .unwrap_or_default()
+    }
+
+    /// The session's output buffer, for the assistant to watch and read.
+    pub fn output(&self, id: &str) -> Option<Output> {
+        self.entries.get(id).map(|e| e.output.clone())
     }
 
     pub fn stop_all(&mut self) {
@@ -206,7 +214,7 @@ impl DirectManager {
         conn: crate::telnet::TelnetConnection,
         events: tokio::sync::mpsc::UnboundedSender<TermEvent>,
     ) -> DirectInfo {
-        let backlog = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let output = Output::default();
         let info = DirectInfo {
             id: id.clone(),
             status: "connected".to_string(),
@@ -222,7 +230,7 @@ impl DirectManager {
             stop: stop.clone(),
         });
 
-        let backlog_for_reader = backlog.clone();
+        let output_for_reader = output.clone();
         let recorder = Arc::new(std::sync::Mutex::new(None::<crate::recorder::Recorder>));
         let recorder_for_reader = recorder.clone();
         self.entries.insert(
@@ -230,7 +238,7 @@ impl DirectManager {
             Entry {
                 info: info.clone(),
                 session,
-                backlog,
+                output,
                 recorder,
             },
         );
@@ -260,7 +268,7 @@ impl DirectManager {
                             tokio::task::yield_now().await;
                             continue;
                         }
-                        push_bounded(&backlog_for_reader, &data);
+                        push_output(&output_for_reader, &data);
                         write_recording(&recorder_for_reader, &data);
                         let payload = base64_encode(&data);
                         if events
@@ -279,6 +287,7 @@ impl DirectManager {
                     Err(_) => continue,
                 }
             }
+            close_output(&output_for_reader);
             let _ = events.send(TermEvent::Closed { session_id: sid });
         });
 
@@ -322,16 +331,17 @@ impl DirectManager {
 
         let conn = crate::serial::SerialConnection::open(&path, config)?;
         let sid = id.clone();
-        let backlog = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-        let backlog_for_reader = backlog.clone();
+        let output = Output::default();
+        let output_for_reader = output.clone();
 
         let recorder = Arc::new(std::sync::Mutex::new(None::<crate::recorder::Recorder>));
         let recorder_for_reader = recorder.clone();
         let end_events = events.clone();
         let end_sid = id.clone();
+        let end_output = output.clone();
         let (handle, stop) = conn.start(
             move |bytes| {
-                push_bounded(&backlog_for_reader, &bytes);
+                push_output(&output_for_reader, &bytes);
                 write_recording(&recorder_for_reader, &bytes);
                 let payload = base64_encode(&bytes);
                 let _ = events.send(TermEvent::Data {
@@ -342,6 +352,7 @@ impl DirectManager {
             // An unplugged adapter ends the read with an error; without this
             // the tab would keep saying "connected" and swallow keystrokes.
             move || {
+                close_output(&end_output);
                 let _ = end_events.send(TermEvent::Closed {
                     session_id: end_sid,
                 });
@@ -364,7 +375,7 @@ impl DirectManager {
                     handle: Arc::new(handle),
                     stop,
                 }),
-                backlog,
+                output,
                 recorder,
             },
         );
@@ -380,19 +391,20 @@ impl DirectManager {
         rows: u16,
         events: tokio::sync::mpsc::UnboundedSender<TermEvent>,
     ) -> Result<DirectInfo, String> {
-        let backlog = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-        let backlog_for_reader = backlog.clone();
+        let output = Output::default();
+        let output_for_reader = output.clone();
         let recorder = Arc::new(std::sync::Mutex::new(None::<crate::recorder::Recorder>));
         let recorder_for_reader = recorder.clone();
         let sid = id.clone();
         let data_events = events.clone();
         let exit_sid = id.clone();
+        let exit_output = output.clone();
 
         let pty = crate::local::LocalPty::spawn(
             cols,
             rows,
             move |bytes| {
-                push_bounded(&backlog_for_reader, &bytes);
+                push_output(&output_for_reader, &bytes);
                 write_recording(&recorder_for_reader, &bytes);
                 let _ = data_events.send(TermEvent::Data {
                     session_id: sid.clone(),
@@ -400,6 +412,7 @@ impl DirectManager {
                 });
             },
             move |code| {
+                close_output(&exit_output);
                 if let Some(code) = code {
                     let _ = events.send(TermEvent::Exit {
                         session_id: exit_sid.clone(),
@@ -428,7 +441,7 @@ impl DirectManager {
             Entry {
                 info: info.clone(),
                 session: Arc::new(DirectSession::Local { pty }),
-                backlog,
+                output,
                 recorder,
             },
         );
@@ -448,12 +461,15 @@ fn write_recording(slot: &std::sync::Mutex<Option<crate::recorder::Recorder>>, d
     }
 }
 
-/// Replay buffers stop growing at 256 KB; a noisy console must not grow them
-/// forever while no pane is attached.
-fn push_bounded(buf: &std::sync::Mutex<Vec<u8>>, data: &[u8]) {
-    if let Ok(mut b) = buf.lock() {
-        let room = (256 * 1024usize).saturating_sub(b.len());
-        b.extend_from_slice(&data[..data.len().min(room)]);
+fn push_output(output: &Output, data: &[u8]) {
+    if let Ok(mut b) = output.lock() {
+        b.push(data);
+    }
+}
+
+fn close_output(output: &Output) {
+    if let Ok(mut b) = output.lock() {
+        b.close();
     }
 }
 
@@ -523,5 +539,83 @@ mod tests {
         assert_eq!(&reply[3..12], &[255, 250, 31, 0, 132, 0, 40, 255, 240]);
 
         session.stop();
+    }
+
+    /// Reads from a fake device until `\r`, returning the line.
+    async fn read_line(server: &mut tokio::net::TcpStream) -> String {
+        let mut line = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            if server.read(&mut byte).await.unwrap() == 0 || byte[0] == b'\r' {
+                return String::from_utf8_lossy(&line).into_owned();
+            }
+            line.push(byte[0]);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_assistant_types_into_a_telnet_switch() {
+        use crate::ai::interactive::{type_line, Ended, Terminal};
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let conn = DirectManager::connect_telnet("127.0.0.1", port, 80, 24)
+            .await
+            .unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        let mut naws = [0u8; 9];
+        server.read_exact(&mut naws).await.unwrap();
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<TermEvent>();
+        let mut mgr = DirectManager::new();
+        mgr.register_telnet("t".into(), "127.0.0.1".into(), port, conn, tx);
+        let term = Terminal::Direct {
+            session: mgr.get("t").unwrap(),
+            output: mgr.output("t").unwrap(),
+        };
+
+        // A switch that echoes, pages its answer, then hangs up on `quit`.
+        let device = tokio::spawn(async move {
+            server.write_all(b"\r\n<sw01>").await.unwrap();
+            let cmd = read_line(&mut server).await;
+            assert_eq!(cmd, "display interface brief");
+            server
+                .write_all(b"display interface brief\r\nGE1/0/1 UP\r\n  ---- More ----")
+                .await
+                .unwrap();
+            let mut key = [0u8; 1];
+            server.read_exact(&mut key).await.unwrap();
+            assert_eq!(&key, b" ");
+            server
+                .write_all(b"\x1b[16D                \x1b[16DGE1/0/2 DOWN\r\n<sw01>")
+                .await
+                .unwrap();
+            assert_eq!(read_line(&mut server).await, "quit");
+        });
+
+        // Wait for the banner, as the user would before typing.
+        for _ in 0..100 {
+            if String::from_utf8_lossy(&term.screen()).contains("<sw01>") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let out = type_line(&term, "display interface brief", Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(out.ended, Ended::Prompt("<sw01>".into()));
+        assert_eq!(out.pages, 1);
+        assert_eq!(out.output, "GE1/0/1 UP\nGE1/0/2 DOWN");
+
+        // The device hanging up ends the wait at once, not at the timeout.
+        let started = std::time::Instant::now();
+        let out = type_line(&term, "quit", Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(out.ended, Ended::Closed);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        device.await.unwrap();
     }
 }

@@ -958,3 +958,59 @@ clippy、`npx tsc --noEmit`、`npx vite build`；mock 里验证：流式输出�
 9. **下载可能把文件写到目标文件夹以外。** 文件名来自服务器，`..`、`/`，以及 Windows 上的 `\` 或 `C:`，都可能让 `Path::join` 跳出用户选择的文件夹。现在由 `local_name` 先替换掉这些字符；在 Windows 上，系统不允许出现在文件名里的字符也会被替换。
 
 新增测试：`telnet_keystrokes_do_not_wait_for_the_reader`（端到端：服务器不发数据时按键也要立刻送达，设备请求窗口大小时要回复大小）、四个 Telnet 解码器测试、`stopping_frees_the_port_without_waiting_for_a_connection`、`remote_names_cannot_escape_the_download_folder`。
+
+## 三十五、AI 交互模式第一阶段：在终端里输入命令 ✅
+
+方案见 `docs/plans/2026-11-02-ai-interactive-terminal.md`。三个待定事项都按建议执行：执行期间暂停键盘输入；完全放行模式下高危命令仍然要确认；分页自动按空格翻页。
+
+**新增工具**
+- `type_in_terminal`：把一行命令输入到用户当前的终端里，等设备回到提示符后返回整理好的输出，以及当前提示符（模型据此知道自己在哪个视图里）。默认超时 30 秒，最长 300 秒。
+- `terminal_key`：只能按固定的几个键：`ctrl_c`、`enter`、`space`、`q`、`y`、`n`。模型没有办法输入任意文本，所以也没有办法输入密码。
+
+**怎么实现的**
+- `ssh::OutputBuffer` 新增 `tap`：读线程每读到一块数据，就复制一份发给它。`LiveSession::open_tap()` 同一时间只允许一个 tap，返回的 `Tap` 被丢弃时自动关闭。
+- `ai/interactive.rs`：
+  - `render`：一个精简的终端行渲染器，能处理 `\r`、退格、`ESC[nD/C/G/K`，去掉颜色和 OSC 序列。设备擦除分页提示的方式（光标左移后用空格覆盖）在这里会被正确还原，不会留下 `More` 字样。
+  - `classify`：判断最后一行是什么。提示符支持 H3C/华为的 `<x>` `[x]` `[~x]`，思科/锐捷的 `x#` `x>` `x(config-if)#`，以及 Linux 的 `user@host:~$` `[root@h ~]#`。另外识别分页、密码、用户名和 y/n 确认。
+  - `drive`：输入命令后接收输出。看到分页就自动按空格，最多 500 页；原始输出超过 256KB 时发送 Ctrl+C；安静 300ms 后检查最后一行，是提示符就结束，是提问就交还给用户；5 秒没有新输出则按“无提示符”结束；超时不会自动中断。输出最后会去掉回显的命令行和结尾的提示符，最多返回 30KB。
+  - 如果屏幕当前停在密码、用户名或分页提示上，`type_in_terminal` 会拒绝执行。
+  - `is_dangerous`：高危命令清单，包括 reboot、reload、shutdown、format、delete、erase、`reset saved-configuration`、`rm -rf`、`dd if=` 等。
+- `tools::may_run_unattended` 新增参数，完全放行模式下遇到高危命令也会要求确认。`AiEvent::ToolCall` 新增 `dangerous` 字段，新增 `ToolStarted` 事件。
+- `read_terminal` 改为在调用时实时读取屏幕，而不是用这一轮开始时的快照。
+- 系统提示词写明了两种执行方式各自适用的场景，以及遇到密码或确认提问时的处理规则。另加了测试，保证系统提示词和工具定义的估算 token 数不超过预留的 `OVERHEAD`。
+
+**前端**
+- 收到 `toolStarted` 后，如果是这两个新工具，终端顶部会显示横幅“AI 正在终端中执行 xxx · 键盘输入已暂停”，期间 `sendInput` 直接丢弃用户按键。横幅上的“停止”会结束这一轮对话并发送 Ctrl+C。
+- 已批准、正在执行的调用会显示为“执行中”，不再一直显示“允许/拒绝”按钮。这个问题对原有的 `run_command` 也存在，一并修好了。
+- 高危命令的确认卡片用红色边框和红字提示。
+- mock 新增两个场景：问“交换机接口”会模拟带分页的 H3C 输出；问“重启”会出现高危命令卡片。
+
+**验证**：新增 13 个单元测试，覆盖提示符和提问识别、渲染时擦除分页提示（H3C 和思科两种方式）、高危命令识别、用假交换机跑通“翻页后回到提示符 / 遇到提问交还 / 无输出结束 / 超时”、拒绝在密码提示处执行、按键白名单、权限门、tap。在 mock 里实际走了一遍：确认 → 横幅 → 执行期间输入被拦下（另做了对照：没有 AI 执行时同样的输入能正常显示）→ 输出 → 结果；高危卡片和“停止”按钮也都试过。
+
+**还没做**：第二阶段（见第三十六节）。还没有在真实交换机上测试过。
+
+## 三十六、AI 交互模式第二阶段：Telnet、串口、本地终端 ✅
+
+AI 助手现在也能用在 Telnet、串口和本地终端标签里。这类会话没有 exec 通道和 SFTP，所以助手只能读终端、在终端里输入命令和按键。
+
+**怎么实现的**
+- tap 从 SSH 里抽出来共用：`ssh::Tap::open(&Arc<Mutex<OutputBuffer>>)`，`LiveSession::open_tap` 改为调用它。`OutputBuffer::close()` 在会话结束时关掉 tap，正在等待输出的命令立刻以“会话已关闭”结束，不用等到超时。SSH 的读线程结束时也会调用它。
+- `direct.rs` 的三种会话不再各自维护一个 `Vec<u8>` 回放缓冲，而是和 SSH 一样使用 `OutputBuffer`（类型别名 `direct::Output`）：回放、屏幕尾部和 tap 都在里面。回放的语义也和 SSH 一致了：界面取过一次之后就不再积累（以前会继续积累到 256KB）。新增 `DirectManager::output(id)`。
+- `interactive::Terminal` 新增 `Direct { session, output }`。
+- `ai_send` 先在 SSH 会话里查找，找不到再查直连会话；同时生成一行会话说明（`SSH user@host`、`Telnet 10.0.8.1:23`、`串口 /dev/ttyUSB0 @ 9600`、`本地终端（zsh）`），写进系统提示词。
+- `tools::offered(ssh, typing)` 按会话类型筛选工具：非 SSH 会话不提供 `run_command`、`list_directory`、`read_file`、`write_file`、`grep`；没有会话时只剩 `read_terminal`。模型如果还是调用了 SSH 专用工具，会收到“当前会话请改用 type_in_terminal”。
+- 系统提示词开头不再写死“通过 SSH 连接”，末尾附上当前会话说明；非 SSH 会话会写明“没有 run_command 和文件工具”。
+- 提示符识别补上了本地终端的常见格式：macOS zsh 的 `user@mac ~ %`、PowerShell 的 `PS C:\Users\me>`、cmd 的 `C:\Users\me>`。自定义主题的提示符（oh-my-zsh、starship 等）识别不了，会在 5 秒无输出后以“未识别到提示符”结束，不影响结果。
+
+**前端**
+- `AiPanel` 新增 `ssh` 属性，`TerminalView` 对所有类型的标签都传入 `sessionId`。附件仍然只在 SSH 会话可用。
+- 非 SSH 会话在面板顶部显示“非 SSH 会话：助手只能在终端里输入命令，不能读写文件”，空状态的说明文字和推荐问题也换成了针对网络设备的版本。
+
+**验证**：新增 3 个测试，共 185 个，全部通过：
+- 用本地假 Telnet 交换机做端到端测试：回显、分页、擦除分页提示、回到提示符；设备挂断后立即以“会话已关闭”结束；
+- 按会话类型筛选工具；
+- 系统提示词里的会话说明。
+
+提示符识别测试补了本地终端的格式。在 mock 里用 Telnet 标签实际走了一遍：确认 → 横幅 → 分页输出 → 结果。
+
+**还没做**：第三阶段，在提示词里加入厂商信息（例如扫描添加的主机名 `H3C-10.0.8.1`）。还没有在真实设备上测试过。

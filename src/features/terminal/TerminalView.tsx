@@ -8,6 +8,7 @@ import { QuickConnect } from "@/features/terminal/QuickConnect";
 import { SftpPanel } from "@/features/sftp/SftpPanel";
 import { AiPanel } from "@/features/ai/AiPanel";
 import { useAiComposer } from "@/features/ai/aiComposer";
+import { useChats } from "@/features/ai/chats";
 import { Menu, confirmDialog, toast, useMenu } from "@/components/ui";
 import { isAppShortcut, keyLabel, shortcutKey } from "@/app/platform";
 import { recordApi, formatBytes } from "@/lib/api";
@@ -346,6 +347,9 @@ export function TerminalView({ visible }: { visible: boolean }) {
               {current && current.status !== "connected" && (
                 <ConnectOverlay tab={current} onReconnect={() => reconnect(current.id)} />
               )}
+              {current && current.status === "connected" && current.aiTyping != null && (
+                <AiTypingBanner tab={current} />
+              )}
             </div>
             {current && <StatusBar tab={current} />}
           </div>
@@ -366,7 +370,8 @@ export function TerminalView({ visible }: { visible: boolean }) {
                 ) : panel === "ai" ? (
                   <AiPanel
                     tabId={current.id}
-                    sessionId={current.kind === "ssh" ? current.sessionId : null}
+                    sessionId={current.sessionId}
+                    ssh={current.kind === "ssh"}
                     hostId={current.hostId}
                     hostLabel={current.title}
                     onClose={() => setPanel(null)}
@@ -612,6 +617,31 @@ function FindBar({ tabId, onClose }: { tabId: string; onClose: () => void }) {
       </button>
       <button className="iconbtn" onClick={onClose} title="关闭 (Esc)">
         <IconX size={14} />
+      </button>
+    </div>
+  );
+}
+
+/**
+ * Shown while the assistant types into this terminal. Keystrokes are held
+ * back meanwhile; stopping ends the assistant's turn and interrupts whatever
+ * it started on the device.
+ */
+function AiTypingBanner({ tab }: { tab: TermTab }) {
+  const stop = () => {
+    useChats.getState().stop();
+    useTerminals.getState().setAiTyping(tab.id, null);
+    useTerminals.getState().sendInput(tab.id, new Uint8Array([3]));
+  };
+  return (
+    <div className="pane-banner pane-banner--top">
+      <span className="spinner spinner--xs" />
+      <span className="pane-banner__text">
+        AI 正在终端中执行 <code>{tab.aiTyping}</code>
+        <span className="muted"> · 键盘输入已暂停</span>
+      </span>
+      <button className="btn btn--sm btn--danger" onClick={stop}>
+        停止
       </button>
     </div>
   );

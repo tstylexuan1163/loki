@@ -71,10 +71,18 @@ pub struct OutputBuffer {
     pending: Vec<u8>,
     attached: bool,
     tail: VecDeque<u8>,
+    /// A live copy of the output for whoever is watching it (the assistant
+    /// typing into the terminal). At most one at a time.
+    tap: Option<mpsc::UnboundedSender<Vec<u8>>>,
 }
 
 impl OutputBuffer {
     pub fn push(&mut self, data: &[u8]) {
+        if let Some(tap) = &self.tap {
+            if tap.send(data.to_vec()).is_err() {
+                self.tap = None;
+            }
+        }
         if !self.attached {
             let room = BACKLOG_LIMIT.saturating_sub(self.pending.len());
             self.pending
@@ -95,6 +103,43 @@ impl OutputBuffer {
 
     pub fn tail(&self) -> Vec<u8> {
         self.tail.iter().copied().collect()
+    }
+
+    /// The stream ended: whoever is watching sees the end of its feed rather
+    /// than waiting out a timeout.
+    pub fn close(&mut self) {
+        self.tap = None;
+    }
+}
+
+/// A live feed of a terminal's output; see [`LiveSession::open_tap`].
+pub struct Tap {
+    pub rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    output: Arc<Mutex<OutputBuffer>>,
+}
+
+impl Tap {
+    /// Starts a live copy of `output`. One at a time: two commands reading the
+    /// same feed would each see the other's output.
+    pub fn open(output: &Arc<Mutex<OutputBuffer>>) -> Result<Tap, String> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut out = output.lock().map_err(|e| e.to_string())?;
+        if out.tap.as_ref().is_some_and(|t| !t.is_closed()) {
+            return Err("终端正被另一条命令使用".into());
+        }
+        out.tap = Some(tx);
+        Ok(Tap {
+            rx,
+            output: output.clone(),
+        })
+    }
+}
+
+impl Drop for Tap {
+    fn drop(&mut self) {
+        if let Ok(mut out) = self.output.lock() {
+            out.tap = None;
+        }
     }
 }
 
@@ -140,6 +185,12 @@ impl LiveSession {
             .lock()
             .map(|mut b| b.take_pending())
             .unwrap_or_default()
+    }
+
+    /// Starts receiving a copy of everything the shell prints from now on.
+    /// Dropping the [`Tap`] stops it.
+    pub fn open_tap(&self) -> Result<Tap, String> {
+        Tap::open(&self.output)
     }
 
     /// Whether the shell channel has ended.
@@ -873,6 +924,9 @@ async fn open_shell(
                 rec.finish(&format!("# 结束: {}\n", crate::recorder::local_stamp()));
             }
         }
+        if let Ok(mut buf) = output_for_pump.lock() {
+            buf.close();
+        }
         // Exactly one terminal event, whether the stream ended cleanly or not.
         closed_for_pump.store(true, Ordering::SeqCst);
         let _ = events.send(TermEvent::Closed {
@@ -1073,6 +1127,24 @@ mod tests {
         // After attaching, the pane receives events live; nothing is queued.
         assert!(buf.take_pending().is_empty());
         assert_eq!(buf.tail(), b"banner prompt");
+    }
+
+    #[test]
+    fn a_tap_sees_new_output_until_it_is_dropped() {
+        let output = Arc::new(Mutex::new(OutputBuffer::default()));
+        output.lock().unwrap().push(b"before");
+        let (tx, rx) = mpsc::unbounded_channel();
+        output.lock().unwrap().tap = Some(tx);
+        let mut tap = Tap {
+            rx,
+            output: output.clone(),
+        };
+        output.lock().unwrap().push(b"after");
+        assert_eq!(tap.rx.try_recv().unwrap(), b"after");
+        drop(tap);
+        assert!(output.lock().unwrap().tap.is_none());
+        // The screen tail keeps everything either way.
+        assert_eq!(output.lock().unwrap().tail(), b"beforeafter");
     }
 
     #[test]
