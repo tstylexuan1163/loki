@@ -193,7 +193,9 @@ export const useTerminals = create<TermState>((set, get) => {
             type: "password",
             host: extra.passwordHost ?? "",
             username:
-              prevPrompt?.type === "password" ? prevPrompt.username : (tab.target?.username ?? ""),
+              prevPrompt?.type === "password"
+                ? prevPrompt.username
+                : (tab.login?.username ?? tab.target?.username ?? ""),
             retry: true,
             // Say what the server said when it was more than "wrong password",
             // e.g. too many attempts from the agent's keys first.
@@ -305,7 +307,7 @@ export const useTerminals = create<TermState>((set, get) => {
 
     openTarget(target) {
       const id = add({
-        title: `${target.username}@${target.address}`,
+        title: target.username ? `${target.username}@${target.address}` : target.address,
         kind: "ssh",
         hostId: null,
         target,

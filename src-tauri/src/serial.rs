@@ -143,10 +143,12 @@ impl SerialConnection {
     /// Splits the port into a blocking writer and a reader thread.
     ///
     /// `serialport` reads block, so the reader runs on its own OS thread; the
-    /// writer stays here for the async side to call.
+    /// writer stays here for the async side to call. `on_end` runs once when
+    /// the reader stops, whether stopped or because the cable was pulled.
     pub fn start(
         self,
         sink: impl Fn(Vec<u8>) + Send + 'static,
+        on_end: impl FnOnce() + Send + 'static,
     ) -> (SerialHandle, std::sync::Arc<std::sync::atomic::AtomicBool>) {
         let running = self.running.clone();
 
@@ -177,6 +179,7 @@ impl SerialConnection {
                     Err(_) => break,
                 }
             }
+            on_end();
         });
 
         (

@@ -1053,6 +1053,25 @@ fn login_name(saved: &str, typed: Option<&str>) -> Option<String> {
     }
 }
 
+/// The saved host a password typed at the prompt belongs to. The prompt names
+/// the address it asked for, which is the jump host's when that hop wanted
+/// one; storing it on the target would break the target's next login.
+fn password_owner<'a>(
+    asked: Option<&str>,
+    target: (&'a str, &str),
+    jump: Option<(&'a str, &str)>,
+) -> Option<&'a str> {
+    let (target_id, target_addr) = target;
+    let Some(asked) = asked else {
+        return Some(target_id);
+    };
+    if asked.eq_ignore_ascii_case(target_addr) {
+        return Some(target_id);
+    }
+    jump.filter(|(_, addr)| asked.eq_ignore_ascii_case(addr))
+        .map(|(id, _)| id)
+}
+
 /// Connects to a saved host or a quick-connect target.
 #[tauri::command]
 pub async fn session_open(
@@ -1068,8 +1087,9 @@ pub async fn session_open(
     let (mut host, payload) = match (&input.host_id, &input.target) {
         (Some(id), _) => load_host(&state, id)?,
         (None, Some(t)) => {
-            let mut view = HostView::ssh("", "", &t.address, t.port, &t.username);
-            view.name = format!("{}@{}", t.username, t.address);
+            // No name: the title is built from the login name, which may
+            // only be known after the username prompt.
+            let view = HostView::ssh("", "", &t.address, t.port, &t.username);
             let payload = serde_json::json!({ "use_agent": true });
             (view, payload)
         }
@@ -1108,7 +1128,7 @@ pub async fn session_open(
         }
     };
 
-    let (target, jump) = {
+    let (target, jump, jump_address) = {
         let vault = state.vault.lock().map_err(|e| e.to_string())?;
         let target = ssh::Hop {
             address: host.address.clone(),
@@ -1146,7 +1166,8 @@ pub async fn session_open(
                 })
             }
         };
-        (target, jump)
+        let jump_address = jump.as_ref().map(|j| j.address.clone());
+        (target, jump, jump_address)
     };
 
     // Forward terminal output to the WebView on one event channel.
@@ -1212,8 +1233,11 @@ pub async fn session_open(
         ConnectOutcome::Live(session) => {
             if let Some(id) = &input.host_id {
                 if input.remember_password {
-                    if let Some(pw) = &input.password {
-                        remember_on_host(&state, id, "password", pw)?;
+                    let jump = host.jump_host_id.as_deref().zip(jump_address.as_deref());
+                    let owner =
+                        password_owner(input.password_host.as_deref(), (id, &host.address), jump);
+                    if let (Some(pw), Some(owner)) = (&input.password, owner) {
+                        remember_on_host(&state, owner, "password", pw)?;
                     }
                 }
                 if input.remember_username {
@@ -3918,9 +3942,8 @@ pub async fn sftp_download_to_downloads(
         .trim_end_matches('/')
         .rsplit('/')
         .next()
-        .unwrap_or("download")
-        .to_string();
-    let local = crate::transfer::unique_local_path(&dir, &name);
+        .unwrap_or("download");
+    let local = crate::transfer::unique_local_path(&dir, &crate::transfer::local_name(name));
     start_transfer(
         &state,
         session_id,
@@ -4192,6 +4215,21 @@ mod tests {
                 .payload
         )
         .is_empty());
+    }
+
+    #[test]
+    fn a_remembered_password_goes_to_the_host_that_asked() {
+        let target = ("t", "10.0.0.5");
+        let jump = Some(("j", "bastion.example"));
+        assert_eq!(password_owner(Some("10.0.0.5"), target, jump), Some("t"));
+        assert_eq!(
+            password_owner(Some("BASTION.example"), target, jump),
+            Some("j")
+        );
+        assert_eq!(password_owner(None, target, None), Some("t"));
+        // Neither hop asked for it: store it nowhere.
+        assert_eq!(password_owner(Some("other"), target, jump), None);
+        assert_eq!(password_owner(Some("bastion.example"), target, None), None);
     }
 
     #[test]

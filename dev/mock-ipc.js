@@ -465,6 +465,10 @@ uci commit openclash && /etc/init.d/openclash restart
         if (input.password !== "right") throw "认证失败：密码被拒绝";
         if (input.rememberUsername) h.username = input.username;
       }
+      // A bare address in quick connect: the real backend asks for the login.
+      if (!h && input.target && !input.target.username && !input.username) {
+        return { kind: "needUsername", host: input.target.address };
+      }
       const id = `s${++state.opened}`;
       sessions.set(id, name);
       setTimeout(() => emit("term-event", { type: "data", sessionId: id, data: b64(banner(name)) }), 50);

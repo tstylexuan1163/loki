@@ -777,7 +777,7 @@ function UsernamePrompt({
       </div>
       <h3 className="overlay__title">输入用户名</h3>
       <p className="overlay__text">
-        这台主机没有设置用户名，用什么账号登录 <strong>{host}</strong>？
+        {canRemember ? "这台主机没有设置用户名，" : ""}用什么账号登录 <strong>{host}</strong>？
       </p>
       <input
         className="field__input"

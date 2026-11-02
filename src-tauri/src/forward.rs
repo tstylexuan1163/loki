@@ -7,10 +7,10 @@
 use crate::ssh::LiveSession;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
 use uuid::Uuid;
 
 /// A forward the user configured.
@@ -38,10 +38,11 @@ pub struct ForwardView {
     pub remote: Option<String>,
 }
 
-/// A forward that is listening. Dropping the stop flag (setting it) closes it.
+/// A forward that is listening. Signalling `stop`, or dropping it, closes the
+/// listener at once and frees the port.
 pub struct Running {
     pub view: ForwardView,
-    pub stop: Arc<AtomicBool>,
+    pub stop: watch::Sender<bool>,
 }
 
 pub struct ForwardManager {
@@ -61,7 +62,7 @@ impl ForwardManager {
 
     pub fn remove(&mut self, id: &str) -> bool {
         if let Some(running) = self.forwards.remove(id) {
-            running.stop.store(true, Ordering::SeqCst);
+            let _ = running.stop.send(true);
             true
         } else {
             false
@@ -99,7 +100,7 @@ impl Default for ForwardManager {
 pub async fn start(
     session: Arc<LiveSession>,
     spec: ForwardSpec,
-) -> Result<(ForwardView, Arc<AtomicBool>), String> {
+) -> Result<(ForwardView, watch::Sender<bool>), String> {
     let listener = TcpListener::bind(("127.0.0.1", spec.local_port))
         .await
         .map_err(|e| format!("无法监听本地端口 {}：{e}", spec.local_port))?;
@@ -108,7 +109,7 @@ pub async fn start(
         .map(|a| a.port())
         .map_err(|e| e.to_string())?;
 
-    let stop = Arc::new(AtomicBool::new(false));
+    let (stop, stop_rx) = watch::channel(false);
     let forward_id = Uuid::new_v4().to_string();
 
     let remote = if spec.kind == "local" {
@@ -129,51 +130,62 @@ pub async fn start(
         remote: remote.clone(),
     };
 
-    let stop_for_task = stop.clone();
     // Hoisted out of the accept loop: the per-connection task needs its own copy.
     let remote_host = spec.remote_host.clone().unwrap_or_default();
     let remote_port = spec.remote_port.unwrap_or(0);
     let kind_for_task = spec.kind.clone();
 
-    tokio::spawn(async move {
-        loop {
-            if stop_for_task.load(Ordering::SeqCst) {
-                break;
-            }
-            let (mut inbound, _) = match listener.accept().await {
-                Ok(v) => v,
-                Err(_) => break,
+    tokio::spawn(serve(listener, stop_rx, move |mut inbound| {
+        let session = session.clone();
+        let kind = kind_for_task.clone();
+        let host = remote_host.clone();
+        let port = remote_port;
+        tokio::spawn(async move {
+            let (host, port) = if kind == "socks" {
+                match socks5_handshake(&mut inbound).await {
+                    Ok(dest) => dest,
+                    Err(_) => return,
+                }
+            } else {
+                (host.clone(), port)
+            };
+            let channel = match session
+                .handle()
+                .channel_open_direct_tcpip(host, port as u32, "127.0.0.1", 0)
+                .await
+            {
+                Ok(c) => c,
+                Err(_) => return,
             };
 
-            let session = session.clone();
-            let kind = kind_for_task.clone();
-            let host = remote_host.clone();
-            let port = remote_port;
-            tokio::spawn(async move {
-                let (host, port) = if kind == "socks" {
-                    match socks5_handshake(&mut inbound).await {
-                        Ok(dest) => dest,
-                        Err(_) => return,
-                    }
-                } else {
-                    (host.clone(), port)
-                };
-                let channel = match session
-                    .handle()
-                    .channel_open_direct_tcpip(host, port as u32, "127.0.0.1", 0)
-                    .await
-                {
-                    Ok(c) => c,
-                    Err(_) => return,
-                };
-
-                let mut remote_stream = channel.into_stream();
-                let _ = tokio::io::copy_bidirectional(&mut inbound, &mut remote_stream).await;
-            });
-        }
-    });
+            let mut remote_stream = channel.into_stream();
+            let _ = tokio::io::copy_bidirectional(&mut inbound, &mut remote_stream).await;
+        });
+    }));
 
     Ok((view, stop))
+}
+
+/// Accepts connections until told to stop.
+///
+/// The stop signal has to interrupt a pending `accept`: checking a flag between
+/// accepts kept the port bound (so the same forward could not be started
+/// again) and let one more connection through after "stop".
+async fn serve(
+    listener: TcpListener,
+    mut stop: watch::Receiver<bool>,
+    mut on_conn: impl FnMut(TcpStream),
+) {
+    loop {
+        tokio::select! {
+            // A send of `true` or a dropped sender both mean stop.
+            _ = stop.wait_for(|stopped| *stopped) => break,
+            accepted = listener.accept() => match accepted {
+                Ok((inbound, _)) => on_conn(inbound),
+                Err(_) => break,
+            },
+        }
+    }
 }
 
 /// Minimal SOCKS5 negotiation: no-auth, CONNECT only.
@@ -275,7 +287,7 @@ mod tests {
                 local_port: 0,
                 remote: None,
             },
-            stop: Arc::new(AtomicBool::new(false)),
+            stop: watch::channel(false).0,
         };
         mgr.insert(mk("a", "s1"));
         mgr.insert(mk("b", "s1"));
@@ -284,6 +296,24 @@ mod tests {
         mgr.stop_for_session("s1");
         assert_eq!(mgr.list().len(), 1);
         assert_eq!(mgr.list()[0].id, "c");
+    }
+
+    #[tokio::test]
+    async fn stopping_frees_the_port_without_waiting_for_a_connection() {
+        let listener = TcpListener::bind(("127.0.0.1", 0u16)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (stop, rx) = watch::channel(false);
+        let task = tokio::spawn(serve(listener, rx, |_| {}));
+
+        stop.send(true).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("the accept loop must end on stop")
+            .unwrap();
+        // The same forward can be started again right away.
+        TcpListener::bind(("127.0.0.1", port))
+            .await
+            .expect("port should be free after stop");
     }
 
     #[tokio::test]

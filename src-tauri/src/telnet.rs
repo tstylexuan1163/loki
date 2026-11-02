@@ -5,7 +5,9 @@
 //! everything else through untouched, so it behaves like the SSH terminal from the
 //! UI's point of view.
 
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 
 /// Telnet command bytes (RFC 854).
@@ -17,16 +19,22 @@ const WILL: u8 = 251;
 const SB: u8 = 250;
 const SE: u8 = 240;
 
-/// Options we are willing to turn on when asked.
+const NAWS: u8 = 31;
+
+/// Options we let the server turn on for its side (`WILL`): it echoes, and
+/// it skips go-ahead.
 ///
-/// Deliberately narrow: ECHO and NAWS are what a login screen needs. Anything
-/// else is refused, which is always a legal answer in telnet.
-const ACCEPT_WILL: &[u8] = &[
-    1,  /* ECHO */
-    3,  /* SUPPRESS GO AHEAD */
-    31, /* NAWS */
-];
-const ACCEPT_DO: &[u8] = &[1 /* ECHO */, 3 /* SUPPRESS GO AHEAD */];
+/// Deliberately narrow; anything else is refused, which is always a legal
+/// answer in telnet.
+const ACCEPT_WILL: &[u8] = &[1 /* ECHO */, 3 /* SUPPRESS GO AHEAD */];
+/// Options we agree to do ourselves (`DO`). Not ECHO: the terminal never
+/// echoes locally, and claiming to would leave typed text invisible. NAWS is
+/// how a switch learns the window width instead of wrapping at 80 columns.
+const ACCEPT_DO: &[u8] = &[3 /* SUPPRESS GO AHEAD */, NAWS];
+
+/// A sub-negotiation longer than this without its `IAC SE` is junk; drop it
+/// rather than hold back output forever.
+const MAX_PENDING: usize = 4096;
 
 /// What the negotiation produced, so the caller can log or display it.
 #[derive(Debug, Default, Clone, serde::Serialize)]
@@ -43,8 +51,36 @@ pub struct Negotiation {
 /// Removes IAC escapes from a data chunk and records any commands it carried.
 ///
 /// Returns the bytes that should reach the terminal, plus replies that must be
-/// sent back. `IAC IAC` means a literal 0xFF, which is data, not a command.
+/// sent back. `IAC IAC` means a literal 0xFF, which is data, not a command. A
+/// command cut off at the end of the chunk is dropped; [`Decoder`] keeps it
+/// for the next read instead.
 pub fn strip_commands(input: &[u8], neg: &mut Negotiation) -> (Vec<u8>, Vec<u8>) {
+    let (out, replies, _) = decode(input, neg);
+    (out, replies)
+}
+
+/// Strips telnet commands across reads: TCP may split `IAC WILL ECHO` between
+/// two segments, and the tail must not reach the screen as stray bytes.
+#[derive(Default)]
+pub struct Decoder {
+    pending: Vec<u8>,
+}
+
+impl Decoder {
+    pub fn feed(&mut self, input: &[u8], neg: &mut Negotiation) -> (Vec<u8>, Vec<u8>) {
+        let mut buf = std::mem::take(&mut self.pending);
+        buf.extend_from_slice(input);
+        let (out, replies, used) = decode(&buf, neg);
+        if buf.len() - used <= MAX_PENDING {
+            self.pending = buf[used..].to_vec();
+        }
+        (out, replies)
+    }
+}
+
+/// The decoder proper. The third value is where an incomplete command starts
+/// (the input length when there is none).
+fn decode(input: &[u8], neg: &mut Negotiation) -> (Vec<u8>, Vec<u8>, usize) {
     let mut out = Vec::with_capacity(input.len());
     let mut replies = Vec::new();
     let mut i = 0;
@@ -57,7 +93,7 @@ pub fn strip_commands(input: &[u8], neg: &mut Negotiation) -> (Vec<u8>, Vec<u8>)
         }
 
         if i + 1 >= input.len() {
-            break;
+            return (out, replies, i);
         }
 
         let cmd = input[i + 1];
@@ -69,20 +105,27 @@ pub fn strip_commands(input: &[u8], neg: &mut Negotiation) -> (Vec<u8>, Vec<u8>)
         }
 
         // Sub-negotiation carries an option byte then values until IAC SE.
+        // We do not act on them, but do not leak them either.
         if cmd == SB {
-            let started = i;
-            i += 2;
-            while i + 1 < input.len() && !(input[i] == IAC && input[i + 1] == SE) {
-                i += 1;
+            let mut j = i + 2;
+            while j + 1 < input.len() && !(input[j] == IAC && input[j + 1] == SE) {
+                j += 1;
             }
-            i = (i + 2).min(input.len());
-            // We do not act on sub-negotiations, but do not leak them either.
-            let _ = started;
+            if j + 1 >= input.len() {
+                return (out, replies, i);
+            }
+            i = j + 2;
             continue;
         }
 
+        // Only the four option verbs carry an option byte; NOP, GA, AYT and
+        // the rest are two bytes, and reading a third would eat real text.
+        if !matches!(cmd, WILL | WONT | DO | DONT) {
+            i += 2;
+            continue;
+        }
         if i + 2 >= input.len() {
-            break;
+            return (out, replies, i);
         }
         let option = input[i + 2];
         match cmd {
@@ -113,13 +156,27 @@ pub fn strip_commands(input: &[u8], neg: &mut Negotiation) -> (Vec<u8>, Vec<u8>)
                 }
             }
             // An answer to something we never asked: ignore it.
-            WONT | DONT => {}
             _ => {}
         }
         i += 3;
     }
 
-    (out, replies)
+    (out, replies, input.len())
+}
+
+/// Doubles 0xFF in outgoing data so the server reads it as a byte, not IAC.
+fn escape_iac(data: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    if !data.contains(&IAC) {
+        return std::borrow::Cow::Borrowed(data);
+    }
+    let mut out = Vec::with_capacity(data.len() + 4);
+    for &b in data {
+        if b == IAC {
+            out.push(IAC);
+        }
+        out.push(b);
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 /// Tells the server our window size (NAWS). Servers that ignore it are unaffected.
@@ -142,9 +199,10 @@ pub fn naws_frame(cols: u16, rows: u16) -> Vec<u8> {
     frame
 }
 
-/// A live telnet connection.
+/// A live telnet connection, before it is split for the terminal.
 pub struct TelnetConnection {
-    stream: TcpStream,
+    reader: OwnedReadHalf,
+    writer: TelnetWriter,
 }
 
 impl TelnetConnection {
@@ -154,46 +212,113 @@ impl TelnetConnection {
             .map_err(|e| format!("无法连接 {host}:{port}：{e}"))?;
         // Login screens can be idle for a while before the first byte.
         let _ = stream.set_nodelay(true);
-        Ok(Self { stream })
+        let (reader, writer) = stream.into_split();
+        Ok(Self {
+            reader,
+            writer: TelnetWriter {
+                half: Arc::new(tokio::sync::Mutex::new(writer)),
+                size: Arc::new(std::sync::Mutex::new((80, 24))),
+            },
+        })
     }
 
+    /// Sends the window size.
+    pub async fn resize(&mut self, cols: u16, rows: u16) -> Result<(), String> {
+        self.writer.resize(cols, rows).await
+    }
+
+    /// Splits into a reader for the output task and a writer for keystrokes.
+    ///
+    /// They must not share a lock: a reader waiting for the server would make
+    /// every keystroke wait with it.
+    pub fn split(self) -> (TelnetReader, TelnetWriter) {
+        (
+            TelnetReader {
+                half: self.reader,
+                decoder: Decoder::default(),
+                writer: self.writer.clone(),
+            },
+            self.writer,
+        )
+    }
+}
+
+/// The sending half: user input, window size, and negotiation replies.
+#[derive(Clone)]
+pub struct TelnetWriter {
+    half: Arc<tokio::sync::Mutex<OwnedWriteHalf>>,
+    /// The last size the terminal reported, for when the server asks for it.
+    size: Arc<std::sync::Mutex<(u16, u16)>>,
+}
+
+impl TelnetWriter {
     /// Sends user input. Telnet wants a bare CR for Enter, but modern servers and
     /// the PTY path both accept CRLF, so the bytes are passed through unchanged.
-    pub async fn write(&mut self, data: &[u8]) -> Result<(), String> {
-        self.stream
-            .write_all(data)
+    pub async fn write(&self, data: &[u8]) -> Result<(), String> {
+        self.raw(&escape_iac(data))
             .await
             .map_err(|e| format!("发送失败：{e}"))
     }
 
     /// Sends the window size.
-    pub async fn resize(&mut self, cols: u16, rows: u16) -> Result<(), String> {
-        let frame = naws_frame(cols, rows);
-        self.stream
-            .write_all(&frame)
+    pub async fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
+        if let Ok(mut s) = self.size.lock() {
+            *s = (cols, rows);
+        }
+        self.raw(&naws_frame(cols, rows))
             .await
             .map_err(|e| format!("发送窗口大小失败：{e}"))
     }
 
-    /// Reads one chunk, stripping telnet commands and answering them.
+    fn size(&self) -> (u16, u16) {
+        self.size.lock().map(|s| *s).unwrap_or((80, 24))
+    }
+
+    async fn raw(&self, bytes: &[u8]) -> std::io::Result<()> {
+        self.half.lock().await.write_all(bytes).await
+    }
+}
+
+/// The receiving half: strips telnet commands and answers them.
+pub struct TelnetReader {
+    half: OwnedReadHalf,
+    decoder: Decoder,
+    writer: TelnetWriter,
+}
+
+impl TelnetReader {
+    /// Waits for the next raw chunk; `None` at end of stream.
     ///
-    /// Returns `None` at end of stream.
-    pub async fn read(&mut self, neg: &mut Negotiation) -> Result<Option<Vec<u8>>, String> {
-        let mut buf = [0u8; 8192];
+    /// Only this step may sit under a timeout: it is cancel-safe, whereas
+    /// cancelling [`Self::process`] halfway would lose a decoded chunk.
+    pub async fn recv(&mut self) -> Result<Option<Vec<u8>>, String> {
+        let mut buf = vec![0u8; 8192];
         let n = self
-            .stream
+            .half
             .read(&mut buf)
             .await
             .map_err(|e| format!("读取失败：{e}"))?;
         if n == 0 {
             return Ok(None);
         }
+        buf.truncate(n);
+        Ok(Some(buf))
+    }
 
-        let (data, replies) = strip_commands(&buf[..n], neg);
-        if !replies.is_empty() {
-            let _ = self.stream.write_all(&replies).await;
+    /// Strips telnet commands from a raw chunk, answers them, and returns the
+    /// bytes meant for the screen.
+    pub async fn process(&mut self, raw: &[u8], neg: &mut Negotiation) -> Vec<u8> {
+        let had_naws = neg.server_do.contains(&NAWS);
+        let (data, mut replies) = self.decoder.feed(raw, neg);
+        // Agreeing to NAWS means sending the size right after the WILL.
+        if !had_naws && neg.server_do.contains(&NAWS) {
+            let (cols, rows) = self.writer.size();
+            replies.extend_from_slice(&naws_frame(cols, rows));
         }
-        Ok(Some(data))
+        if !replies.is_empty() {
+            let _ = self.writer.raw(&replies).await;
+        }
+        data
     }
 }
 
@@ -214,6 +339,47 @@ mod tests {
         let mut neg = Negotiation::default();
         let (data, _) = strip_commands(&[b'a', IAC, IAC, b'b'], &mut neg);
         assert_eq!(data, vec![b'a', IAC, b'b']);
+    }
+
+    #[test]
+    fn a_command_split_across_reads_does_not_leak() {
+        let mut neg = Negotiation::default();
+        let mut dec = Decoder::default();
+        let (data, replies) = dec.feed(&[b'a', IAC, WILL], &mut neg);
+        assert_eq!(data, b"a");
+        assert!(replies.is_empty());
+        let (data, replies) = dec.feed(&[1, b'b'], &mut neg);
+        assert_eq!(data, b"b", "the option byte is not screen output");
+        assert_eq!(replies, vec![IAC, DO, 1]);
+
+        // Same for a sub-negotiation cut before its IAC SE.
+        let (data, _) = dec.feed(&[IAC, SB, 24, 1, IAC], &mut neg);
+        assert!(data.is_empty());
+        let (data, _) = dec.feed(&[SE, b'o', b'k'], &mut neg);
+        assert_eq!(data, b"ok");
+    }
+
+    #[test]
+    fn two_byte_commands_keep_the_next_character() {
+        let mut neg = Negotiation::default();
+        // IAC NOP and IAC GA, as keepalives and prompts send them.
+        let (data, replies) = strip_commands(&[IAC, 241, b'x', IAC, 249, b'y'], &mut neg);
+        assert_eq!(data, b"xy");
+        assert!(replies.is_empty());
+    }
+
+    #[test]
+    fn naws_is_agreed_and_local_echo_refused() {
+        let mut neg = Negotiation::default();
+        let (_, replies) = strip_commands(&[IAC, DO, NAWS, IAC, DO, 1], &mut neg);
+        assert_eq!(replies, vec![IAC, WILL, NAWS, IAC, WONT, 1]);
+        assert_eq!(neg.server_do, vec![NAWS]);
+    }
+
+    #[test]
+    fn outgoing_ff_is_doubled() {
+        assert_eq!(&*escape_iac(b"ab"), b"ab");
+        assert_eq!(&*escape_iac(&[1, IAC, 2]), &[1, IAC, IAC, 2]);
     }
 
     #[test]

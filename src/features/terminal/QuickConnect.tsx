@@ -108,7 +108,9 @@ export function QuickConnect({ onClose }: { onClose: () => void }) {
     ),
   );
 
-  const sshTarget = parseTarget(text, "root");
+  // No default login name: a bare address asks for one when connecting,
+  // since guessing `root` only fails on network gear.
+  const sshTarget = parseTarget(text, "");
   const telnetTarget = parseTelnet(text);
 
   const go = (fn: () => void) => {
@@ -169,11 +171,25 @@ export function QuickConnect({ onClose }: { onClose: () => void }) {
         run: () => go(() => openHost(h)),
       });
     }
+    // A bare address is also a search term, so it goes after the saved hosts
+    // it matches: Enter still opens those first.
+    if (sshTarget && !text.includes("@") && !category) {
+      rows.push({
+        label: `${sshTarget.address}${sshTarget.port !== 22 ? `:${sshTarget.port}` : ""}`,
+        sub: "快速连接，登录时询问用户名",
+        icon: <IconTerminal size={15} />,
+        run: () =>
+          go(() => {
+            addRecent(text.trim());
+            openTarget(sshTarget);
+          }),
+      });
+    }
     // Bare SSH recents. Anything with a scheme belongs to another protocol.
     // They have no category, so a category filter hides them.
     for (const r of category ? [] : recent.filter((r) => !r.includes("://"))) {
       if (q && !r.toLowerCase().includes(q)) continue;
-      const t = parseTarget(r, "root");
+      const t = parseTarget(r, "");
       if (t)
         rows.push({
           label: r,

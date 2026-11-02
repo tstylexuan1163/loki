@@ -113,7 +113,7 @@ async fn plan_download(sftp: &SftpSession, remote: &str, local: &Path) -> Result
             }
             let attrs = entry.metadata();
             let rpath = crate::sftp::join_path(&rdir, &name);
-            let lpath = ldir.join(&name);
+            let lpath = ldir.join(local_name(&name));
             // Links are skipped: following them can loop, and copying them as
             // files would silently change what they are.
             if attrs.is_symlink() {
@@ -324,6 +324,37 @@ pub async fn remove_recursive(sftp: &SftpSession, path: &str) -> Result<(), Stri
     Ok(())
 }
 
+/// A remote file name made safe to create locally.
+///
+/// The name comes from the server. `..`, a slash, or (on Windows) a backslash
+/// or drive colon would make `Path::join` write outside the folder the user
+/// picked; characters Windows forbids would fail the copy instead.
+pub fn local_name(name: &str) -> String {
+    let forbidden: &[char] = if cfg!(windows) {
+        &['/', '\\', ':', '*', '?', '"', '<', '>', '|']
+    } else {
+        &['/']
+    };
+    let mut out: String = name
+        .chars()
+        .map(|c| {
+            if forbidden.contains(&c) || c.is_control() {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    if cfg!(windows) {
+        // Windows drops trailing dots and spaces, so `a.` and `a` collide.
+        out = out.trim_end_matches(['.', ' ']).to_string();
+    }
+    if out.is_empty() || out == "." || out == ".." {
+        return "_".into();
+    }
+    out
+}
+
 /// Picks a name in `dir` that does not exist yet: `a.txt`, `a (1).txt`, ...
 pub fn unique_local_path(dir: &Path, name: &str) -> PathBuf {
     let candidate = dir.join(name);
@@ -361,6 +392,23 @@ mod tests {
         // A dotfile has no extension to keep.
         assert_eq!(unique_local_path(&dir, ".env"), dir.join(".env (1)"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn remote_names_cannot_escape_the_download_folder() {
+        assert_eq!(local_name("report.txt"), "report.txt");
+        assert_eq!(local_name(".."), "_");
+        assert_eq!(local_name(""), "_");
+        assert_eq!(local_name("../../etc/passwd"), ".._.._etc_passwd");
+        let dir = Path::new("downloads");
+        for evil in ["..", "../x", "a/../../b"] {
+            let p = dir.join(local_name(evil));
+            assert_eq!(p.parent(), Some(dir), "{evil} escaped as {}", p.display());
+        }
+        if cfg!(windows) {
+            assert_eq!(local_name(r"..\..\x"), ".._.._x");
+            assert_eq!(local_name("C:evil"), "C_evil");
+        }
     }
 
     #[test]

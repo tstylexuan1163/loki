@@ -95,21 +95,51 @@ impl LocalPty {
             .take_writer()
             .map_err(|e| format!("无法写入本地终端：{e}"))?;
 
-        let mut on_data = on_data;
+        // Rebinding inside makes this FnOnce, callable on both paths below
+        // without a `mut` that one platform would warn about.
+        let read_all = move || {
+            let mut on_data = on_data;
+            let mut buf = [0u8; 16 * 1024];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => on_data(buf[..n].to_vec()),
+                }
+            }
+        };
+
+        // Unix: the read hits EOF once the shell exits, so exit follows the
+        // last byte of output on the same thread.
+        #[cfg(not(windows))]
         std::thread::Builder::new()
             .name("loki-local-pty".into())
             .spawn(move || {
-                let mut buf = [0u8; 16 * 1024];
-                loop {
-                    match reader.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => on_data(buf[..n].to_vec()),
-                    }
-                }
+                read_all();
                 let code = child.wait().ok().map(|s| s.exit_code());
                 on_exit(code);
             })
             .map_err(|e| format!("无法启动读取线程：{e}"))?;
+
+        // Windows: ConPTY keeps its output pipe open until the pseudo console
+        // itself is closed, so the read never ends when the shell exits and
+        // the tab would stay "connected" after `exit`. Wait on the process
+        // instead; the reader ends when the tab drops the master.
+        #[cfg(windows)]
+        {
+            std::thread::Builder::new()
+                .name("loki-local-pty".into())
+                .spawn(read_all)
+                .map_err(|e| format!("无法启动读取线程：{e}"))?;
+            std::thread::Builder::new()
+                .name("loki-local-wait".into())
+                .spawn(move || {
+                    let code = child.wait().ok().map(|s| s.exit_code());
+                    // Let the last output the shell wrote reach the screen first.
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    on_exit(code);
+                })
+                .map_err(|e| format!("无法启动等待线程：{e}"))?;
+        }
 
         Ok(Self {
             master: Mutex::new(pair.master),

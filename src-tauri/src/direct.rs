@@ -56,7 +56,7 @@ pub struct SerialOptions {
 /// A connection the terminal can write to and resize.
 pub enum DirectSession {
     Telnet {
-        conn: tokio::sync::Mutex<crate::telnet::TelnetConnection>,
+        writer: crate::telnet::TelnetWriter,
         stop: Arc<AtomicBool>,
     },
     Serial {
@@ -79,7 +79,7 @@ impl DirectSession {
 
     pub async fn write(&self, data: &[u8]) -> Result<(), String> {
         match self {
-            DirectSession::Telnet { conn, .. } => conn.lock().await.write(data).await,
+            DirectSession::Telnet { writer, .. } => writer.write(data).await,
             DirectSession::Serial { handle, .. } => handle.write(data),
             DirectSession::Local { pty } => pty.write(data),
         }
@@ -88,7 +88,7 @@ impl DirectSession {
     /// A serial line has no window size; telnet uses NAWS.
     pub async fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
         match self {
-            DirectSession::Telnet { conn, .. } => conn.lock().await.resize(cols, rows).await,
+            DirectSession::Telnet { writer, .. } => writer.resize(cols, rows).await,
             DirectSession::Serial { .. } => Ok(()),
             DirectSession::Local { pty } => pty.resize(cols, rows),
         }
@@ -216,12 +216,12 @@ impl DirectManager {
         };
 
         let stop = Arc::new(AtomicBool::new(false));
+        let (mut reader, writer) = conn.split();
         let session = Arc::new(DirectSession::Telnet {
-            conn: tokio::sync::Mutex::new(conn),
+            writer,
             stop: stop.clone(),
         });
 
-        let session_for_reader = session.clone();
         let backlog_for_reader = backlog.clone();
         let recorder = Arc::new(std::sync::Mutex::new(None::<crate::recorder::Recorder>));
         let recorder_for_reader = recorder.clone();
@@ -235,9 +235,8 @@ impl DirectManager {
             },
         );
 
-        // Reader task: strip telnet commands, forward the rest. The connection
-        // lives in an Arc<Mutex>, so each read takes the lock briefly and the
-        // writer never waits on a blocked read for long.
+        // Reader task: strip telnet commands, forward the rest. It owns the
+        // read half outright, so keystrokes never wait behind a pending read.
         let sid = id.clone();
         tokio::spawn(async move {
             let mut neg = Negotiation::default();
@@ -245,21 +244,14 @@ impl DirectManager {
                 if stop.load(Ordering::SeqCst) {
                     break;
                 }
-                let DirectSession::Telnet { conn, .. } = &*session_for_reader else {
-                    break;
-                };
-                let result = {
-                    let mut guard = conn.lock().await;
-                    // A read timeout keeps the loop responsive to `stop`.
-                    tokio::time::timeout(
-                        std::time::Duration::from_millis(250),
-                        guard.read(&mut neg),
-                    )
-                    .await
-                };
+                // A read timeout keeps the loop responsive to `stop`.
+                let result =
+                    tokio::time::timeout(std::time::Duration::from_millis(250), reader.recv())
+                        .await;
 
                 match result {
-                    Ok(Ok(Some(data))) => {
+                    Ok(Ok(Some(raw))) => {
+                        let data = reader.process(&raw, &mut neg).await;
                         if data.is_empty() {
                             // Everything in the chunk was negotiation. Yielding
                             // matters: a peer that answers instantly would
@@ -335,15 +327,26 @@ impl DirectManager {
 
         let recorder = Arc::new(std::sync::Mutex::new(None::<crate::recorder::Recorder>));
         let recorder_for_reader = recorder.clone();
-        let (handle, stop) = conn.start(move |bytes| {
-            push_bounded(&backlog_for_reader, &bytes);
-            write_recording(&recorder_for_reader, &bytes);
-            let payload = base64_encode(&bytes);
-            let _ = events.send(TermEvent::Data {
-                session_id: sid.clone(),
-                data: payload,
-            });
-        });
+        let end_events = events.clone();
+        let end_sid = id.clone();
+        let (handle, stop) = conn.start(
+            move |bytes| {
+                push_bounded(&backlog_for_reader, &bytes);
+                write_recording(&recorder_for_reader, &bytes);
+                let payload = base64_encode(&bytes);
+                let _ = events.send(TermEvent::Data {
+                    session_id: sid.clone(),
+                    data: payload,
+                });
+            },
+            // An unplugged adapter ends the read with an error; without this
+            // the tab would keep saying "connected" and swallow keystrokes.
+            move || {
+                let _ = end_events.send(TermEvent::Closed {
+                    session_id: end_sid,
+                });
+            },
+        );
 
         let info = DirectInfo {
             id: id.clone(),
@@ -462,5 +465,63 @@ fn base64_encode(data: &[u8]) -> String {
 impl Default for DirectManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn telnet_keystrokes_do_not_wait_for_the_reader() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let conn = DirectManager::connect_telnet("127.0.0.1", port, 132, 40)
+            .await
+            .unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+
+        // The initial NAWS frame arrives first; skip it.
+        let mut buf = [0u8; 64];
+        let n = server.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..3], &[255, 250, 31], "got {:?}", &buf[..n]);
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<TermEvent>();
+        let mut mgr = DirectManager::new();
+        mgr.register_telnet("t".into(), "127.0.0.1".into(), port, conn, tx);
+        let session = mgr.get("t").unwrap();
+
+        // The server is silent, so the reader sits in a pending read. A
+        // keystroke used to queue behind it for up to 250 ms each.
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        for _ in 0..5 {
+            let started = std::time::Instant::now();
+            session.write(b"x").await.unwrap();
+            assert!(
+                started.elapsed() < std::time::Duration::from_millis(100),
+                "write waited {:?}",
+                started.elapsed()
+            );
+        }
+        let mut got = Vec::new();
+        while got.len() < 5 {
+            let n = server.read(&mut buf).await.unwrap();
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(got, b"xxxxx");
+
+        // A switch asking for the window size gets WILL NAWS and the size.
+        server.write_all(&[255, 253, 31]).await.unwrap();
+        let mut reply = Vec::new();
+        while reply.len() < 12 {
+            let n = server.read(&mut buf).await.unwrap();
+            reply.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(&reply[..3], &[255, 251, 31]);
+        assert_eq!(&reply[3..12], &[255, 250, 31, 0, 132, 0, 40, 255, 240]);
+
+        session.stop();
     }
 }
