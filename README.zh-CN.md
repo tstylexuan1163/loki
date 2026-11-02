@@ -5,7 +5,8 @@
 <h1 align="center">loki</h1>
 
 <p align="center">
-  每个终端旁边都有 AI 助手的桌面 SSH 客户端。<br/>
+  支持 SSH、Telnet、串口和本地 shell 的桌面终端，<br/>
+  每个标签旁边都有 AI 助手，能直接在终端里替你输入命令。<br/>
   主机、密钥和密码都加密保存在你自己的电脑上。
 </p>
 
@@ -59,8 +60,8 @@
 
 <table>
   <tr>
-    <td><img src="docs/images/hosts-dark.png" alt="主机列表" /></td>
-    <td><img src="docs/images/terminal-ai.png" alt="终端旁的流式 AI 助手" /></td>
+    <td><img src="docs/images/hosts-light.png" alt="按分类整理的主机" /></td>
+    <td><img src="docs/images/terminal-ai.png" alt="AI 助手通过 Telnet 在交换机终端里执行命令" /></td>
   </tr>
   <tr>
     <td><img src="docs/images/quick-connect.png" alt="快速连接" /></td>
@@ -131,22 +132,20 @@ src-tauri/src/
   crypto.rs, vault.rs      Argon2id → HKDF → AES-256-GCM；密钥生命周期
   store.rs                 SQLite，只存密文
   ssh.rs                   连接链、主机密钥策略、认证、PTY
+  telnet.rs, serial.rs     Telnet（含 NAWS）和串口
+  direct.rs                Telnet、串口、本地终端会话
   local.rs                 本地 shell（portable-pty）
   sftp.rs, transfer.rs     文件面板、上传下载
   forward.rs, stats.rs     端口转发、状态栏采样
-  sshconfig.rs             ~/.ssh/config 导入
+  sshconfig.rs, netscan.rs ~/.ssh/config 导入、网段扫描
+  recorder.rs              会话录制
   ai/                      模型服务商、工具、对话循环
+  ai/interactive.rs        在终端里输入命令：提示符、分页、提问识别
   commands.rs              IPC 命令
 workers/sync/              可选的 Cloudflare Worker 同步服务
 dev/mock.html              浏览器里运行的模拟界面
 docs/STATUS.md             已验证内容与验证方式
 ```
-
-## 致谢
-
-loki 的架构参考了对 [Hatoba](https://github.com/scarletkc/Hatoba)（MIT）的分析。Hatoba 是一个开源 SSH 客户端，采用同样的“秘密只在 Rust、处处只存密文”设计。loki 是独立重写的实现，不是它的分支。
-
-基于 [Tauri](https://tauri.app)、[russh](https://github.com/Eugeny/russh)、[xterm.js](https://xtermjs.org) 和 React 构建。
 
 ## 许可证
 

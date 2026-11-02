@@ -5,7 +5,8 @@
 <h1 align="center">loki</h1>
 
 <p align="center">
-  A desktop SSH client with an AI assistant beside every terminal.<br/>
+  A desktop terminal for SSH, Telnet, serial and local shells,<br/>
+  with an AI assistant beside every tab that can type into the terminal for you.<br/>
   Your hosts, keys and passwords stay encrypted on your machine.
 </p>
 
@@ -61,8 +62,8 @@ The interface is currently in Simplified Chinese.
 
 <table>
   <tr>
-    <td><img src="docs/images/hosts-dark.png" alt="Host list" /></td>
-    <td><img src="docs/images/terminal-ai.png" alt="Streaming AI assistant beside the terminal" /></td>
+    <td><img src="docs/images/hosts-light.png" alt="Hosts grouped by category" /></td>
+    <td><img src="docs/images/terminal-ai.png" alt="The assistant typing a command into a switch over Telnet" /></td>
   </tr>
   <tr>
     <td><img src="docs/images/quick-connect.png" alt="Quick connect" /></td>
@@ -133,25 +134,20 @@ src-tauri/src/
   crypto.rs, vault.rs      Argon2id → HKDF → AES-256-GCM; key lifecycle
   store.rs                 SQLite, ciphertext only
   ssh.rs                   connect chain, host-key policy, auth, PTY shell
+  telnet.rs, serial.rs     Telnet (NAWS) and serial lines
+  direct.rs                Telnet, serial and local sessions
   local.rs                 local shell (portable-pty)
   sftp.rs, transfer.rs     file panel, upload / download
   forward.rs, stats.rs     port forwarding, status-bar readings
-  sshconfig.rs             ~/.ssh/config import
+  sshconfig.rs, netscan.rs ~/.ssh/config import, subnet scan
+  recorder.rs              session recording
   ai/                      model providers, tools, turn loop
+  ai/interactive.rs        typing into the terminal: prompts, pagers, questions
   commands.rs              IPC commands
 workers/sync/              optional Cloudflare Worker for sync
 dev/mock.html              browser-only UI with a fake backend
 docs/STATUS.md             what is verified, and how (Chinese)
 ```
-
-## Acknowledgements
-
-loki's architecture follows an analysis of [Hatoba](https://github.com/scarletkc/Hatoba)
-(MIT), an open-source SSH client with the same "secrets stay in Rust, ciphertext
-everywhere" design. loki is an independent reimplementation, not a fork.
-
-Built with [Tauri](https://tauri.app), [russh](https://github.com/Eugeny/russh),
-[xterm.js](https://xtermjs.org) and React.
 
 ## License
 

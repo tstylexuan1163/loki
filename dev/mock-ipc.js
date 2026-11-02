@@ -57,6 +57,12 @@
     `Last login: Wed Oct 29 09:12:44 2026 from 10.0.0.8\r\n` +
     `\x1b[1;32mdeploy@${title}\x1b[0m:\x1b[1;34m~\x1b[0m$ `;
 
+  const switchBanner =
+    `\r\n******************************************************************\r\n` +
+    `*  Authorized access only. All activity is logged.              *\r\n` +
+    `******************************************************************\r\n\r\n` +
+    `Login authentication\r\n\r\n<sw-3f>`;
+
   const sessions = new Map();
 
   const handlers = {
@@ -275,7 +281,7 @@ uci commit openclash && /etc/init.d/openclash restart
         state.aiTimers.push(
           setTimeout(() => {
             tag({ type: "toolResult", id: callId, ok: true, content: "Interface            Link Speed   Duplex Type PVID Description\nGE1/0/1              UP   1G(a)   F(a)   A    1    uplink-core\nGE1/0/2              DOWN auto    A      A    1\nGE1/0/3              UP   1G(a)   F(a)   A    10   ap-3f\n---\n已回到提示符：<sw-3f>\n（自动翻页 1 次）" });
-            tag({ type: "text", text: "3 个接口里 **GE1/0/2 是 DOWN**，其余正常。" });
+            tag({ type: "text", text: "3 个接口里 **GE1/0/2 是 DOWN**，速率协商停在 auto，看起来没有接线或对端没开。GE1/0/1 上联核心、GE1/0/3 接 3 楼 AP，都正常。\n\n要我进接口视图看看 GE1/0/2 的配置吗？" });
             tag({ type: "done", steps: 2 });
           }, 2400),
         );
@@ -498,7 +504,9 @@ uci commit openclash && /etc/init.d/openclash restart
       }
       const id = `s${++state.opened}`;
       sessions.set(id, name);
-      setTimeout(() => emit("term-event", { type: "data", sessionId: id, data: b64(banner(name)) }), 50);
+      // A telnet host is a switch, so the assistant's typing demo makes sense.
+      const greeting = h?.protocol === "telnet" ? switchBanner : banner(name);
+      setTimeout(() => emit("term-event", { type: "data", sessionId: id, data: b64(greeting) }), 50);
       return { kind: "connected", session: { id, title: name, status: "connected" } };
     },
     telnet_open: ({ input }) => {
